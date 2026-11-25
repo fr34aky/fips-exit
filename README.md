@@ -5,7 +5,8 @@ node**: mesh clients send it their internet traffic, IPv4 and IPv6, and it
 forwards that traffic to the legacy internet from its own addresses.
 
 The client side is in [fips2go](https://github.com/fr34aky/fips2go)
-(Settings → Advanced → Exit node). Any Linux fips node can be a client too,
+(Overview → Internet route; it sends IPv4 only for now). Any Linux fips node
+can be a client too,
 with the kernel's `ip6tnl` (see `test/netns.sh` for the exact commands).
 
 ## How it works
@@ -105,8 +106,9 @@ an optimisation, not a requirement.
 - Run a recent fips on the exit. A route through older nodes carries less
   than 1280 bytes; the exit's fips then has to split its packets for that
   route, which older versions do not do.
-- A phone can be an exit too: fips2go has an opt-in "Be an exit node for
-  others" mode with its own client list. It needs none of this repository.
+- fips2go also ships an exit node of its own, a Docker container
+  (`exit-node/` there). It speaks the same contract and needs none of this
+  repository; the two differ in what they offer, not in what a client sends.
 - Other Linux fips nodes can be clients with the kernel's `ip6tnl`
   (`mode any`, `encaplimit none`, remote = the exit's fips address; the
   commands are in `test/netns.sh`). A kernel client cannot send a non-TCP

@@ -131,6 +131,27 @@ def load_clients():
     return clients
 
 
+def served(clients, warn=True):
+    """The clients the exit serves: the list, without any whose derived IPv4
+    address an earlier line already has. `add` never writes such a line; a
+    list edited by hand can hold one, and the daemon skips it the same way
+    (the first keeps the address), so the routes and the firewall must not
+    be built for it either."""
+    out, by_inner = [], {}
+    for address, name in clients:
+        inner = inner_ipv4(address)
+        other = by_inner.get(inner)
+        if other is not None and other != address:
+            if warn:
+                print(f"fips-exit: {address} {name} has the same IPv4 address ({inner}) as "
+                      f"{other}; not served. Remove one of them.", file=sys.stderr)
+            continue
+        if other is None:
+            by_inner[inner] = address
+            out.append((address, name))
+    return out
+
+
 def save_clients(clients):
     os.makedirs(DIR, exist_ok=True)
     temp = CLIENTS + ".tmp"
@@ -337,7 +358,7 @@ def ufw(clients, config, on):
 
 def cmd_up():
     config = load_config()
-    clients = load_clients()
+    clients = served(load_clients())
     wan = uplink(config)
     tun = config["TUN"]
     if not tun_present(config):
@@ -418,8 +439,11 @@ def cmd_remove(who):
 
 
 def cmd_list():
-    for address, name in load_clients():
-        print(f"{address}  {inner_ipv4(address)}  {name}".rstrip())
+    clients = load_clients()
+    serving = {address for address, _ in served(clients, warn=False)}
+    for address, name in clients:
+        note = "" if address in serving else "  (not served: its IPv4 address is taken)"
+        print(f"{address}  {inner_ipv4(address)}  {name}".rstrip() + note)
 
 
 def apply():

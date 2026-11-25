@@ -1,0 +1,66 @@
+# Build and test on every push to main and every PR.
+#
+# Exists so that the two things a reviewer would otherwise have to take on
+# trust are run by a machine: the daemon's admission and routing rules
+# (cargo test), and the whole exit in network namespaces — a client, a second
+# client, the exit and an "internet", with the real control script, nftables
+# and the real daemon (test/netns.sh).
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Nothing here needs more than to read the tree. There are no secrets.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, 2026-07-17
+
+      - name: the inner-address formula is the same in the daemon and the script
+        run: |
+          set -euo pipefail
+          # Both derive a client's IPv4 address from its fips address, and a
+          # packet is admitted only when they agree. The daemon's own test
+          # holds the vectors; the script is checked against the same ones.
+          python3 -I - <<'PY'
+          import importlib.machinery, importlib.util, ipaddress
+          loader = importlib.machinery.SourceFileLoader("fips_exit", "fips-exit")
+          spec = importlib.util.spec_from_loader("fips_exit", loader)
+          m = importlib.util.module_from_spec(spec)
+          loader.exec_module(m)
+          vectors = {
+              "fdab:cdef::": "100.107.205.239",
+              "fdff:ffff::": "100.127.255.255",
+              "fd00::": "100.64.0.0",
+          }
+          for addr, want in vectors.items():
+              got = str(m.inner_ipv4(ipaddress.IPv6Address(addr)))
+              assert got == want, f"{addr}: script derives {got}, the contract says {want}"
+          print("script agrees with the contract vectors")
+          PY
+
+      - name: daemon unit tests (admission, routing, the address contract)
+        run: cargo test --locked
+
+      - name: release build
+        run: cargo build --release --locked
+
+      - name: the exit in network namespaces (test/netns.sh)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends nftables iproute2 iputils-ping
+          # Ubuntu 24.04 refuses unprivileged user namespaces to unconfined
+          # programs; the test is `unshare -Urnm`, as the README documents it.
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urnm test/netns.sh

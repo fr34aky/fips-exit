@@ -126,3 +126,12 @@ root and without fips: network namespaces stand in for two clients, the
 exit and the internet, and a 1280-byte link stands in for the mesh. It
 checks both families, NAT, full-size packets in both directions, TCP, the
 binding of a client to its addresses, isolation, removal and teardown.
+
+## Contributing
+
+Changes come as pull requests against `main`. The `checks` job has to pass:
+it runs the daemon's unit tests and `test/netns.sh`. Read
+[`PR-REVIEW.md`](PR-REVIEW.md) first — it is the checklist a PR is reviewed
+against — and [`SECURITY-REVIEW.md`](SECURITY-REVIEW.md) for where the trust
+boundaries are, what is known to be missing, and which design choices are
+deliberate. Say in the PR how the change was verified, and what was not.

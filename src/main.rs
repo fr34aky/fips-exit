@@ -418,7 +418,11 @@ const DNS_IN_FLIGHT: usize = 64;
 /// or commas between them) or, when that is unset, the host's
 /// `/etc/resolv.conf`. `Ok(None)`: `DNS_UPSTREAMS=off`, no resolver is run.
 fn dns_upstreams(setting: Option<&str>, resolv_conf: &str) -> Result<Option<Vec<SocketAddr>>, String> {
-    let setting = setting.map(|s| s.trim().trim_matches('"')).unwrap_or("");
+    // As systemd hands it over from the config file: possibly quoted, and
+    // with whatever followed a `#` on the line.
+    let setting = setting
+        .map(|s| s.split('#').next().unwrap_or("").trim().trim_matches('"').trim())
+        .unwrap_or("");
     if setting == "off" {
         return Ok(None);
     }
@@ -835,6 +839,9 @@ mod tests {
             Ok(Some(vec![at("9.9.9.9"), at("2620:fe::fe")]))
         );
         assert_eq!(dns_upstreams(Some("off"), conf), Ok(None));
+        // A comment after the value arrives with it from the unit's environment.
+        assert_eq!(dns_upstreams(Some("9.9.9.9  # quad9"), conf), Ok(Some(vec![at("9.9.9.9")])));
+        assert_eq!(dns_upstreams(Some("off # for now"), conf), Ok(None));
         assert!(dns_upstreams(Some("dns.example.org"), conf).is_err(), "a name is not an address");
         assert!(dns_upstreams(None, "search lan\n").is_err(), "nothing to forward to");
         // No more than four are asked.

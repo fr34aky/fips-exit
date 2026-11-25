@@ -351,9 +351,6 @@ table inet {TABLE} {{
     chain input {{
         type filter hook input priority filter; policy accept;
         iifname "{tun}" drop
-        # The daemon's resolver answers clients only; nobody else's query
-        # needs to reach it.
-        iifname "{mesh}" udp dport 53 ip6 saddr != @clients6 drop
     }}
     # With the kernel's own tunnel module loaded, the kernel answers every
     # tunnel packet the daemon has just taken with "port unreachable",

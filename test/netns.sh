@@ -17,7 +17,7 @@ trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$FIPS_EXIT_DIR"' EXIT
 mount -t tmpfs tmpfs /run
 
 E=fd0e::1 C1=fd11:2233:4455:6677::1 C2=fd99:8877:6655:4433::2
-C1V4=10.17.34.51 C2V4=10.153.136.119
+C1V4=100.81.34.51 C2V4=100.89.136.119
 fail() { echo "FAIL: $*"; exit 1; }
 ok() { echo "ok: $*"; }
 

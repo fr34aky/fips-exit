@@ -41,10 +41,25 @@ const PROTO_IPV6: i32 = 41; // IPPROTO_IPV6
 /// The largest inner packet: the TUN's MTU, and the IPv6 minimum.
 const TUN_MTU: i32 = 1280;
 
-/// The IPv4 address a client has inside the tunnel: `10.` and the three
-/// bytes after the `fd` of its fips address. The client derives the same.
+/// The IPv4 address a client has inside the tunnel: `100.64.0.0/10` with
+/// the low 22 bits of the three bytes after the `fd` of its fips address.
+/// The client derives the same; this is the contract with fips2go
+/// (`shim/src/exit.rs`, `inner_ipv4`) and its exit container, and must not
+/// change on one side only.
+///
+/// ```text
+/// inner = 0x64400000 | ((a[1] << 16 | a[2] << 8 | a[3]) & 0x3fffff)
+/// ```
+///
+/// Carrier-grade NAT space rather than `10/8`: a client's address must not
+/// fall inside a LAN the exit or the client is on, and `10/8` is the range
+/// most LANs use.
 fn inner_ipv4(fips_addr: &[u8; 16]) -> [u8; 4] {
-    [10, fips_addr[1], fips_addr[2], fips_addr[3]]
+    let bits = (u32::from(fips_addr[1]) << 16
+        | u32::from(fips_addr[2]) << 8
+        | u32::from(fips_addr[3]))
+        & 0x003f_ffff;
+    (0x6440_0000 | bits).to_be_bytes()
 }
 
 /// The allowed clients, by both of their inner addresses.
@@ -69,8 +84,22 @@ impl Clients {
             match field.parse::<Ipv6Addr>() {
                 Ok(addr) if addr.octets()[0] == 0xfd => {
                     let addr = addr.octets();
-                    clients.by_v6.insert(addr, ());
-                    clients.by_v4.insert(inner_ipv4(&addr), addr);
+                    // 22 bits, so two clients can derive one address. Their
+                    // replies could not be told apart: the first keeps it.
+                    // (`fips-exit add` refuses the second; this is for a
+                    // list edited by hand.)
+                    match clients.by_v4.get(&inner_ipv4(&addr)) {
+                        Some(other) if *other != addr => {
+                            eprintln!(
+                                "fips-exitd: {field} has the same inner IPv4 address as {}, skipped",
+                                Ipv6Addr::from(*other)
+                            );
+                        }
+                        _ => {
+                            clients.by_v6.insert(addr, ());
+                            clients.by_v4.insert(inner_ipv4(&addr), addr);
+                        }
+                    }
                 }
                 _ => eprintln!("fips-exitd: not a fips address, skipped: {field}"),
             }
@@ -504,7 +533,37 @@ mod tests {
     fn the_list_takes_fips_addresses_and_skips_the_rest() {
         let c = clients();
         assert_eq!(c.len(), 2);
-        assert_eq!(c.by_v4.get(&[10, 0x11, 0x22, 0x33]), Some(&addr(A)));
+        assert_eq!(c.by_v4.get(&[100, 0x51, 0x22, 0x33]), Some(&addr(A)));
+    }
+
+    /// The same vectors as fips2go's `exit::tests` and its exit container's
+    /// `test_exitctl.py`: all three derive one address for one client.
+    #[test]
+    fn the_inner_address_follows_the_shared_formula() {
+        let inner = |b1, b2, b3| {
+            let mut a = [0u8; 16];
+            a[0] = 0xfd;
+            a[1..4].copy_from_slice(&[b1, b2, b3]);
+            inner_ipv4(&a)
+        };
+        assert_eq!(inner(0xab, 0xcd, 0xef), [100, 107, 205, 239]);
+        assert_eq!(inner(0xff, 0xff, 0xff), [100, 127, 255, 255]);
+        assert_eq!(inner(0, 0, 0), [100, 64, 0, 0]);
+    }
+
+    /// Two addresses that differ only above the 22 bits derive one inner
+    /// address. The first on the list keeps it; the second is not a client.
+    #[test]
+    fn a_second_client_with_the_same_inner_address_is_skipped() {
+        let c = Clients::parse("fd11:2233::1 first\nfd51:2233::2 second\n");
+        assert_eq!(c.len(), 1);
+        let first: [u8; 16] = "fd11:2233::1".parse::<Ipv6Addr>().unwrap().octets();
+        let second: [u8; 16] = "fd51:2233::2".parse::<Ipv6Addr>().unwrap().octets();
+        assert_eq!(inner_ipv4(&first), inner_ipv4(&second));
+        assert_eq!(c.by_v4.get(&inner_ipv4(&first)), Some(&first));
+        assert!(!c.by_v6.contains_key(&second));
+        // The same line twice is one client, not a clash.
+        assert_eq!(Clients::parse("fd11:2233::1\nfd11:2233::1\n").len(), 1);
     }
 
     #[test]
@@ -540,7 +599,7 @@ mod tests {
         assert_eq!(c.route(&v4([1, 1, 1, 1], inner_ipv4(&b), 60)), Some((PROTO_IPV4, b)));
         assert_eq!(c.route(&v6([0x20; 16], a, 60)), Some((PROTO_IPV6, a)));
         // Nobody's address, too short, not IP.
-        assert_eq!(c.route(&v4([1, 1, 1, 1], [10, 9, 9, 9], 60)), None);
+        assert_eq!(c.route(&v4([1, 1, 1, 1], [100, 64, 9, 9], 60)), None);
         assert_eq!(c.route(&v6([0x20; 16], addr("fd77::7"), 60)), None);
         assert_eq!(c.route(&[0x45; 10]), None);
         assert_eq!(c.route(&[]), None);

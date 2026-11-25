@@ -105,9 +105,13 @@ def parse_client(text):
 
 
 def inner_ipv4(address):
-    """The client's IPv4 address inside the tunnel: 10. and the three bytes
-    after the fd of its fips address. The client derives the same value."""
-    return ipaddress.IPv4Address(b"\x0a" + address.packed[1:4])
+    """The client's IPv4 address inside the tunnel: 100.64.0.0/10 with the
+    low 22 bits of the three bytes after the fd of its fips address. The
+    client derives the same value; fips-exitd (src/main.rs) and fips2go
+    (shim/src/exit.rs) must agree with this, byte for byte."""
+    a = address.packed
+    bits = (a[1] << 16 | a[2] << 8 | a[3]) & 0x3FFFFF
+    return ipaddress.IPv4Address(0x64400000 | bits)
 
 
 # --- state -------------------------------------------------------------------
@@ -392,7 +396,7 @@ def cmd_add(who, name=""):
     for other, other_name in clients:
         if other == address:
             die(f"{address} is already a client")
-        # 24 bits of the address: a clash is unlikely, and must not pass.
+        # 22 bits of the address: a clash is unlikely, and must not pass.
         if inner_ipv4(other) == inner_ipv4(address):
             die(f"{address} clashes with client {other} {other_name} (same derived IPv4 address)")
     clients.append((address, name))

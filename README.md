@@ -30,9 +30,15 @@ Two parts run on the exit:
   or each other — and clamps the TCP MSS.
 
 Addresses inside the tunnel need no negotiation. A client's IPv6 source is
-its fips address (`fd…`). Its IPv4 source is `10.` followed by the three
-bytes after the `fd` of that address; both sides derive it, and `add`
-refuses a client whose derived address clashes with an existing one.
+its fips address (`fd…`). Its IPv4 source is in `100.64.0.0/10`: that
+prefix with the low 22 bits of the three bytes after the `fd` of the fips
+address (`0x64400000 | ((a[1] << 16 | a[2] << 8 | a[3]) & 0x3fffff)`). Both
+sides derive it, it is the same formula fips2go and its exit container use,
+and `add` refuses a client whose derived address clashes with an existing
+one. The range is carrier-grade NAT space, so that a client's address does
+not fall inside a LAN; an exit whose own uplink is behind carrier-grade NAT,
+or that also runs an overlay using the range (Tailscale does), can hold a
+client's address itself and should not be used as an exit.
 
 ## Install
 

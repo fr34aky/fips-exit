@@ -63,8 +63,9 @@ sudo fips-exit status
 Changes apply at once; the daemon re-reads the list on SIGHUP, which the
 script sends. The list is `/etc/fips-exit/clients`. `/etc/fips-exit/config`
 takes `WAN=<interface>` (default: the interface of the default route),
-`MESH_IF=<interface>` (default `fips0`) and `TUN=<name>` (default
-`fipsexit0`).
+`MESH_IF=<interface>` (default `fips0`), `TUN=<name>` (default `fipsexit0`)
+and `BLOCK_CIDRS=<networks>` (IPv4 or IPv6, space separated: further
+destinations no client may reach).
 
 On the client, enter this node's npub as the exit node. A direct fips link
 between client and exit (add the exit as a peer) keeps latency down; it is
@@ -90,6 +91,17 @@ packets, and QUIC over IPv6 stalls. Raising fips's transport MTU to about
 an optimisation, not a requirement.
 
 ## What the operator and the client should know
+
+- **A client reaches the public internet and nothing else.** Not this host,
+  not another client, and not the uplink's own network: private and
+  unique-local ranges, link-local, carrier-grade NAT space, multicast and
+  the documentation ranges are refused as destinations in both families,
+  whatever interface they would leave by. On a home network the uplink is
+  also the LAN, so without this a client could open the router's admin page.
+  `BLOCK_CIDRS` adds to the list; nothing takes away from it. What is NOT
+  blocked yet is the uplink's own *public* address when the exit sits behind
+  a NAT router: from inside, that address is the router. If that matters,
+  put it in `BLOCK_CIDRS`.
 
 - The exit sees its clients' internet traffic as any VPN endpoint does, and
   the internet sees the exit's address.

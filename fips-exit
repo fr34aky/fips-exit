@@ -131,6 +131,58 @@ def load_clients():
     return clients
 
 
+# Where a client may never be sent, whatever its packet says: this host's
+# and the uplink's own networks, the other clients, and everything that is
+# not the public internet. The uplink interface is usually the LAN as well,
+# so "out of the uplink" alone lets a client reach the operator's router,
+# NAS and printer. The same list as fips2go's exit container
+# (exit-node/exitctl.py, BLOCKED_V4), plus its IPv6 counterpart, since this
+# exit forwards IPv6 too.
+BLOCKED_V4 = [
+    "0.0.0.0/8",        # "this network"
+    "10.0.0.0/8",       # private
+    "100.64.0.0/10",    # carrier-grade NAT: the clients' own inner addresses
+    "127.0.0.0/8",      # loopback
+    "169.254.0.0/16",   # link-local
+    "172.16.0.0/12",    # private
+    "192.0.0.0/24",     # IETF protocol assignments
+    "192.0.2.0/24",     # documentation
+    "192.168.0.0/16",   # private
+    "198.18.0.0/15",    # benchmarking
+    "198.51.100.0/24",  # documentation
+    "203.0.113.0/24",   # documentation
+    "224.0.0.0/3",      # multicast, reserved, broadcast
+]
+BLOCKED_V6 = [
+    "::/8",             # unspecified, loopback, IPv4-mapped and -compatible
+    "64:ff9b:1::/48",   # local-use NAT64
+    "100::/64",         # discard-only
+    "2001::/32",        # Teredo
+    "2001:db8::/32",    # documentation
+    "2002::/16",        # 6to4: can carry a private IPv4 address inside
+    "3fff::/20",        # documentation
+    "fc00::/7",         # unique local, which includes the mesh (fd00::/8)
+    "fe80::/10",        # link-local
+    "fec0::/10",        # site-local (deprecated)
+    "ff00::/8",         # multicast
+]
+
+
+def blocked(config):
+    """(IPv4 networks, IPv6 networks) no client is forwarded to: the lists
+    above and BLOCK_CIDRS from the config, which only ever adds. A value
+    there that is not a network stops the script: a block the operator
+    asked for and did not get would be silent."""
+    v4, v6 = list(BLOCKED_V4), list(BLOCKED_V6)
+    for text in config.get("BLOCK_CIDRS", "").replace(",", " ").split():
+        try:
+            network = ipaddress.ip_network(text, strict=False)
+        except ValueError as error:
+            die(f"BLOCK_CIDRS: {text}: {error}")
+        (v4 if network.version == 4 else v6).append(str(network))
+    return v4, v6
+
+
 def served(clients, warn=True):
     """The clients the exit serves: the list, without any whose derived IPv4
     address an earlier line already has. `add` never writes such a line; a
@@ -236,6 +288,7 @@ def ruleset(clients, config, wan):
     tun, mesh = config["TUN"], config["MESH_IF"]
     set4 = ", ".join(str(inner_ipv4(a)) for a, _ in clients)
     set6 = ", ".join(str(a) for a, _ in clients)
+    blocked4, blocked6 = blocked(config)
     return f"""
 table inet {TABLE}
 delete table inet {TABLE}
@@ -252,6 +305,20 @@ table inet {TABLE} {{
         {"elements = { " + set6 + " }" if set6 else ""}
     }}
 
+    # Destinations no client reaches (see BLOCKED_V4 above).
+    set blocked4 {{
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = {{ {", ".join(blocked4)} }}
+    }}
+    set blocked6 {{
+        type ipv6_addr
+        flags interval
+        auto-merge
+        elements = {{ {", ".join(blocked6)} }}
+    }}
+
     chain forward {{
         type filter hook forward priority filter; policy accept;
         iifname "{tun}" jump from_client
@@ -260,8 +327,11 @@ table inet {TABLE} {{
     chain from_client {{
         meta nfproto ipv4 ip saddr != @clients4 drop
         meta nfproto ipv6 ip6 saddr != @clients6 drop
-        # The internet only: not this host's other networks, not each other.
+        # The internet only: not this host's other networks, not each other,
+        # and not the uplink's own LAN or anything else that is not public.
         oifname != "{wan}" drop
+        ip daddr @blocked4 drop
+        ip6 daddr @blocked6 drop
         meta nfproto ipv4 tcp flags syn tcp option maxseg size > {MSS4} tcp option maxseg size set {MSS4}
         meta nfproto ipv6 tcp flags syn tcp option maxseg size > {MSS6} tcp option maxseg size set {MSS6}
         accept

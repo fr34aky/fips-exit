@@ -28,15 +28,23 @@ ip -6 addr add $E/128 dev fips0 nodad
 ip -6 route add fd00::/8 dev fips0
 ip link add wan type veth peer name eth0
 ip link set wan up
-ip addr add 203.0.113.1/24 dev wan
-ip -6 addr add 2001:db8:1::1/64 dev wan nodad
+ip addr add 8.8.8.1/24 dev wan
+ip -6 addr add 2001:4860:1::1/64 dev wan nodad
+# The uplink is also the operator's LAN, as on most home networks, and has
+# a second public network the operator chose to block (BLOCK_CIDRS).
+ip addr add 192.168.77.1/24 dev wan
+ip -6 addr add fc00:77::1/64 dev wan nodad
+ip addr add 9.9.9.1/24 dev wan
 
 ip netns add inet
 ip link set eth0 netns inet
 ip -n inet link set lo up
 ip -n inet link set eth0 up
-ip -n inet addr add 203.0.113.2/24 dev eth0
-ip -n inet -6 addr add 2001:db8:1::2/64 dev eth0 nodad
+ip -n inet addr add 8.8.8.2/24 dev eth0
+ip -n inet -6 addr add 2001:4860:1::2/64 dev eth0 nodad
+ip -n inet addr add 192.168.77.2/24 dev eth0
+ip -n inet -6 addr add fc00:77::2/64 dev eth0 nodad
+ip -n inet addr add 9.9.9.2/24 dev eth0
 # No route back to anything but the exit's own uplink addresses: a reply
 # only arrives if the exit masqueraded.
 
@@ -73,7 +81,7 @@ client() { # name address ipv4
 }
 client c1 $C1 $C1V4
 client c2 $C2 $C2V4
-printf "WAN=wan\nFIPS_FIREWALL=\n" > "$FIPS_EXIT_DIR/config"
+printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n" > "$FIPS_EXIT_DIR/config"
 daemon="$here/target/release/fips-exitd"
 [ -x "$daemon" ] || fail "build the daemon first: cargo build --release"
 
@@ -114,7 +122,7 @@ else: print("timeout")' "$2" "$3" "$4"
 
 # --- before any client is added: nothing passes -------------------------------
 "$here/fips-exit" up >/dev/null
-[ "$(ask c1 4 203.0.113.2 100)" = timeout ] || fail "traffic passed without a client entry"
+[ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "traffic passed without a client entry"
 ok "no client entry, no traffic"
 
 "$here/fips-exit" add $C1 phone-one >/dev/null
@@ -122,18 +130,18 @@ ok "no client entry, no traffic"
 ok "client added: $("$here/fips-exit" list)"
 
 # --- both families, masqueraded -----------------------------------------------
-[ "$(ask c1 4 203.0.113.2 100)" = 100 ] || fail "IPv4 through the exit"
-[ "$(ask c1 6 2001:db8:1::2 100)" = 100 ] || fail "IPv6 through the exit"
-grep -qx 203.0.113.1 "$FIPS_EXIT_DIR/peers" || fail "IPv4 not masqueraded: $(cat "$FIPS_EXIT_DIR/peers")"
-grep -qx 2001:db8:1::1 "$FIPS_EXIT_DIR/peers" || fail "IPv6 not masqueraded: $(cat "$FIPS_EXIT_DIR/peers")"
+[ "$(ask c1 4 8.8.8.2 100)" = 100 ] || fail "IPv4 through the exit"
+[ "$(ask c1 6 2001:4860:1::2 100)" = 100 ] || fail "IPv6 through the exit"
+grep -qx 8.8.8.1 "$FIPS_EXIT_DIR/peers" || fail "IPv4 not masqueraded: $(cat "$FIPS_EXIT_DIR/peers")"
+grep -qx 2001:4860:1::1 "$FIPS_EXIT_DIR/peers" || fail "IPv6 not masqueraded: $(cat "$FIPS_EXIT_DIR/peers")"
 ok "IPv4 and IPv6 reach the internet from the exit's addresses"
 
 # --- full-size packets towards the client --------------------------------------
 # 1280 bytes is the tunnel's MTU: IPv4 payload 1252 (DF set, as QUIC does),
 # IPv6 payload 1232. Neither fits one mesh packet beside the outer header, so
 # the exit sends two fragments of the outer packet and the client reassembles.
-[ "$(ask c1 4 203.0.113.2 1252)" = 1252 ] || fail "1280-byte IPv4 packet (DF) towards the client"
-[ "$(ask c1 6 2001:db8:1::2 1232)" = 1232 ] || fail "1280-byte IPv6 packet towards the client"
+[ "$(ask c1 4 8.8.8.2 1252)" = 1252 ] || fail "1280-byte IPv4 packet (DF) towards the client"
+[ "$(ask c1 6 2001:4860:1::2 1232)" = 1232 ] || fail "1280-byte IPv6 packet towards the client"
 ok "1280-byte packets arrive in both families (outer fragments)"
 
 # --- a 1280-byte IPv6 packet from the client ----------------------------------
@@ -156,7 +164,7 @@ for offset in (0, 1232):
     data = inner[offset:offset + 1232]
     frag = struct.pack("!BBHI", 41, 0, offset | (offset + len(data) < len(inner)), 0xf1b5) + data
     raw.sendto(struct.pack("!IHBB", 0x60000000, len(frag), 44, 64) + src + exit_ + frag, (sys.argv[2], 0))
-print(len(reply.recv(4096)))' $C1 $E 2001:db8:1::2 | grep -qx 100 || fail "fragmented 1280-byte IPv6 packet from the client"
+print(len(reply.recv(4096)))' $C1 $E 2001:4860:1::2 | grep -qx 100 || fail "fragmented 1280-byte IPv6 packet from the client"
 ok "a 1280-byte IPv6 packet sent as two outer fragments is reassembled by the exit"
 
 # --- TCP MSS ------------------------------------------------------------------
@@ -175,31 +183,49 @@ while True:
     if not d: break
     n += len(d)
 print(n)' "$1"; }
-[ "$(fetch 203.0.113.2)" = 200000 ] || fail "TCP over IPv4"
-[ "$(fetch 2001:db8:1::2)" = 200000 ] || fail "TCP over IPv6"
+[ "$(fetch 8.8.8.2)" = 200000 ] || fail "TCP over IPv4"
+[ "$(fetch 2001:4860:1::2)" = 200000 ] || fail "TCP over IPv6"
 ok "TCP transfers complete in both families"
 
 # --- a client is bound to its own addresses -----------------------------------
 "$here/fips-exit" add $C2 phone-two >/dev/null
-[ "$(ask c2 4 203.0.113.2 100)" = 100 ] || fail "second client"
+[ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "second client"
 ip -n c2 addr add $C1V4/32 dev tun0
 ip netns exec c2 python3 -c '
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("'$C1V4'", 0)); s.settimeout(1.5)
-s.sendto(b"100", ("203.0.113.2", 4444))
+s.sendto(b"100", ("8.8.8.2", 4444))
 try: s.recv(4096); print("SPOOFED")
 except socket.timeout: print("dropped")' | grep -qx dropped || fail "client two sent as client one"
 ok "a client cannot send from another client's address"
 
 # --- clients do not reach the exit host or each other -------------------------
-ip netns exec c1 ping -c 1 -W 1 -q 203.0.113.1 >/dev/null 2>&1 && fail "client reached the exit host through the tunnel"
+ip netns exec c1 ping -c 1 -W 1 -q 8.8.8.1 >/dev/null 2>&1 && fail "client reached the exit host through the tunnel"
 ip netns exec c1 ping -c 1 -W 1 -q $C2V4 >/dev/null 2>&1 && fail "client reached another client"
 ok "the exit host and other clients are not reachable through the tunnel"
 
+# --- the internet only: not the uplink's own LAN -------------------------------
+# The host on the LAN answers the exit itself, so it is up; a client's packet
+# to it would leave by the uplink interface like any other. The destination
+# is what stops it.
+ip netns exec inet ping -c 1 -W 1 -q 192.168.77.1 >/dev/null 2>&1 || fail "test setup: the LAN host does not reach the exit"
+[ "$(ask c1 4 192.168.77.2 100)" = timeout ] || fail "CLIENT REACHED A PRIVATE ADDRESS ON THE UPLINK'S LAN"
+[ "$(ask c1 6 fc00:77::2 100)" = timeout ] || fail "CLIENT REACHED A UNIQUE-LOCAL ADDRESS ON THE UPLINK'S LAN"
+[ "$(ask c1 4 9.9.9.2 100)" = timeout ] || fail "CLIENT REACHED A NETWORK IN BLOCK_CIDRS"
+[ "$(ask c1 4 8.8.8.2 100)" = 100 ] || fail "the blocks broke the internet"
+ok "private, unique-local and BLOCK_CIDRS destinations are not reachable through the tunnel"
+
+# A BLOCK_CIDRS entry that is not a network stops the script.
+printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=not-a-network\n" > "$FIPS_EXIT_DIR/config"
+"$here/fips-exit" up >/dev/null 2>&1 && fail "up accepted a bad BLOCK_CIDRS"
+printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n" > "$FIPS_EXIT_DIR/config"
+"$here/fips-exit" up >/dev/null
+ok "a bad BLOCK_CIDRS entry is refused"
+
 # --- removal and teardown -----------------------------------------------------
 "$here/fips-exit" remove phone-one >/dev/null
-[ "$(ask c1 4 203.0.113.2 100)" = timeout ] || fail "removed client still passes"
-[ "$(ask c2 4 203.0.113.2 100)" = 100 ] || fail "remaining client broke on removal"
+[ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "removed client still passes"
+[ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "remaining client broke on removal"
 ok "removing a client cuts it off and leaves the others"
 "$here/fips-exit" down >/dev/null
 ip route show dev fipsexit0 | grep -q . && fail "routes left after down"

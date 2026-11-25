@@ -55,7 +55,10 @@ IPv4 address derived from the client's fips address.
   every client, or routes replies to nobody. CI checks the daemon and the
   script against the same vectors fips2go tests.
 - **Firewall leaks.** A client reaching this host, another client, or
-  anything that is not the uplink; or the internet opening a connection to a
+  anything that is not the public internet — the uplink interface is usually
+  the LAN too, so the destination lists (`BLOCKED_V4`, `BLOCKED_V6` in the
+  script, the same as fips2go's container plus IPv6) are what keeps a client
+  off it, and a change that shortens them needs a reason; or the internet opening a connection to a
   client. Also: rules left behind after `down`, and rules of someone else's
   (fips's table, ufw's chains) changed beyond the tagged ones this script
   adds.
@@ -69,11 +72,11 @@ IPv4 address derived from the client's fips address.
 
 ## Known gaps — real, not yet fixed
 
-- **A client can reach the exit's LAN** when the LAN is on the uplink
-  interface, as on most home networks: `from_client` only requires the
-  packet to leave by the uplink. fips2go's exit container blocks private
-  ranges, carrier-grade NAT space and the network's own public address; this
-  has to do the same before it is used anywhere the LAN matters.
+- **The uplink's own public address is not blocked** when the exit is
+  behind a NAT router. From inside, that address is the router: its admin
+  page and, through NAT loopback, every port it forwards. fips2go's exit
+  container looks the address up and keeps it blocked as it changes; here
+  the operator has to put it in `BLOCK_CIDRS`.
 - **No DNS for clients.** A fips2go phone sends every lookup to its exit's
   port 53. Nothing answers here.
 - **No limit on clients, bandwidth or destinations** beyond the list itself.

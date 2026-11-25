@@ -154,8 +154,13 @@ BLOCKED_V4 = [
     "224.0.0.0/3",      # multicast, reserved, broadcast
 ]
 BLOCKED_V6 = [
-    "::/8",             # unspecified, loopback, IPv4-mapped and -compatible
-    "64:ff9b:1::/48",   # local-use NAT64
+    # All of 0000::/8, which IANA reserves: unspecified, loopback,
+    # IPv4-mapped and -compatible, and both NAT64 prefixes (64:ff9b::/96 and
+    # 64:ff9b:1::/48). A NAT64 gateway on the uplink's network would turn
+    # 64:ff9b::c0a8:101 into 192.168.1.1, so the prefix is a way round the
+    # IPv4 list. The cost: an exit whose uplink is IPv6-only behind NAT64
+    # cannot carry its clients' IPv6 connections to IPv4-only sites.
+    "::/8",
     "100::/64",         # discard-only
     "2001::/32",        # Teredo
     "2001:db8::/32",    # documentation

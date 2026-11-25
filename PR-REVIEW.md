@@ -66,7 +66,8 @@ Do this before reading a single diff hunk.
 6. **Admission is still exact.** A packet enters the tunnel only from a
    listed client and only with that client's own inner source address. A
    reply goes only to the client its destination belongs to. Two clients may
-   never share an inner address, in `add` or in a list edited by hand.
+   never share an inner address, in `add` or in a list edited by hand. The
+   resolver answers listed clients only, and only queries.
 7. **The firewall still isolates.** Through the tunnel a client reaches the
    uplink and nothing else on this host, and not another client; the
    internet reaches a client only as a reply. `SECURITY-REVIEW.md` lists

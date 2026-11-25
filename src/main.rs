@@ -25,13 +25,20 @@
 //!   and nowhere if it belongs to none.
 //!
 //! Everything else (the TUN's routes, NAT, the firewall) is `fips-exit up`.
+//!
+//! It also answers its clients' DNS. A fips2go phone sends every lookup to
+//! UDP port 53 on its exit's fips address, over the mesh and outside the
+//! tunnel, so that no name leaves through the phone's own network. Without
+//! an answer there the exit carries packets nobody can address. The daemon
+//! forwards a listed client's query to the host's resolvers and returns the
+//! answer; it does not parse names and caches nothing ([`serve_dns`]).
 //! The client list is re-read on SIGHUP.
 
 use std::collections::HashMap;
 use std::io;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -283,6 +290,9 @@ struct Counters {
     refused: AtomicU64,
     unrouted: AtomicU64,
     send_failed: AtomicU64,
+    dns_answered: AtomicU64,
+    dns_refused: AtomicU64,
+    dns_failed: AtomicU64,
 }
 
 static RELOAD: AtomicBool = AtomicBool::new(false);
@@ -388,6 +398,186 @@ fn from_tun(state: &State, tun: RawFd, socket4: RawFd, socket6: RawFd) -> io::Er
     }
 }
 
+// ---- DNS for the clients ---------------------------------------------------
+
+const DNS_PORT: u16 = 53;
+/// The largest query read and the largest answer taken from an upstream.
+const DNS_BUFFER: usize = 4096;
+/// The largest answer sent to a client in one piece. A mesh packet is 1280
+/// bytes; an answer that would not fit one is replaced by a truncated one
+/// ([`dns_reply`]) rather than sent as fragments, which a client's small
+/// in-process stack may not put together again.
+const DNS_MAX_REPLY: usize = 1232;
+/// How long one upstream is waited for.
+const DNS_TIMEOUT: Duration = Duration::from_secs(3);
+/// Queries being forwarded at once. Each is a thread waiting on a socket;
+/// beyond this a query is dropped and the client's resolver asks again.
+const DNS_IN_FLIGHT: usize = 64;
+
+/// The resolvers to forward to, from `DNS_UPSTREAMS` (IP addresses, spaces
+/// or commas between them) or, when that is unset, the host's
+/// `/etc/resolv.conf`. `Ok(None)`: `DNS_UPSTREAMS=off`, no resolver is run.
+fn dns_upstreams(setting: Option<&str>, resolv_conf: &str) -> Result<Option<Vec<SocketAddr>>, String> {
+    let setting = setting.map(|s| s.trim().trim_matches('"')).unwrap_or("");
+    if setting == "off" {
+        return Ok(None);
+    }
+    let named: Vec<&str> = if setting.is_empty() {
+        // `nameserver <address>` lines; a zone index (fe80::1%eth0) is cut.
+        resolv_conf
+            .lines()
+            .filter_map(|l| l.split('#').next()?.trim().strip_prefix("nameserver"))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .map(|a| a.split('%').next().unwrap_or(a))
+            .collect()
+    } else {
+        setting.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect()
+    };
+    let mut upstreams = Vec::new();
+    for text in named {
+        let ip: IpAddr =
+            text.parse().map_err(|_| format!("DNS upstream is not an IP address: {text}"))?;
+        let addr = SocketAddr::new(ip, DNS_PORT);
+        if !upstreams.contains(&addr) {
+            upstreams.push(addr);
+        }
+    }
+    if upstreams.is_empty() {
+        return Err("no DNS upstream: set DNS_UPSTREAMS, or DNS_UPSTREAMS=off".into());
+    }
+    upstreams.truncate(4);
+    Ok(Some(upstreams))
+}
+
+/// Where the question section of a DNS message with exactly one question
+/// ends, or `None` for anything else. The only place a query is looked
+/// into, and the bytes are a client's: every step is bounds-checked.
+fn question_end(message: &[u8]) -> Option<usize> {
+    if message.len() < 12 || message[4..6] != [0, 1] {
+        return None;
+    }
+    let mut at = 12;
+    loop {
+        let len = usize::from(*message.get(at)?);
+        if len == 0 {
+            at += 1;
+            break;
+        }
+        // A label, not a compression pointer: a question has none.
+        if len > 63 {
+            return None;
+        }
+        at += 1 + len;
+        if at > 12 + 255 {
+            return None;
+        }
+    }
+    // QTYPE and QCLASS.
+    (at + 4 <= message.len()).then_some(at + 4)
+}
+
+/// An answer with no records for `query`: its header and question with the
+/// response bit set, the truncated bit if `truncated`, and `rcode`. `None`
+/// for a query that is not exactly one question, which gets no answer.
+fn dns_reply(query: &[u8], truncated: bool, rcode: u8) -> Option<Vec<u8>> {
+    let end = question_end(query)?;
+    let mut reply = query[..end].to_vec();
+    // QR, the query's opcode and RD, and TC when asked for.
+    reply[2] = 0x80 | (query[2] & 0x79) | if truncated { 0x02 } else { 0 };
+    // RA, and the code.
+    reply[3] = 0x80 | (rcode & 0x0f);
+    // One question; no answer, authority or additional records.
+    reply[6..12].fill(0);
+    Some(reply)
+}
+
+/// Ask the upstreams in turn; the first answer to this query wins.
+fn dns_forward(query: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; DNS_BUFFER];
+    for upstream in upstreams {
+        let bind: SocketAddr = match upstream {
+            SocketAddr::V4(_) => ([0, 0, 0, 0], 0).into(),
+            SocketAddr::V6(_) => ([0u16; 8], 0).into(),
+        };
+        let Ok(socket) = UdpSocket::bind(bind) else { continue };
+        // Connected: the kernel drops datagrams from anyone else.
+        if socket.connect(upstream).is_err()
+            || socket.set_read_timeout(Some(DNS_TIMEOUT)).is_err()
+            || socket.send(query).is_err()
+        {
+            continue;
+        }
+        let deadline = std::time::Instant::now() + DNS_TIMEOUT;
+        while std::time::Instant::now() < deadline {
+            match socket.recv(&mut buf) {
+                // The same id, and a response.
+                Ok(n) if n >= 12 && buf[..2] == query[..2] && buf[2] & 0x80 != 0 => {
+                    return Some(buf[..n].to_vec());
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    None
+}
+
+/// The resolver: UDP port 53 on this node's fips address. Answers listed
+/// clients only (the source of a packet on the mesh is its sender's fips
+/// address: fips authenticates it), so this is not an open resolver for the
+/// mesh. Returns only if the socket fails.
+fn serve_dns(state: Arc<State>, socket: UdpSocket, upstreams: Vec<SocketAddr>) -> io::Error {
+    let socket = Arc::new(socket);
+    let upstreams = Arc::new(upstreams);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let mut buf = [0u8; DNS_BUFFER];
+    loop {
+        let (n, peer) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return e,
+        };
+        state.reload_if_asked();
+        let IpAddr::V6(source) = peer.ip() else { continue };
+        let listed = state.clients.read().unwrap().by_v6.contains_key(&source.octets());
+        // A response bit set is not a query: never answer an answer.
+        if !listed || n < 12 || buf[2] & 0x80 != 0 {
+            state.counters.dns_refused.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if in_flight.fetch_add(1, Ordering::Relaxed) >= DNS_IN_FLIGHT {
+            in_flight.fetch_sub(1, Ordering::Relaxed);
+            state.counters.dns_failed.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let query = buf[..n].to_vec();
+        let (state, socket, upstreams, in_flight) =
+            (state.clone(), socket.clone(), upstreams.clone(), in_flight.clone());
+        std::thread::spawn(move || {
+            let reply = match dns_forward(&query, &upstreams) {
+                Some(answer) if answer.len() <= DNS_MAX_REPLY => {
+                    state.counters.dns_answered.fetch_add(1, Ordering::Relaxed);
+                    Some(answer)
+                }
+                // Too large for one mesh packet: tell the client so.
+                Some(_) => {
+                    state.counters.dns_answered.fetch_add(1, Ordering::Relaxed);
+                    dns_reply(&query, true, 0)
+                }
+                // No upstream answered: SERVFAIL now, not a timeout later.
+                None => {
+                    state.counters.dns_failed.fetch_add(1, Ordering::Relaxed);
+                    dns_reply(&query, false, 2)
+                }
+            };
+            if let Some(reply) = reply {
+                let _ = socket.send_to(&reply, peer);
+            }
+            in_flight.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+}
+
 struct Args {
     clients: String,
     mesh_if: String,
@@ -460,11 +650,36 @@ fn run() -> Result<(), String> {
             std::process::exit(1);
         });
     }
+    // DNS for the clients. A resolver that cannot start is said loudly and is
+    // not fatal: the tunnel works without it for anyone who brings their own.
+    let resolv_conf = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    match dns_upstreams(std::env::var("DNS_UPSTREAMS").ok().as_deref(), &resolv_conf) {
+        Ok(None) => eprintln!("fips-exitd: DNS_UPSTREAMS=off: no DNS for clients"),
+        Err(e) => eprintln!("fips-exitd: NO DNS FOR CLIENTS: {e}"),
+        Ok(Some(upstreams)) => {
+            match UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(local)), DNS_PORT)) {
+                Ok(socket) => {
+                    let list: Vec<String> = upstreams.iter().map(|u| u.ip().to_string()).collect();
+                    eprintln!("fips-exitd: DNS for clients on port {DNS_PORT}, forwarding to {}", list.join(", "));
+                    let state = state.clone();
+                    std::thread::spawn(move || {
+                        let e = serve_dns(state, socket, upstreams);
+                        eprintln!("fips-exitd: DNS socket: {e}");
+                        std::process::exit(1);
+                    });
+                }
+                Err(e) => eprintln!(
+                    "fips-exitd: NO DNS FOR CLIENTS: cannot listen on [{}]:{DNS_PORT}: {e}",
+                    Ipv6Addr::from(local)
+                ),
+            }
+        }
+    }
     {
         // Once a minute, and only if something moved: a line for the journal.
         let state = state.clone();
         std::thread::spawn(move || {
-            let mut last = (0, 0, 0, 0);
+            let mut last = (0, 0, 0, 0, 0, 0, 0);
             loop {
                 std::thread::sleep(Duration::from_secs(60));
                 state.reload_if_asked();
@@ -474,11 +689,15 @@ fn run() -> Result<(), String> {
                     c.to_clients.load(Ordering::Relaxed),
                     c.refused.load(Ordering::Relaxed),
                     c.unrouted.load(Ordering::Relaxed),
+                    c.dns_answered.load(Ordering::Relaxed),
+                    c.dns_refused.load(Ordering::Relaxed),
+                    c.dns_failed.load(Ordering::Relaxed),
                 );
                 if now != last {
                     eprintln!(
-                        "fips-exitd: packets to internet {}, to clients {}, refused {}, unrouted {}",
-                        now.0, now.1, now.2, now.3
+                        "fips-exitd: packets to internet {}, to clients {}, refused {}, unrouted {}; \
+                         DNS answered {}, refused {}, failed {}",
+                        now.0, now.1, now.2, now.3, now.4, now.5, now.6
                     );
                     last = now;
                 }
@@ -604,4 +823,78 @@ mod tests {
         assert_eq!(c.route(&[0x45; 10]), None);
         assert_eq!(c.route(&[]), None);
     }
+    #[test]
+    fn upstreams_come_from_the_setting_or_the_hosts_resolv_conf() {
+        let at = |text: &str| SocketAddr::new(text.parse().unwrap(), 53);
+        let conf = "# resolv.conf\nnameserver 127.0.0.53\nnameserver fe80::1%eth0\noptions edns0\nsearch lan\n";
+        assert_eq!(dns_upstreams(None, conf), Ok(Some(vec![at("127.0.0.53"), at("fe80::1")])));
+        assert_eq!(dns_upstreams(Some(""), conf), Ok(Some(vec![at("127.0.0.53"), at("fe80::1")])));
+        // The setting replaces the file, and is trimmed like the script's values.
+        assert_eq!(
+            dns_upstreams(Some("\"9.9.9.9, 2620:fe::fe 9.9.9.9\""), conf),
+            Ok(Some(vec![at("9.9.9.9"), at("2620:fe::fe")]))
+        );
+        assert_eq!(dns_upstreams(Some("off"), conf), Ok(None));
+        assert!(dns_upstreams(Some("dns.example.org"), conf).is_err(), "a name is not an address");
+        assert!(dns_upstreams(None, "search lan\n").is_err(), "nothing to forward to");
+        // No more than four are asked.
+        let many = "1.1.1.1 1.0.0.1 9.9.9.9 8.8.8.8 8.8.4.4";
+        assert_eq!(dns_upstreams(Some(many), "").unwrap().unwrap().len(), 4);
+    }
+
+    /// `example.com A IN`, id abcd, recursion desired.
+    fn query() -> Vec<u8> {
+        let mut q = vec![0xab, 0xcd, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        q
+    }
+
+    #[test]
+    fn the_question_is_found_or_the_query_is_left_alone() {
+        let q = query();
+        assert_eq!(question_end(&q), Some(q.len()));
+        // With an EDNS record after it, the question still ends where it ends.
+        let mut edns = q.clone();
+        edns[11] = 1;
+        edns.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(question_end(&edns), Some(q.len()));
+        // Truncated anywhere, two questions, a pointer, an endless name: none.
+        for cut in 0..q.len() {
+            assert_eq!(question_end(&q[..cut]), None, "cut at {cut}");
+        }
+        let mut two = q.clone();
+        two[5] = 2;
+        assert_eq!(question_end(&two), None);
+        let mut pointer = q.clone();
+        pointer[12] = 0xc0;
+        assert_eq!(question_end(&pointer), None);
+        let mut long = vec![0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for _ in 0..10 {
+            long.push(63);
+            long.extend_from_slice(&[b'a'; 63]);
+        }
+        long.extend_from_slice(&[0, 0, 1, 0, 1]);
+        assert_eq!(question_end(&long), None, "a name over 255 bytes");
+    }
+
+    #[test]
+    fn an_empty_answer_keeps_the_id_and_the_question() {
+        let q = query();
+        let fail = dns_reply(&q, false, 2).unwrap();
+        assert_eq!(fail[..2], q[..2], "the id");
+        assert_eq!(fail[2], 0x81, "a response, recursion desired as asked");
+        assert_eq!(fail[3], 0x82, "recursion available, SERVFAIL");
+        assert_eq!(fail[4..12], [0, 1, 0, 0, 0, 0, 0, 0], "one question, no records");
+        assert_eq!(fail[12..], q[12..], "the question as asked");
+        let cut = dns_reply(&q, true, 0).unwrap();
+        assert_eq!(cut[2], 0x83, "truncated");
+        assert_eq!(cut[3], 0x80);
+        // The EDNS record of a query is not echoed: the count says none.
+        let mut edns = q.clone();
+        edns[11] = 1;
+        edns.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(dns_reply(&edns, false, 2).unwrap(), fail);
+        assert_eq!(dns_reply(&q[..14], false, 2), None, "no answer to what is not a question");
+    }
+
 }

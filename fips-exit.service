@@ -8,6 +8,8 @@ Requires=fips.service
 # The daemon moves packets between the mesh and its TUN device (it waits for
 # fips's interface by itself); fips-exit then applies routes, NAT and the
 # firewall for the clients in /etc/fips-exit/clients.
+# DNS_UPSTREAMS for the daemon's resolver, if the config sets it.
+EnvironmentFile=-/etc/fips-exit/config
 ExecStart=/usr/local/sbin/fips-exitd
 ExecStartPost=/bin/sh -c 'for i in $(seq 80); do ip link show fipsexit0 >/dev/null 2>&1 && exec /usr/local/sbin/fips-exit up; sleep 0.5; done; exit 1'
 ExecStopPost=/usr/local/sbin/fips-exit down

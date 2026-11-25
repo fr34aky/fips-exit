@@ -88,7 +88,7 @@ daemon="$here/target/release/fips-exitd"
 # --- without the daemon, the script says so and applies nothing ----------------
 "$here/fips-exit" up 2>&1 | grep -q "fips-exitd is not running" || fail "up without the daemon"
 ok "up without the daemon is refused"
-"$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>"$FIPS_EXIT_DIR/daemon.log" &
+DNS_UPSTREAMS=8.8.8.2 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>"$FIPS_EXIT_DIR/daemon.log" &
 for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && break; sleep 0.2; done
 ip link show fipsexit0 >/dev/null 2>&1 || fail "the daemon did not create its TUN: $(cat "$FIPS_EXIT_DIR/daemon.log")"
 
@@ -120,10 +120,44 @@ for _ in range(3):
 else: print("timeout")' "$2" "$3" "$4"
 }
 
+# The upstream resolver the daemon forwards its clients' DNS to: answers any
+# question with one A record, and a name starting "big" with far more than
+# fits one mesh packet.
+cat > "$FIPS_EXIT_DIR/dns.py" <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("8.8.8.2", 53))
+while True:
+    q, peer = s.recvfrom(4096)
+    head = q[:2] + b"\x81\x80" + b"\x00\x01\x00\x01\x00\x00\x00\x00"
+    end = 12
+    while q[end]: end += 1 + q[end]
+    question = q[12:end + 5]
+    answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04"
+    if question[1:4] == b"big": answer += b"\x00" * 1500
+    s.sendto(head + question + answer, peer)
+PY
+ip netns exec inet python3 "$FIPS_EXIT_DIR/dns.py" &
+dns_pid=$!
+resolve() { # netns name -> "answers=<n> rcode=<n> tc=<0|1>" or "timeout"
+  ip netns exec "$1" python3 -c '
+import socket, sys
+me, exit_, name = sys.argv[1:4]
+q = b"\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+for label in name.split("."): q += bytes([len(label)]) + label.encode()
+q += b"\x00\x00\x01\x00\x01"
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind((me, 0)); s.settimeout(5)
+s.sendto(q, (exit_, 53))
+try: r = s.recv(4096)
+except socket.timeout: print("timeout"); sys.exit()
+assert r[:2] == q[:2] and r[2] & 0x80
+print("answers=%d rcode=%d tc=%d size=%d" % (int.from_bytes(r[6:8], "big"), r[3] & 15, (r[2] >> 1) & 1, len(r)))' "$2" $E "$3"
+}
+
 # --- before any client is added: nothing passes -------------------------------
 "$here/fips-exit" up >/dev/null
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "traffic passed without a client entry"
-ok "no client entry, no traffic"
+[ "$(resolve c1 $C1 example.com)" = timeout ] || fail "DNS answered without a client entry"
+ok "no client entry, no traffic and no DNS"
 
 "$here/fips-exit" add $C1 phone-one >/dev/null
 "$here/fips-exit" list | grep -q "$C1  $C1V4  phone-one" || fail "list: $("$here/fips-exit" list)"
@@ -187,6 +221,19 @@ print(n)' "$1"; }
 [ "$(fetch 2001:4860:1::2)" = 200000 ] || fail "TCP over IPv6"
 ok "TCP transfers complete in both families"
 
+# --- DNS for the clients, and only for them ------------------------------------
+# A phone sends its lookups to port 53 on the exit's fips address, over the
+# mesh and outside the tunnel.
+r=$(resolve c1 $C1 example.com)
+[ "${r% size=*}" = "answers=1 rcode=0 tc=0" ] || fail "a client's DNS query: $r"
+[ "$(resolve c2 $C2 example.com)" = timeout ] || fail "A NODE THAT IS NOT A CLIENT GOT DNS"
+# An answer too large for one mesh packet comes back truncated, not in
+# fragments.
+r=$(resolve c1 $C1 big.example.com)
+[ "${r% size=*}" = "answers=0 rcode=0 tc=1" ] || fail "an oversized DNS answer: $r"
+[ "${r#*size=}" -le 1232 ] || fail "an oversized DNS answer was sent whole: $r"
+ok "a client resolves names through the exit, a stranger does not, and a large answer is truncated"
+
 # --- a client is bound to its own addresses -----------------------------------
 "$here/fips-exit" add $C2 phone-two >/dev/null
 [ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "second client"
@@ -221,6 +268,12 @@ printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=not-a-network\n" > "$FIPS_EXIT_DIR/
 printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n" > "$FIPS_EXIT_DIR/config"
 "$here/fips-exit" up >/dev/null
 ok "a bad BLOCK_CIDRS entry is refused"
+
+# --- no upstream answers: the client is told at once ---------------------------
+kill $dns_pid
+r=$(resolve c2 $C2 example.com)
+[ "${r% size=*}" = "answers=0 rcode=2 tc=0" ] || fail "DNS with the upstream down: $r"
+ok "with no upstream answering, a client gets SERVFAIL instead of silence"
 
 # --- removal and teardown -----------------------------------------------------
 "$here/fips-exit" remove phone-one >/dev/null

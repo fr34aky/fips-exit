@@ -64,8 +64,11 @@ Changes apply at once; the daemon re-reads the list on SIGHUP, which the
 script sends. The list is `/etc/fips-exit/clients`. `/etc/fips-exit/config`
 takes `WAN=<interface>` (default: the interface of the default route),
 `MESH_IF=<interface>` (default `fips0`), `TUN=<name>` (default `fipsexit0`)
-and `BLOCK_CIDRS=<networks>` (IPv4 or IPv6, space separated: further
-destinations no client may reach).
+`BLOCK_CIDRS=<networks>` (IPv4 or IPv6, space separated: further
+destinations no client may reach) and `DNS_UPSTREAMS=<addresses>` (the
+resolvers the clients' lookups are forwarded to; default: the host's
+`/etc/resolv.conf`; `off` for no DNS at all). The daemon reads the last one
+when it starts: `sudo systemctl restart fips-exit` after changing it.
 
 On the client, enter this node's npub as the exit node. A direct fips link
 between client and exit (add the exit as a peer) keeps latency down; it is
@@ -91,6 +94,15 @@ packets, and QUIC over IPv6 stalls. Raising fips's transport MTU to about
 an optimisation, not a requirement.
 
 ## What the operator and the client should know
+
+- **The exit answers its clients' DNS.** A fips2go phone sends every lookup
+  to UDP port 53 on its exit's fips address, over the mesh, so that no name
+  leaves through the phone's own network. The daemon forwards a listed
+  client's query to the host's resolvers and returns the answer. Only listed
+  clients are answered, so it is not an open resolver for the mesh. It caches
+  nothing and validates nothing: it is as good as the resolver behind it,
+  which also sees the names (from the exit, not from the client). An answer
+  too large for one mesh packet is returned truncated; UDP only.
 
 - **A client reaches the public internet and nothing else.** Not this host,
   not another client, and not the uplink's own network: private and

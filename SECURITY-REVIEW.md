@@ -32,10 +32,18 @@ IPv4 address derived from the client's fips address.
    Everything inside is the sender's.
 2. **Packets from the internet**, arriving on the TUN after NAT, routed back
    to a client by their destination (`Clients::route`).
-3. **The client list**, `/etc/fips-exit/clients`. Root-owned, but written by
+3. **DNS queries from clients, and answers from the upstream resolvers.**
+   The daemon's resolver (`serve_dns`) takes a datagram on port 53 of the
+   fips address from a listed client and forwards it as it is. It looks
+   inside a query in one place only, `question_end`, to build an empty
+   answer (SERVFAIL, or truncated) when there is no usable one. An
+   upstream's answer is matched on its id and response bit, on a connected
+   socket, and otherwise passed through unread; one over 1232 bytes is
+   replaced by a truncated answer.
+4. **The client list**, `/etc/fips-exit/clients`. Root-owned, but written by
    hand as well as by `add`: the daemon skips a line it cannot use rather
    than stopping, and must not be led by one into admitting someone else.
-4. **Operator input to the script**: an npub, an address or a name on the
+5. **Operator input to the script**: an npub, an address or a name on the
    command line, and `WAN`, `MESH_IF`, `TUN` and `FIPS_FIREWALL` in
    `/etc/fips-exit/config`. These end up in nftables scripts and in
    arguments of `ip` and `sysctl`. Not hostile, but a typo there runs as
@@ -66,6 +74,9 @@ IPv4 address derived from the client's fips address.
   the command line reaching an nftables script or a command line without
   being parsed into an address or checked as an interface name first.
   Commands are run as argument lists, never through a shell.
+- **An open resolver.** The daemon answering DNS for a node that is not a
+  listed client, or answering something that is not a query. Either makes
+  the exit a resolver, and a reflector, for the whole mesh.
 - **Parsing the inner packet.** Out-of-bounds reads and length arithmetic in
   the two places that look inside a packet. A panic here is a remote
   denial of service for every client.
@@ -77,8 +88,6 @@ IPv4 address derived from the client's fips address.
   page and, through NAT loopback, every port it forwards. fips2go's exit
   container looks the address up and keeps it blocked as it changes; here
   the operator has to put it in `BLOCK_CIDRS`.
-- **No DNS for clients.** A fips2go phone sends every lookup to its exit's
-  port 53. Nothing answers here.
 - **No limit on clients, bandwidth or destinations** beyond the list itself.
 - **The config's interface names are not checked.** `WAN`, `MESH_IF` and
   `TUN` from `/etc/fips-exit/config` are placed in the nftables script as
@@ -97,3 +106,10 @@ IPv4 address derived from the client's fips address.
 - The script's own nftables chains have policy accept. They only see traffic
   to and from the TUN, and each ends in an explicit verdict.
 - The exit's operator sees its clients' traffic, as any VPN endpoint does.
+- The resolver forwards and nothing more: no cache, no DNSSEC validation,
+  no filtering of private addresses in answers (a client could not reach
+  one through the exit anyway), UDP only. It is as trustworthy as the
+  host's resolver, which the operator chose.
+- A resolver that cannot start (port 53 taken, no upstream) is logged and
+  the daemon keeps running: the tunnel is still of use to a client that
+  brings its own names.

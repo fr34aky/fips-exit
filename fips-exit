@@ -351,6 +351,9 @@ table inet {TABLE} {{
     chain input {{
         type filter hook input priority filter; policy accept;
         iifname "{tun}" drop
+        # The daemon's resolver answers clients only; nobody else's query
+        # needs to reach it.
+        iifname "{mesh}" udp dport 53 ip6 saddr != @clients6 drop
     }}
     # With the kernel's own tunnel module loaded, the kernel answers every
     # tunnel packet the daemon has just taken with "port unreachable",
@@ -374,8 +377,9 @@ def fips_firewall(clients, config, on):
     """Let the clients' tunnel packets through fips's own firewall.
 
     That firewall drops what arrives on the mesh interface unless a drop-in
-    under fips.d allows it. Ours admits IP-in-IPv6 (and its fragments) from
-    the clients' addresses and nothing else.
+    under fips.d allows it. Ours admits IP-in-IPv6 (and its fragments) and
+    DNS queries (UDP port 53, for the daemon's resolver) from the clients'
+    addresses, and nothing else.
     """
     firewall = config["FIPS_FIREWALL"]
     dropin = os.path.join(os.path.dirname(firewall), "fips.d", "fips-exit.nft")
@@ -385,8 +389,10 @@ def fips_firewall(clients, config, on):
     rule = None
     if on and clients:
         addresses = ", ".join(str(a) for a, _ in clients)
+        # The tunnel, and the clients' DNS queries to the daemon's resolver.
         rule = ("# Written by fips-exit; do not edit.\n"
-                f"ip6 saddr {{ {addresses} }} ip6 nexthdr {{ 4, 41, 44 }} accept\n")
+                f"ip6 saddr {{ {addresses} }} ip6 nexthdr {{ 4, 41, 44 }} accept\n"
+                f"ip6 saddr {{ {addresses} }} udp dport 53 accept\n")
     if rule == before:
         return
     if rule is None:
@@ -415,6 +421,10 @@ def ufw(clients, config, on):
         ("ip6tables", "ufw6-before-input"): [
             ["-i", config["MESH_IF"], "-s", str(a), "-p", proto, "-j", "ACCEPT"]
             for a, _ in clients for proto in ("4", "41")
+        ] + [
+            # DNS queries to the daemon's resolver.
+            ["-i", config["MESH_IF"], "-s", str(a), "-p", "udp", "--dport", "53", "-j", "ACCEPT"]
+            for a, _ in clients
         ],
     }
     for tool, chain in (("iptables", "ufw-before-forward"), ("ip6tables", "ufw6-before-forward")):

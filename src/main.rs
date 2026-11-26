@@ -53,6 +53,24 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Issue an ioctl with a platform-correct request argument.
+///
+/// `libc::ioctl`'s request parameter is `c_ulong` on glibc and `c_int` on musl,
+/// while the consts (`TUNSETIFF`, `SIOCSIFMTU`, …) are unsigned. Casting at each
+/// call site either truncates on musl or fails to compile on glibc, so every
+/// call goes through here and this is the only place that knows the difference.
+#[cfg(target_env = "musl")]
+#[inline]
+fn ioctl_req(request: libc::c_ulong) -> libc::c_int {
+    request as libc::c_int
+}
+
+#[cfg(not(target_env = "musl"))]
+#[inline]
+fn ioctl_req(request: libc::c_ulong) -> libc::c_ulong {
+    request
+}
+
 const PROTO_IPV4: i32 = 4; // IPPROTO_IPIP
 const PROTO_IPV6: i32 = 41; // IPPROTO_IPV6
 
@@ -551,7 +569,7 @@ fn open_tun(name: &str) -> io::Result<OwnedFd> {
     let mut req = IfReq::new(name)?;
     let flags = (libc::IFF_TUN | libc::IFF_NO_PI) as i16;
     req.data[..2].copy_from_slice(&flags.to_ne_bytes());
-    if unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETIFF, &req) } < 0 {
+    if unsafe { libc::ioctl(tun.as_raw_fd(), ioctl_req(TUNSETIFF), &req) } < 0 {
         return Err(last_error("create TUN device"));
     }
 
@@ -562,16 +580,16 @@ fn open_tun(name: &str) -> io::Result<OwnedFd> {
     let ctl = unsafe { OwnedFd::from_raw_fd(ctl) };
     let mut req = IfReq::new(name)?;
     req.data[..4].copy_from_slice(&TUN_MTU.to_ne_bytes());
-    if unsafe { libc::ioctl(ctl.as_raw_fd(), libc::SIOCSIFMTU, &req) } < 0 {
+    if unsafe { libc::ioctl(ctl.as_raw_fd(), ioctl_req(libc::SIOCSIFMTU), &req) } < 0 {
         return Err(last_error("set TUN MTU"));
     }
     let mut req = IfReq::new(name)?;
-    if unsafe { libc::ioctl(ctl.as_raw_fd(), libc::SIOCGIFFLAGS, &mut req) } < 0 {
+    if unsafe { libc::ioctl(ctl.as_raw_fd(), ioctl_req(libc::SIOCGIFFLAGS), &mut req) } < 0 {
         return Err(last_error("read TUN flags"));
     }
     let flags = i16::from_ne_bytes([req.data[0], req.data[1]]) | libc::IFF_UP as i16;
     req.data[..2].copy_from_slice(&flags.to_ne_bytes());
-    if unsafe { libc::ioctl(ctl.as_raw_fd(), libc::SIOCSIFFLAGS, &req) } < 0 {
+    if unsafe { libc::ioctl(ctl.as_raw_fd(), ioctl_req(libc::SIOCSIFFLAGS), &req) } < 0 {
         return Err(last_error("bring TUN up"));
     }
     Ok(tun)

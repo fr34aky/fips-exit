@@ -16,13 +16,19 @@ export FIPS_EXIT_DIR=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$FIPS_EXIT_DIR"' EXIT
 mount -t tmpfs tmpfs /run
 
-E=fd0e::1 C1=fd11:2233:4455:6677::1 C2=fd99:8877:6655:4433::2
-C1V4=100.81.34.51 C2V4=100.89.136.119
+E=fd0e::1 C1=fd11:2233:4455:6677::1 C2=fd99:8877:6655:4433::2 C3=fd55:aaaa:bbbb:cccc::3
+C1V4=100.81.34.51 C2V4=100.89.136.119 C3V4=100.85.170.170
 fail() { echo "FAIL: $*"; exit 1; }
 ok() { echo "ok: $*"; }
 
 ip link set lo up
 ip link add fips0 type bridge
+# Its own address, set before any client is attached. Left alone, a bridge
+# takes the lowest address among its ports, so it changes as clients are
+# added, after an earlier client has learned it: that client then sends to
+# an address the exit no longer answers to, for the eight seconds its
+# neighbour entry takes to notice.
+ip link set fips0 address 02:00:00:00:0e:01
 ip link set fips0 mtu 1280 up
 ip -6 addr add $E/128 dev fips0 nodad
 ip -6 route add fd00::/8 dev fips0
@@ -81,6 +87,7 @@ client() { # name address ipv4
 }
 client c1 $C1 $C1V4
 client c2 $C2 $C2V4
+client c3 $C3 $C3V4
 printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n" > "$FIPS_EXIT_DIR/config"
 daemon="$here/target/release/fips-exitd"
 [ -x "$daemon" ] || fail "build the daemon first: cargo build --release"
@@ -88,9 +95,38 @@ daemon="$here/target/release/fips-exitd"
 # --- without the daemon, the script says so and applies nothing ----------------
 "$here/fips-exit" up 2>&1 | grep -q "fips-exitd is not running" || fail "up without the daemon"
 ok "up without the daemon is refused"
-DNS_UPSTREAMS=8.8.8.2 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>"$FIPS_EXIT_DIR/daemon.log" &
-for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && break; sleep 0.2; done
+sock="$FIPS_EXIT_DIR/control.sock"
+DNS_UPSTREAMS=8.8.8.2 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 --control "$sock" 2>"$FIPS_EXIT_DIR/daemon.log" &
+for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && [ -S "$sock" ] && break; sleep 0.2; done
 ip link show fipsexit0 >/dev/null 2>&1 || fail "the daemon did not create its TUN: $(cat "$FIPS_EXIT_DIR/daemon.log")"
+
+# --- the control socket: root's alone, and no peer on it stops anything ---------
+# Accounts are made over it (further down). It runs through everything
+# below, with a peer that says nothing and after one that sent no command.
+ctl() { # bytes to send, as Python would write them -> the daemon's answer
+  python3 -c '
+import ast, socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(8); s.connect(sys.argv[1])
+s.sendall(ast.literal_eval("b\"" + sys.argv[2] + "\\n\"")); s.shutdown(socket.SHUT_WR)
+answer = b""
+while True:
+    data = s.recv(65536)
+    if not data: break
+    answer += data
+sys.stdout.write(answer.decode())' "$sock" "$1"
+}
+[ -S "$sock" ] || fail "no control socket: $(cat "$FIPS_EXIT_DIR/daemon.log")"
+[ "$(stat -c %a "$sock")" = 600 ] || fail "the control socket has mode $(stat -c %a "$sock")"
+case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver="?) ;; *) fail "stat: $(ctl stat)" ;; esac
+python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); time.sleep(600)' "$sock" &
+# Bytes that are no text, then a line with no end within the limit: an error
+# each, and what follows the second is not read as a command.
+[ "$(ctl '\xff\xfe\x00 put\n'"$(printf 'x%.0s' $(seq 5000))"'\nput pkg 999999 0 0 '$C1)" = "$(printf 'err syntax\nerr line')" ] \
+  || fail "what is not a command was not refused"
+[ "$(ctl usage)" = "ok 0" ] || fail "an account came out of what was not a command: $(ctl usage)"
+ok "the control socket is root's, and answers what is not a command with an error"
 
 # A server that answers a request "<n>" with n bytes, DF set on IPv4: what a
 # QUIC server does to a client that sent a small packet.
@@ -291,6 +327,41 @@ printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n" > "$FIPS_EXIT_DIR/con
 "$here/fips-exit" up >/dev/null
 ok "a bad BLOCK_CIDRS entry is refused"
 
+# --- a member of an account: carried while the account has bytes ---------------
+# An account is how an address that is not on the operator's list uses the
+# exit, for a number of bytes. Nothing in the script makes one yet, so the
+# routes and the set entries it makes for a client are made by hand here.
+[ "$(ctl "check $C3")" = "ok free v4" ] || fail "check: $(ctl "check $C3")"
+# The second member is on the operator's list, which wins: not counted.
+[ "$(ctl "put pkg 0 0 0 $C3,$C2")" = "ok $C3=v4 $C2=static" ] || fail "put: $(ctl "check $C3")"
+ip route replace $C3V4 dev fipsexit0
+ip -6 route replace $C3 dev fipsexit0 table 5170
+nft add element inet fips_exit clients4 "{ $C3V4 }"
+nft add element inet fips_exit clients6 "{ $C3 }"
+[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A MEMBER WAS CARRIED WITHOUT A GRANT"
+[ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a member without a grant got DNS"
+# 400 bytes. A request is 31 (20 + 8 + "100") and its answer 128: two
+# exchanges fit, the third crosses the line with its answer, and that was
+# the last. A name is answered and not counted.
+[ "$(ctl "grant pkg 400")" = ok ] || fail "grant"
+r=$(resolve c3 $C3 example.com)
+[ "${r% size=*}" = "answers=1 rcode=0 tc=0" ] || fail "a member's DNS query: $r"
+for i in 1 2 3; do
+  [ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "exchange $i of a member with bytes left"
+done
+[ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "a client on the list, also a member"
+[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A MEMBER WAS CARRIED PAST ITS GRANT"
+[ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a member without bytes left got DNS"
+[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384\nok 1')" ] || fail "usage: $(ctl usage)"
+# The same put again, as after a lost answer, takes nothing back; a larger
+# grant carries the member again.
+[ "$(ctl "put pkg 0 0 0 $C3,$C2")" = "ok $C3=v4 $C2=static" ] || fail "put again"
+[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384\nok 1')" ] || fail "a repeated put changed the count: $(ctl usage)"
+[ "$(ctl "grant pkg 1000")" = ok ] || fail "grant"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member after a larger grant"
+[ "$(ctl "usage pkg")" = "$(printf 'account pkg 1000 124 512\nok 1')" ] || fail "usage: $(ctl usage)"
+ok "a member is carried for the bytes its account was granted, counted exactly, and no further"
+
 # --- no upstream answers: the client is told at once ---------------------------
 kill $dns_pid
 r=$(resolve c2 $C2 example.com)
@@ -302,6 +373,12 @@ ok "with no upstream answering, a client gets SERVFAIL instead of silence"
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "removed client still passes"
 [ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "remaining client broke on removal"
 ok "removing a client cuts it off and leaves the others"
+# `remove` had the daemon read the list again: the account is as it was.
+[ "$(ctl "usage pkg")" = "$(printf 'account pkg 1000 124 512\nok 1')" ] || fail "THE ACCOUNT WAS LOST AT A RELOAD: $(ctl usage)"
+case "$(ctl stat)" in "ok epoch="*" accounts=1 resolver=1") ;; *) fail "stat: $(ctl stat)" ;; esac
+[ "$(ctl "drop pkg")" = ok ] || fail "drop"
+[ "$(ctl "check $C3")" = "ok free v4" ] || fail "after drop: $(ctl "check $C3")"
+ok "an account outlives a reload of the client list, and is gone when dropped"
 legacy fx55667788 $C2
 PATH="$FIPS_EXIT_DIR/bin:$PATH" "$here/fips-exit" down >/dev/null || fail "down with empty objects in ip's list of links"
 ip link show fx55667788 >/dev/null 2>&1 && fail "down left an old fx tunnel device"

@@ -83,7 +83,8 @@ Do this before reading a single diff hunk.
 7. **What a member is carried is counted, once.** After the packet was
    passed on, by its inner length, against its own account. The three
    numbers of an account only grow; nothing is carried once the count has
-   reached the grant, bar the packet that crosses.
+   reached the grant, bar the packet that crosses, and nothing from the
+   second an account that has an end has ended.
 8. **The firewall still isolates.** Through the tunnel a client reaches the
    uplink and nothing else on this host, and not another client; the
    internet reaches a client only as a reply. A member of an account gets no

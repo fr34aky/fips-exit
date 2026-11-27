@@ -456,10 +456,10 @@ r=$(resolve c3 $C3 example.com)
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "A MEMBER WAS CARRIED PAST ITS ACCOUNT'S GRANT"
 [ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a member without bytes left got DNS"
 [ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "a client on the list, also a member"
-[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384\nok 1')" ] || fail "usage: $(ctl usage)"
+[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384 0\nok 1')" ] || fail "usage: $(ctl usage)"
 # The same put again, as after a lost answer, takes nothing back.
 [ "$(ctl "put pkg 400 0 0 $C3,$C1,$C2")" = "ok $C3=v4 $C1=v4 $C2=static" ] || fail "put again"
-[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384\nok 1')" ] || fail "a repeated put changed the count: $(ctl usage)"
+[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384 0\nok 1')" ] || fail "a repeated put changed the count: $(ctl usage)"
 ok "members share their account's bytes, counted exactly, and are carried no further"
 
 # --- what a member gets, and what it does not ---------------------------------------
@@ -474,8 +474,21 @@ ok "members share their account's bytes, counted exactly, and are carried no fur
 ip netns exec c3 ping -c 1 -W 1 -q $C2V4 >/dev/null 2>&1 && fail "a member reached another client"
 [ -z "$(fetch c3 8.8.8.2 25)" ] || fail "A MEMBER REACHED PORT 25"
 [ "$(fetch c2 8.8.8.2 25)" = 200000 ] || fail "a client on the list and port 25"
-"$here/fips-exit" accounts | grep -Eq "^pkg +1000000 +[0-9]+ +[0-9]+ +[0-9]+$" || fail "accounts: $("$here/fips-exit" accounts)"
+"$here/fips-exit" accounts | grep -Eq "^pkg +1000000 +[0-9]+ +[0-9]+ +[0-9]+ +-$" || fail "accounts: $("$here/fips-exit" accounts)"
 ok "a member reaches the internet in both families and nothing else, and not port 25"
+
+# --- an account may have an end ------------------------------------------------------
+# Whatever is left of its bytes: from that second on its members are not
+# carried. A later end, or none, carries them again.
+[ "$(ctl "until pkg $(($(date +%s) + 3))")" = ok ] || fail "until"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member before its account's end"
+sleep 3
+[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A MEMBER WAS CARRIED AFTER ITS ACCOUNT'S END"
+[ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a member got DNS after its account's end"
+"$here/fips-exit" accounts | grep -Eq "^pkg .* \(over\)$" || fail "accounts after the end: $("$here/fips-exit" accounts)"
+[ "$(ctl "until pkg 0")" = ok ] || fail "until 0"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member whose account has no end any more"
+ok "an account that has an end carries its members until then, and not after"
 
 # --- only replies go to the tunnel -----------------------------------------------------
 # All of fd00::/8 is routed to the tunnel in this mode, for the members. That

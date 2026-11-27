@@ -174,9 +174,10 @@ because its reply was lost changes nothing.
 |---|---|
 | `put <account> <granted> <used_in> <used_out> <address,…>` | Makes the account or brings it up to these values: each number is raised to the given one, never lowered; the members are replaced. |
 | `grant <account> <granted>` | Raises the grant to this total. |
+| `until <account> <unix seconds>` | Sets when the account ends, whatever is left of its bytes; 0 for no end. `put` takes it as a last word too. |
 | `members <account> <address,…>` | Replaces the members. |
 | `drop <account>` | Removes the account and its members. |
-| `usage [account]` | One line per account: granted, used in, used out. |
+| `usage [account]` | One line per account: granted, used in, used out, and its end. |
 | `check <address>` | Says whether this address could be a member here, and whether it would get its inner IPv4 address. |
 | `stat` | The daemon's start time as an epoch, the number of accounts, whether the resolver runs. |
 

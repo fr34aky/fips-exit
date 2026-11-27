@@ -131,6 +131,9 @@ below.
   a packet to a destination the exit refuses is counted and then dropped.
 - When the count reaches the grant, the members are not carried any
   further. The packet that crosses the line still is.
+- An account may have an end as well: a time from which its members are not
+  carried, whatever is left of its bytes. That is how time is sold: a grant
+  too large to use up, and an end. The time is this machine's clock.
 - DNS is answered for a member while its account has bytes, and not counted.
 - A client on the list is never counted, and wins over a member with the
   same address or the same derived IPv4 address, at once. A member whose
@@ -146,11 +149,13 @@ alone. One command a line; every answer ends in a line that begins `ok` or
 nothing.
 
 ```text
-put <account> <granted> <used_in> <used_out> <address,…|->   make it, or raise its numbers; replace its members
+put <account> <granted> <used_in> <used_out> <address,…|-> [until]
+                                                              make it, or raise its numbers; replace its members
 grant <account> <granted>                                     raise what it may use, in all
+until <account> <unix seconds|0>                              when it ends; 0 for no end
 members <account> <address,…|->                               replace its members
 drop <account>
-usage [account]                                               account <name> <granted> <used_in> <used_out>
+usage [account]                                               account <name> <granted> <used_in> <used_out> <until>
 check <address>                                               static | member <account> v4|no4 | free v4|no4
 stat                                                          epoch=<start> accounts=<n> resolver=<0|1>
 ```

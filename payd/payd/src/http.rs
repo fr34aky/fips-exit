@@ -338,6 +338,9 @@ pub async fn serve(listener: TcpListener, site: Arc<Site>, limits: Limits, admit
         let site = site.clone();
         tokio::spawn(async move {
             let _places = (place, peer_place);
+            // What takes long is answered before the connection's life is
+            // over, with a little left to send the answer in.
+            let until = tokio::time::Instant::now() + limits.lifetime.saturating_sub(Duration::from_secs(3));
             let service = service_fn(move |request: Request<Incoming>| {
                 let site = site.clone();
                 async move {
@@ -345,7 +348,7 @@ pub async fn serve(listener: TcpListener, site: Arc<Site>, limits: Limits, admit
                     let response = match body_of(body, limits.body_bytes, limits.body_time).await {
                         Some(body) => match route(&site, mesh_peer, &Request::from_parts(parts, ()), &body) {
                             Answer::Now(response) => response,
-                            Answer::Buy(asked, kind) => orders::respond(&site, mesh_peer, &asked, kind).await,
+                            Answer::Buy(asked, kind) => orders::respond(&site, mesh_peer, &asked, kind, until).await,
                         },
                         None => plain(StatusCode::PAYLOAD_TOO_LARGE, "a body too large, or too slow"),
                     };
@@ -561,7 +564,8 @@ mod tests {
         // And on an exit that names no mint, it is answered at once.
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let asked = orders::asked_json(json).unwrap();
-        let answer = runtime.block_on(orders::respond(&site, peer, &asked, Kind::Json));
+        let soon = tokio::time::Instant::now() + Duration::from_secs(30);
+        let answer = runtime.block_on(orders::respond(&site, peer, &asked, Kind::Json, soon));
         assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 

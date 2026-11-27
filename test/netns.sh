@@ -748,11 +748,16 @@ for tag in (["access", "paid"], ["price", "2000000"], ["pay", "cashu"], ["port",
     assert tag in tags, (tag, tags)' $MINT || fail "the advert of an exit that sells: $(advert_terms)"
 # The wallet and what was sold are kept when the service starts again, with
 # its mint away: nothing is sold then, and who paid is carried all the same.
+fresh=$(token 8)
 kill $mint_pid; wait $mint_pid 2>/dev/null || true
 restart_payd
 wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +16 sat +0 sat +16 sat +away +$MINT\$"' \
   || fail "the wallet after the service started again: $("$here/fips-exit" wallet 2>&1)"
-[ "$(status_of "$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")")" = 503 ] || fail "an order while the mint is away"
+r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$fresh\"}")
+[ "$(status_of "$r")" = 503 ] && printf '%s' "$r" | grep -q '"code":"mint-away"' || fail "an order while the mint is away: $r"
+# A token that did buy is still answered with what became of it.
+r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")
+[ "$(status_of "$r")" = 200 ] && printf '%s' "$r" | grep -q '"again":true' || fail "a token that bought, sent again while the mint is away: $r"
 wait_for '[ "$(ask c1 4 8.8.8.2 100)" = 100 ]' || fail "who paid is not carried after the service started again"
 [ "$(stat -c %a "$FIPS_EXIT_DIR/state/seed")" = 600 ] && [ "$(wc -w < "$FIPS_EXIT_DIR/state/seed")" = 24 ] || fail "the wallet's seed"
 "$here/fips-exit" revoke $bought >/dev/null && "$here/fips-exit" revoke $also >/dev/null || fail "revoke what was bought"

@@ -16,32 +16,42 @@
 //!
 //! What may go wrong between asking the mint and hearing from it is not
 //! guessed at. An order whose answer was lost stays open; the wallet is let
-//! to finish what it began; and the mint is asked whether it signed what
-//! this wallet asked for in exchange for the token. If it did, the order is
-//! paid. If it did not, the token was not taken by this exit (it may be
-//! spent all the same, by whoever sent it here): nothing is granted. The
-//! same token sent again by its buyer is answered with what became of it,
-//! and with a new key for the package if it made one: the answer that
+//! to finish what it began; and the mint is asked two things: whether it
+//! signed what this wallet asked for in exchange for the token, and whether
+//! the token's proofs are spent. One exchange does both at once, so:
+//!
+//! ```text
+//! signed, and spent           the mint took the token for this wallet: paid
+//! not signed, and spent       someone else spent it: nothing is granted
+//! signed, and not spent       signed before, for something else (the wallet's
+//!                             file is behind its seed's use): nothing is
+//!                             granted, and the wallet counts again
+//! not signed, and not spent   it may yet arrive: asked again, for a while
+//! ```
+//!
+//! The same token sent again by its buyer is answered with what became of
+//! it, and with a new key for the package if it made one: the answer that
 //! carried the first may not have arrived.
 
 use std::collections::HashSet;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use serde::Deserialize;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 use crate::http::{Site, answer};
 use crate::manage;
 use crate::store::{Begun, MAX_BYTES, NewOrder, Order, Refused, Settled, Store};
 use crate::sync::{seat_of, unix_now};
 use crate::terms::{bytes_shown, date, escape, shell};
-use crate::wallet::{self, MINT_TIME, Mint, Recorded, Refusal, Wallets};
+use crate::wallet::{self, Inputs, MINT_TIME, Mint, Recorded, Refusal, Wallets};
 
 /// How long a request waits to hear what became of its order. One that
 /// takes longer is answered "not yet", and goes on.
@@ -49,10 +59,13 @@ const ANSWER_TIME: Duration = Duration::from_secs(30);
 /// How many orders may be under way at once.
 const AT_ONCE: usize = 8;
 /// Tokens taken to a mint, for the whole service: this many in a burst, and
-/// one more every two seconds. Limits for one address stop nobody who can
-/// make new addresses.
-const BURST: f64 = 30.0;
-const PER_SECOND: f64 = 0.5;
+/// one more every six seconds. Limits for one address stop nobody who can
+/// make new addresses. Within what the wallet library itself allows a mint
+/// to be asked (20 requests at once, then one every three seconds), with
+/// room for what else is asked there: past that the library makes a request
+/// wait, and a token would be half taken for longer.
+const BURST: f64 = 10.0;
+const PER_SECOND: f64 = 1.0 / 6.0;
 /// How long after an order began the mint is still asked whether it signed
 /// for it, when it has said no so far.
 const GIVE_UP: Duration = Duration::from_secs(600);
@@ -82,6 +95,8 @@ pub enum Kind {
 #[derive(Debug, PartialEq)]
 pub struct Bought {
     pub order: String,
+    /// The package, and what was bought as it was offered: of the order,
+    /// whatever a request that sends its token again asks for.
     pub settled: Settled,
     /// Whether this token had paid before, and this is that purchase again.
     pub again: bool,
@@ -121,6 +136,8 @@ pub enum Fault {
     Busy,
     /// The mint did not take the token.
     Refused(String),
+    /// The token could not be taken to its mint just now, and is untouched.
+    Again,
     Bad(String),
     Store(String),
 }
@@ -128,7 +145,7 @@ pub enum Fault {
 impl Fault {
     pub fn status(&self) -> StatusCode {
         match self {
-            Fault::NotSold | Fault::MintAway(_) | Fault::ExitDown => StatusCode::SERVICE_UNAVAILABLE,
+            Fault::NotSold | Fault::MintAway(_) | Fault::ExitDown | Fault::Again => StatusCode::SERVICE_UNAVAILABLE,
             Fault::NoOffer(_) | Fault::Token(_) | Fault::WrongMint(_) | Fault::TooMuch { .. } | Fault::Bad(_) => {
                 StatusCode::BAD_REQUEST
             }
@@ -163,6 +180,7 @@ impl Fault {
             Fault::ExitDown => "exit-down",
             Fault::Busy => "busy",
             Fault::Refused(_) => "refused",
+            Fault::Again => "try-again",
             Fault::Bad(_) => "bad-request",
             Fault::Store(_) => "store",
         }
@@ -173,7 +191,7 @@ impl Fault {
     pub fn said(&self) -> String {
         const UNTOUCHED: &str = "The token was not touched.";
         match self {
-            Fault::NotSold => format!("Nothing can be bought here right now. {UNTOUCHED}"),
+            Fault::NotSold => "Nothing can be bought here right now: no token is taken to a mint.".into(),
             Fault::NoOffer(id) => format!("No package {id:.40} is offered here. {UNTOUCHED}"),
             Fault::Token(why) => format!("{why}. {UNTOUCHED}"),
             Fault::WrongMint(mint) => {
@@ -207,6 +225,9 @@ impl Fault {
             Fault::ExitDown => format!("The exit is not running. {UNTOUCHED}"),
             Fault::Busy => format!("Too many tokens are being redeemed just now: try again in a minute. {UNTOUCHED}"),
             Fault::Refused(why) => format!("The mint did not take the token: {why:.200}. Nothing was bought."),
+            Fault::Again => {
+                format!("The token could not be taken to its mint just now: send it again in a minute. {UNTOUCHED}")
+            }
             Fault::Bad(what) => what.clone(),
             Fault::Store(e) => format!("the store: {e}"),
         }
@@ -388,26 +409,35 @@ async fn take(
         Ok(Ok(paid)) => settle(&site, &mint, &id, paid),
         // The mint said no, or was not reached, or its answer was lost. The
         // wallet knows which: whether it has something unfinished.
-        Ok(Err(error)) => match mint.unfinished(&receipt).await {
-            Ok(None) => {
-                site.store.order_drop(&id)?;
-                if error.is_definitive_failure() {
-                    eprintln!("fips-exit-payd: order {id}: {} did not take the token: {error}", mint.name);
-                    Err(Fault::Refused(error.to_string()))
-                } else {
-                    Err(Fault::MintAway(mint.name.clone()))
+        Ok(Err(error)) => {
+            // A mint that says it signed before what the wallet asked of it
+            // now (in either of the ways mints say it): the wallet's file
+            // is behind its seed's use, and what was signed then is not
+            // this order's, whatever is found of it later.
+            let stale = matches!(error, cdk::Error::BlindedMessageAlreadySigned | cdk::Error::DuplicateOutputs);
+            match mint.unfinished(&receipt).await {
+                Ok(None) => {
+                    site.store.order_drop(&id)?;
+                    if stale {
+                        mint.suspect();
+                        Err(Fault::Again)
+                    } else if error.is_definitive_failure() {
+                        eprintln!("fips-exit-payd: order {id}: {} did not take the token: {error}", mint.name);
+                        Err(Fault::Refused(error.to_string()))
+                    } else {
+                        Err(Fault::Again)
+                    }
                 }
+                // Unfinished: decided now if the mint can be asked, and
+                // else left open. What the mint said is not the end of it
+                // by itself: "spent" may be the wallet's own request having
+                // spent the token.
+                Ok(Some(_)) => {
+                    decide(&site, &desk, &mint, Some(Mine { id: &id, stale })).await.mine.unwrap_or(Err(Fault::NotYet))
+                }
+                Err(_) => Err(Fault::NotYet),
             }
-            // Unfinished: decided now if the mint can be asked, and else
-            // left open. "Spent" is an answer the library does not take as
-            // final, since its own request may have spent the token; asked
-            // what it signed for this wallet, the mint says whose it was.
-            Ok(Some(_)) => {
-                let said_spent = matches!(error, cdk::Error::TokenAlreadySpent);
-                decide(&site, &desk, &mint, Some((&id, said_spent))).await.mine.unwrap_or(Err(Fault::NotYet))
-            }
-            Err(_) => Err(Fault::NotYet),
-        },
+        }
         Err(_) => Err(Fault::NotYet),
     };
     drop(turn);
@@ -418,31 +448,26 @@ async fn take(
     outcome
 }
 
-/// Buy what `asked` asks for, for `caller`.
-pub async fn buy(site: &Arc<Site>, caller: Ipv6Addr, asked: &Asked) -> Result<Bought, Fault> {
-    let desk = site.desk.as_ref().filter(|desk| desk.wallets.ready()).ok_or(Fault::NotSold)?;
-    let offer = site
-        .config
-        .packages
-        .iter()
-        .find(|offer| offer.id == asked.package)
-        .ok_or_else(|| Fault::NoOffer(asked.package.clone()))?;
-    let key = key_asked(asked)?;
-    let (token, text) = wallet::parse(&asked.token)?;
-    let mint = desk.wallets.mint_of(&token)?;
-    let look = mint.look(&token).await?;
-    // The same token again: what became of it, whatever is asked now.
-    if let Some(order) = site.store.order_with_receipt(&look.receipt)? {
-        return known(site, caller, &order);
-    }
+/// What is asked of a new purchase before its token goes anywhere: that it
+/// is worth the price and not much more, that the package it is to be added
+/// to can take it, and that the caller can be served. The package to add
+/// to, if one.
+async fn fits(
+    site: &Site,
+    desk: &Desk,
+    caller: Ipv6Addr,
+    offer: &fips_exit_proto::Package,
+    key: Option<&str>,
+    look: &wallet::Look,
+) -> Result<Option<String>, Fault> {
     let net = look.value.saturating_sub(look.fee);
     if net < offer.sat {
         return Err(Fault::TooLittle { value: look.value, fee: look.fee, price: offer.sat });
     }
-    if net > offer.sat + (offer.sat / 10).max(2) {
+    if net > offer.sat + offer.sat / 10 {
         return Err(Fault::TooMuch { net, price: offer.sat });
     }
-    let target = match &key {
+    let target = match key {
         Some(key) => {
             let package = site.store.package_with_key(key)?.ok_or(Fault::NoKey)?;
             if package.revoked {
@@ -456,6 +481,44 @@ pub async fn buy(site: &Arc<Site>, caller: Ipv6Addr, asked: &Asked) -> Result<Bo
         None => None,
     };
     desk.can_serve(caller, target.is_none()).await?;
+    Ok(target)
+}
+
+/// Buy what `asked` asks for, for `caller`, and say what became of it by
+/// `until`: the connection that asks lives no longer.
+pub async fn buy(site: &Arc<Site>, caller: Ipv6Addr, asked: &Asked, until: Instant) -> Result<Bought, Fault> {
+    let desk = site.desk.as_ref().ok_or(Fault::NotSold)?;
+    let (token, text) = wallet::parse(&asked.token)?;
+    let mint = desk.wallets.mint_of(&token)?;
+    // The same token again: what became of it, whatever is asked now and
+    // whatever could be sold now. Before everything that is asked only of a
+    // new purchase, each of which would say that the token was not touched.
+    if let Some(receipt) = mint.receipt(&token).await
+        && let Some(order) = site.store.order_with_receipt(&receipt)?
+    {
+        return known(site, caller, &order);
+    }
+    if !mint.ready() {
+        return Err(Fault::MintAway(mint.name.clone()));
+    }
+    if Instant::now() >= until {
+        return Err(Fault::Again);
+    }
+    let offer = site
+        .config
+        .packages
+        .iter()
+        .find(|offer| offer.id == asked.package)
+        .ok_or_else(|| Fault::NoOffer(asked.package.clone()))?;
+    let key = key_asked(asked)?;
+    // Nothing has been taken anywhere so far, so running out of time is
+    // nothing lost.
+    let checked = tokio::time::timeout_at(until, async {
+        let look = mint.look(&token).await?;
+        let target = fits(site, desk, caller, offer, key.as_deref(), &look).await?;
+        Ok::<_, Fault>((look, target))
+    });
+    let (look, target) = checked.await.map_err(|_| Fault::Again)??;
     let place = desk.places.clone().try_acquire_owned().map_err(|_| Fault::Busy)?;
     let id = Store::order_id()?;
     let at_work = desk.enter(&id, caller).ok_or(Fault::Busy)?;
@@ -472,14 +535,18 @@ pub async fn buy(site: &Arc<Site>, caller: Ipv6Addr, asked: &Asked) -> Result<Bo
         target: target.as_deref(),
         receipt: &look.receipt,
         value: look.value,
+        inputs: &look.inputs,
     };
     if let Begun::Known(order) = site.store.order_begin(&id, &new, unix_now())? {
         return known(site, caller, &order);
     }
     // On its own, so that it goes on whatever becomes of this request: a
-    // token half taken is not left because a connection closed.
+    // token half taken is not left because a connection closed. The request
+    // waits for it as long as its connection lives, and then says "not
+    // yet".
     let task = tokio::spawn(take(site.clone(), mint.clone(), id, text, look.receipt, at_work, place));
-    match tokio::time::timeout(ANSWER_TIME, task).await {
+    let wait = until.saturating_duration_since(Instant::now()).min(ANSWER_TIME);
+    match tokio::time::timeout(wait, task).await {
         Ok(Ok(outcome)) => outcome,
         _ => Err(Fault::NotYet),
     }
@@ -518,17 +585,41 @@ struct Decided {
     mine: Option<Result<Bought, Fault>>,
 }
 
+/// The order of the request that asks [`decide`].
+#[derive(Clone, Copy)]
+struct Mine<'a> {
+    id: &'a str,
+    /// The mint has just said that it signed before what the wallet asked
+    /// it to sign for this order: that is not this order's, then.
+    stale: bool,
+}
+
+/// What an open order has come to.
+enum Verdict {
+    /// This much arrived.
+    Paid(u64),
+    /// The mint did not take the token for this wallet, and its proofs are
+    /// spent: by someone else.
+    SpentElsewhere,
+    /// What the mint has signed of this order's outputs it signed before:
+    /// the wallet's file is behind its seed's use.
+    Stale,
+    /// The token was not taken, and will not be now.
+    NotTaken,
+    Open,
+}
+
 /// Decide the open orders at `mint`, whose turn the caller holds: all that
 /// no request is working on, and `mine`, the order of the request that
-/// asks, with whether the mint has just said that its token is spent.
+/// asks.
 ///
 /// The one place where the wallet is let to finish what it began, and so
 /// the one place that must keep, first, what the wallet asked the mint to
 /// sign for every open order: once the wallet has put itself right it does
 /// not know any more, and what it concludes is not what is gone by.
-async fn decide(site: &Site, desk: &Desk, mint: &Mint, mine: Option<(&str, bool)>) -> Decided {
+async fn decide(site: &Site, desk: &Desk, mint: &Mint, mine: Option<Mine<'_>>) -> Decided {
     let receipt = |order: &Order| <[u8; 32]>::try_from(order.receipt.as_slice()).ok();
-    let is_mine = |order: &Order| mine.is_some_and(|(id, _)| id == order.id);
+    let is_mine = |order: &Order| mine.is_some_and(|mine| mine.id == order.id);
     let all = site.store.orders_open().unwrap_or_default();
     let all: Vec<&Order> = all.iter().filter(|order| order.mint == mint.name).collect();
     let mut open: Vec<Order> = all
@@ -563,8 +654,13 @@ async fn decide(site: &Site, desk: &Desk, mint: &Mint, mine: Option<(&str, bool)
             }
         }
     }
+    // Whether the wallet finished what it began, as far as the mint let
+    // it. If it did not (the mint was slow, or away), a request of its own
+    // may still be on its way, and nothing is given up in this round.
+    let mut finished = true;
     if unfinished && let Err(e) = mint.put_right().await {
         eprintln!("fips-exit-payd: {}: the wallet could not finish what it began: {e}", mint.name);
+        finished = false;
     }
     for order in &open {
         let Some(receipt) = receipt(order) else { continue };
@@ -573,60 +669,55 @@ async fn decide(site: &Site, desk: &Desk, mint: &Mint, mine: Option<(&str, bool)
             continue;
         };
         let old = unix_now().saturating_sub(order.created) >= desk.give_up.as_secs();
-        let said_spent = mine.is_some_and(|(id, said_spent)| id == order.id && said_spent);
-        let paid = match &order.outputs {
+        let verdict = match &order.outputs {
+            Some(_) if mine.is_some_and(|mine| mine.id == order.id && mine.stale) => Verdict::Stale,
             // The mint was asked to sign for it: the mint says whether it
-            // did. If it did not and the token is spent, it was spent by
-            // someone else, and that is the end of it. If it did not and
-            // nothing says the token is spent, the request may yet arrive:
-            // asked again for a while.
-            Some(outputs) => match mint.signed(outputs).await {
-                Ok(0) if said_spent || old => Some(0),
-                Ok(0) | Err(_) => None,
-                Ok(sat) => Some(sat),
+            // did, and whether the token is spent. One exchange does both.
+            Some(outputs) => match (mint.signed(outputs).await, mint.inputs(&order.inputs).await) {
+                (Ok(sat), Ok(Inputs::Spent)) if sat > 0 => Verdict::Paid(sat),
+                (Ok(sat), Ok(_)) if sat > 0 => Verdict::Stale,
+                (Ok(_), Ok(Inputs::Spent | Inputs::Partly)) => Verdict::SpentElsewhere,
+                // Neither, so far. Given up only when the wallet has
+                // nothing of it left to ask again, and long enough after it
+                // asked that nothing of it is still on its way.
+                (Ok(_), Ok(Inputs::Unspent)) if old && finished && still.is_none() => Verdict::NotTaken,
+                _ => Verdict::Open,
             },
             // It was not: the wallet either took the token without a hitch
             // and the order was not settled (its record says so), or never
             // came to ask.
-            None if still.is_some() => None,
+            None if still.is_some() => Verdict::Open,
             None => match mint.recorded(&order.id).await {
-                Ok(Recorded::Received(sat, _)) => Some(sat),
-                Ok(_) => Some(0),
-                Err(_) => None,
+                Ok(Recorded::Received(sat, _)) => Verdict::Paid(sat),
+                Ok(_) => Verdict::NotTaken,
+                Err(_) => Verdict::Open,
             },
         };
-        let outcome = match paid {
-            None => {
-                decided.left += 1;
-                Err(Fault::NotYet)
+        // An order that came to nothing is forgotten, and with it what the
+        // wallet could not give up by itself.
+        let forget = |why: String| async move {
+            eprintln!("fips-exit-payd: order {}: {why}: forgotten", order.id);
+            if still.is_some()
+                && let Err(e) = mint.forget(&receipt).await
+            {
+                eprintln!("fips-exit-payd: {}: the wallet could not give the token up: {e}", mint.name);
             }
-            Some(0) => {
-                eprintln!(
-                    "fips-exit-payd: order {}: {} did not take the token for this exit: forgotten",
-                    order.id, mint.name
-                );
-                // What the wallet could not finish by itself is given up.
-                let forgotten = match still {
-                    Some(_) => mint.forget(&receipt).await,
-                    None => Ok(()),
-                };
-                if let Err(e) = &forgotten {
-                    eprintln!("fips-exit-payd: {}: the wallet could not give the token up: {e}", mint.name);
-                }
-                match site.store.order_drop(&order.id) {
-                    Ok(()) if said_spent => Err(Fault::Refused("it is spent already".into())),
-                    Ok(()) => Err(Fault::MintAway(mint.name.clone())),
-                    Err(e) => {
-                        decided.left += 1;
-                        Err(Fault::Store(e.to_string()))
-                    }
-                }
+            site.store.order_drop(&order.id).map_err(|e| Fault::Store(e.to_string()))
+        };
+        let outcome = match verdict {
+            Verdict::Open => Err(Fault::NotYet),
+            Verdict::SpentElsewhere => {
+                let forgotten = forget("the token is spent, and not for this exit".into()).await;
+                forgotten.and(Err(Fault::Refused("it is spent already".into())))
             }
-            Some(sat) => {
+            Verdict::NotTaken => forget(format!("{} did not take the token", mint.name)).await.and(Err(Fault::Again)),
+            Verdict::Stale => {
+                mint.suspect();
+                forget("the mint signed what was asked of it before this order".into()).await.and(Err(Fault::Again))
+            }
+            Verdict::Paid(sat) => {
                 let settled = settle(site, mint, &order.id, sat);
-                if settled.is_err() {
-                    decided.left += 1;
-                } else if order.outputs.is_some() {
+                if settled.is_ok() && order.outputs.is_some() {
                     // Settled on the mint's word. If the wallet does not
                     // hold it, it is found again from the seed.
                     let (holds, sold) = (mint.balance().await.map(|b| b.0), site.store.sold(&mint.name));
@@ -643,6 +734,9 @@ async fn decide(site: &Site, desk: &Desk, mint: &Mint, mine: Option<(&str, bool)
                 settled
             }
         };
+        if matches!(outcome, Err(Fault::NotYet | Fault::Store(_))) {
+            decided.left += 1;
+        }
         if is_mine(order) {
             decided.mine = Some(outcome);
         }
@@ -686,8 +780,8 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
 }
 
 /// What was bought, for a person.
-fn bought_words(bought: &Bought, offer: &str) -> String {
-    let settled = &bought.settled;
+fn bought_words(bought: &Bought) -> String {
+    let (settled, offer) = (&bought.settled, &bought.settled.offer);
     let fee =
         if settled.fee_sat > 0 { format!(" (its mint took {} sat more)", settled.fee_sat) } else { String::new() };
     let what = if settled.added {
@@ -702,9 +796,15 @@ fn bought_words(bought: &Bought, offer: &str) -> String {
     }
 }
 
-/// A purchase asked as `kind`, by `caller`, answered.
-pub async fn respond(site: &Arc<Site>, caller: Ipv6Addr, asked: &Asked, kind: Kind) -> Response<Full<Bytes>> {
-    let outcome = buy(site, caller, asked).await;
+/// A purchase asked as `kind`, by `caller`, answered by `until`.
+pub async fn respond(
+    site: &Arc<Site>,
+    caller: Ipv6Addr,
+    asked: &Asked,
+    kind: Kind,
+    until: Instant,
+) -> Response<Full<Bytes>> {
+    let outcome = buy(site, caller, asked, until).await;
     match (kind, outcome) {
         (Kind::Json, Err(fault)) => refuse(Kind::Json, &fault),
         (Kind::Form, Err(fault)) => refuse(Kind::Form, &fault),
@@ -730,7 +830,7 @@ pub async fn respond(site: &Arc<Site>, caller: Ipv6Addr, asked: &Asked, kind: Ki
             json(StatusCode::OK, &said)
         }
         (Kind::Form, Ok(bought)) => {
-            let done = bought_words(&bought, &asked.package);
+            let done = bought_words(&bought);
             let settled = &bought.settled;
             match (holds_key(site, asked, &bought), &settled.key) {
                 // Added to a package whose key the buyer has: its page.
@@ -916,7 +1016,19 @@ pub mod testing {
 
         pub async fn buy(&self, caller: &str, package: &str, token: &str, key: Option<&str>) -> Result<Bought, Fault> {
             let asked = Asked { package: package.into(), token: token.into(), key: key.map(str::to_string) };
-            buy(&self.site, caller.parse().unwrap(), &asked).await
+            buy(&self.site, caller.parse().unwrap(), &asked, Instant::now() + Duration::from_secs(60)).await
+        }
+
+        /// Another wallet on this exit's seed, in a directory of its own
+        /// with nothing but the seed: as when a second service is started
+        /// with a copy of it, which is not to be done.
+        pub async fn second_wallet(&self, name: &str) -> Wallets {
+            let dir = self.dir.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::copy(self.dir.join("seed"), dir.join("seed")).unwrap();
+            let wallets = Wallets::open(&dir, std::slice::from_ref(&self.mint)).await.unwrap();
+            wallets.mints[0].reach().await.unwrap();
+            wallets
         }
 
         /// Is `token` still good: can a wallet of somebody's redeem it?
@@ -942,22 +1054,6 @@ mod tests {
         text.parse().unwrap()
     }
 
-    /// The same exit, giving an open order up at once.
-    fn given_up(w: &World) -> Arc<Site> {
-        let was = w.site.desk.as_ref().unwrap();
-        let mut desk = Desk::new(was.wallets.clone(), w.dir.join("control.sock"));
-        desk.give_up = Duration::ZERO;
-        let mut site = Site::new(
-            w.site.config.clone(),
-            w.site.exit.clone(),
-            w.site.store.clone(),
-            w.site.seats.clone(),
-            w.site.changed.clone(),
-        );
-        site.desk = Some(Arc::new(desk));
-        Arc::new(site)
-    }
-
     async fn body(response: Response<Full<Bytes>>) -> String {
         String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
     }
@@ -971,7 +1067,7 @@ mod tests {
         kind: Kind,
     ) -> (StatusCode, String) {
         let asked = Asked { package: package.into(), token: token.into(), key: key.map(str::to_string) };
-        let response = respond(&w.site, a(caller), &asked, kind).await;
+        let response = respond(&w.site, a(caller), &asked, kind, Instant::now() + Duration::from_secs(60)).await;
         (response.status(), body(response).await)
     }
 
@@ -1019,8 +1115,9 @@ mod tests {
         let first_key = first.settled.key.clone().unwrap();
         // Its buyer, again (the answer may not have arrived): the same
         // package, and a new key for it. Whatever is asked for this time.
-        let again = w.buy(BUYER, "big", &token, None).await.unwrap();
+        let again = w.buy(BUYER, "no such package", &token, Some("not a key")).await.unwrap();
         assert!(again.again);
+        assert_eq!(again.settled.offer, "small", "what was bought, not what is asked now");
         assert_eq!(
             (again.order.as_str(), &again.settled.package.id),
             (first.order.as_str(), &first.settled.package.id)
@@ -1211,15 +1308,22 @@ mod tests {
 
     /// The mint was away when the token was taken to it. The wallet takes
     /// it there again when the mint is back, and what the mint then takes
-    /// is paid.
+    /// is paid. Nothing is given up meanwhile, however old the order: the
+    /// wallet's own request may be on its way.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_token_that_did_not_reach_the_mint_is_taken_there_again() {
-        let w = world(0, GIVE_UP).await;
-        let token = w.token(64).await;
+        let w = world(0, Duration::ZERO).await;
+        let (token, another) = (w.token(64).await, w.token(64).await);
         w.proxy.go_away();
         assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::NotYet));
         assert_eq!(round(&w.site).await, 1);
+        assert_eq!(round(&w.site).await, 1);
         assert!(w.site.store.packages().unwrap().is_empty());
+        // Its buyer, asking meanwhile, is told that it is not known yet:
+        // not that nothing is sold, though the mint is away.
+        assert!(w.the_mint().reach().await.is_err() && w.site.methods().is_empty());
+        assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::NotYet));
+        assert_eq!(w.buy(OTHER, "small", &another, None).await, Err(Fault::MintAway(w.mint.clone())));
         w.proxy.pass();
         assert_eq!(round(&w.site).await, 0);
         assert_eq!(w.site.store.package_of(a(BUYER)).unwrap().unwrap().granted, 10_000_000);
@@ -1235,7 +1339,8 @@ mod tests {
         let w = world(0, Duration::ZERO).await;
         let token = w.token(64).await;
         w.proxy.refuse_swaps();
-        assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::MintAway(w.mint.clone())));
+        assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::Again));
+        assert!(Fault::Again.said().contains("The token was not touched."));
         assert!(w.site.store.orders(10).unwrap().is_empty());
         assert_eq!(w.the_mint().balance().await.unwrap(), (0, 0));
         w.proxy.pass();
@@ -1254,35 +1359,68 @@ mod tests {
 
     /// A token its sender spent elsewhere, taken to the mint, whose answer
     /// ("spent") is lost. All the wallet can find is that the proofs are
-    /// spent, which they would also be had the mint taken them for it. The
-    /// exit asks the mint what it signed for this wallet, which is nothing,
-    /// and grants nothing; and the wallet is left holding nothing of it.
+    /// spent, which they would also be had the mint taken them for it, and
+    /// it cannot finish. The exit asks the mint what it signed for this
+    /// wallet, which is nothing: someone else spent it. Nothing is granted,
+    /// and the wallet is left holding nothing of it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_token_spent_elsewhere_buys_nothing_though_the_answer_was_lost() {
-        let mut w = world(0, GIVE_UP).await;
+        let w = world(0, GIVE_UP).await;
         let token = w.token(64).await;
         assert!(w.still_good(&token).await, "its sender redeems it, here");
         w.proxy.lose_swap_answers();
-        assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::NotYet));
-        let order = w.site.store.orders_open().unwrap().remove(0);
-        w.proxy.pass();
-        // Open for as long as the mint might sign yet, and nothing granted.
-        assert_eq!(round(&w.site).await, 1);
-        assert!(w.site.store.packages().unwrap().is_empty());
-        assert_eq!(
-            w.the_mint().balance().await.unwrap(),
-            (0, 64),
-            "the wallet cannot finish it, and holds it as under way"
-        );
-        // Then given up.
-        w.site = given_up(&w);
-        assert_eq!(round(&w.site).await, 0);
-        assert_eq!(w.site.store.order(&order.id).unwrap(), None, "forgotten");
+        assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::Refused("it is spent already".into())));
+        assert!(w.site.store.orders(10).unwrap().is_empty(), "forgotten");
         assert!(w.site.store.packages().unwrap().is_empty(), "nothing was granted");
         assert_eq!((w.the_mint().balance().await.unwrap(), w.site.store.sold(&w.mint).unwrap()), ((0, 0), 0));
+        // The same, with the mint away after it answered: open until the
+        // mint can be asked, and then that.
+        w.proxy.pass();
+        let token = w.token(64).await;
+        assert!(w.still_good(&token).await);
+        w.proxy.lose_a_swap_answer_and_go_away();
+        assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::NotYet));
+        let order = w.site.store.orders_open().unwrap().remove(0);
+        assert_eq!(round(&w.site).await, 1);
+        w.proxy.pass();
+        assert_eq!(round(&w.site).await, 0);
+        assert_eq!(w.site.store.order(&order.id).unwrap(), None);
+        assert!(w.site.store.packages().unwrap().is_empty());
+        assert_eq!(w.the_mint().balance().await.unwrap(), (0, 0));
         assert_eq!(w.the_mint().recorded(&order.id).await, Ok(Recorded::No));
-        // And sent again, the mint says what it is.
-        assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::Refused("it is spent already".into())));
+    }
+
+    /// A wallet whose file is behind what its seed was used for asks the
+    /// mint to sign what the mint signed before. The mint refuses, and what
+    /// it signed then is not a payment now: nothing is granted, the token
+    /// is as good as it was, and nothing is sold until the wallet has
+    /// counted again. Here it is behind because a second wallet uses its
+    /// seed, which is not to be done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_the_mint_signed_before_is_not_a_payment() {
+        for answer_lost in [false, true] {
+            let w = world(0, GIVE_UP).await;
+            let second = w.second_wallet("second").await;
+            let (_, theirs) = wallet::parse(&w.token(64).await).unwrap();
+            assert_eq!(second.mints[0].receive(&theirs, "theirs").await.unwrap(), 64);
+            // The exit's wallet would now ask for what the mint signed for
+            // the second one.
+            let token = w.token(64).await;
+            if answer_lost {
+                w.proxy.lose_swap_answers();
+            }
+            assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::Again), "answer lost: {answer_lost}");
+            w.proxy.pass();
+            assert!(w.site.store.orders(10).unwrap().is_empty() && w.site.store.packages().unwrap().is_empty());
+            assert_eq!(w.site.store.sold(&w.mint).unwrap(), 0);
+            assert!(!w.the_mint().ready(), "nothing is sold at a mint the wallet is behind at");
+            assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::MintAway(w.mint.clone())));
+            // Counted again, it knows of what its seed has, and sells.
+            w.the_mint().reach().await.unwrap();
+            assert_eq!(w.the_mint().balance().await.unwrap(), (64, 0), "what the second wallet took, found");
+            assert_eq!(w.buy(BUYER, "small", &token, None).await.unwrap().settled.paid_sat, 64);
+            assert_eq!(w.the_mint().balance().await.unwrap(), (128, 0));
+        }
     }
 
     /// What a service that died left behind: a token that arrived in the
@@ -1303,6 +1441,7 @@ mod tests {
                 target: None,
                 receipt,
                 value: 64,
+                inputs: "[]",
             };
             store.order_begin(id, &new, unix_now()).unwrap()
         };
@@ -1338,6 +1477,10 @@ mod tests {
         assert!(!desk.spend());
         let token = w.token(64).await;
         assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::Busy));
+        // And a connection that has no time left for an answer asks for
+        // nothing.
+        let asked = Asked { package: "small".into(), token: token.clone(), key: None };
+        assert_eq!(buy(&w.site, a(BUYER), &asked, Instant::now()).await, Err(Fault::Again));
         assert!(w.site.store.orders(10).unwrap().is_empty());
         assert!(w.still_good(&token).await);
     }
@@ -1395,6 +1538,10 @@ mod tests {
             "{page}"
         );
         assert!(page.contains("<h2>Add to this package</h2>"), "and more can be added there");
+        let (status, page) = ask(&w, "fd66::6", "big", &token, None, Kind::Form).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("This token paid before: 64 sat arrived, and small is package p"), "{page}");
+        assert!(page.contains("The key it had before opens nothing any more"));
         let (status, page) = ask(&w, "fd66::6", "small", "nonsense", None, Kind::Form).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(page.contains("<h1>Not bought</h1>") && page.contains("That is not a Cashu token"), "{page}");
@@ -1467,16 +1614,53 @@ mod tests {
         let dir = w.dir.join("moved");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("seed"), &seed).unwrap();
+        let notes = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("recount-"))
+                .count()
+        };
         let wallets = Wallets::open(&dir, std::slice::from_ref(&w.mint)).await.unwrap();
         assert_eq!(wallets.mints[0].balance().await.unwrap(), (0, 0));
+        assert_eq!(notes(), 1, "that it is to be counted again is written down");
+        // The service stops before it reached the mint, and starts again:
+        // the wallet's file is there now, and it is still to be counted.
+        drop(wallets);
+        let wallets = Wallets::open(&dir, std::slice::from_ref(&w.mint)).await.unwrap();
+        assert_eq!((wallets.mints[0].balance().await.unwrap(), notes()), ((0, 0), 1));
         wallets.mints[0].reach().await.unwrap();
         assert_eq!(wallets.mints[0].balance().await.unwrap(), (64, 0), "counted again from the seed");
+        assert_eq!(notes(), 0);
         assert_eq!(std::fs::read_to_string(dir.join("seed")).unwrap(), seed, "and the seed is as it was");
         // A seed that is not one is not replaced: what it holds would be gone.
         std::fs::write(dir.join("seed"), "not a seed").unwrap();
         let refused = Wallets::open(&dir, std::slice::from_ref(&w.mint)).await.err().unwrap();
         assert!(refused.contains("it is not replaced"), "{refused}");
         assert_eq!(std::fs::read_to_string(dir.join("seed")).unwrap(), "not a seed");
+        // And a wallet's file without its seed is not given another.
+        std::fs::remove_file(dir.join("seed")).unwrap();
+        let refused = Wallets::open(&dir, std::slice::from_ref(&w.mint)).await.err().unwrap();
+        assert!(refused.contains("seed is missing"), "{refused}");
+        assert!(!dir.join("seed").exists());
+    }
+
+    /// A wallet's file that is older than its seed's use (an old copy put
+    /// back) is found to be behind when the mint is reached, and counts
+    /// again before anything is sold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wallet_behind_its_seed_counts_again_before_it_sells() {
+        let w = world(0, GIVE_UP).await;
+        w.buy(BUYER, "small", &w.token(64).await, None).await.unwrap();
+        // The seed, and a wallet's file that knows of nothing.
+        let dir = w.dir.join("old");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::copy(w.dir.join("seed"), dir.join("seed")).unwrap();
+        std::fs::write(dir.join("wallet.db"), b"").unwrap();
+        let wallets = Wallets::open(&dir, std::slice::from_ref(&w.mint)).await.unwrap();
+        assert!(!wallets.ready());
+        assert_eq!(wallets.mints[0].balance().await.unwrap(), (0, 0));
+        wallets.mints[0].reach().await.unwrap();
+        assert_eq!(wallets.mints[0].balance().await.unwrap(), (64, 0));
     }
 
     /// A mint that is not reached: nothing is offered, and a token of it is
@@ -1493,9 +1677,10 @@ mod tests {
         assert!(wallets.mints[0].reach().await.is_err());
         assert!(!wallets.ready());
         let (parsed, _) = wallet::parse(&token).unwrap();
-        assert_eq!(wallets.mint_of(&parsed).err(), Some(Refusal::MintAway(w.mint.clone())), "not reached yet");
+        let named = wallets.mint_of(&parsed).expect("an accepted mint, reached or not");
+        assert!(!named.ready(), "not reached yet");
         wallets.mints[1].reach().await.unwrap();
-        assert!(wallets.ready() && wallets.mint_of(&parsed).is_ok());
+        assert!(wallets.ready() && named.ready());
         assert!(Wallets::open(&dir, &[w.mint.clone(), format!("{}/", w.mint)]).await.is_err(), "the same mint twice");
     }
 }

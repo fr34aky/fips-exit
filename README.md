@@ -195,7 +195,8 @@ POST /v1/orders  {"package": "1gb", "token": "cashuB…", "key": "…"}    added
   after the fee its mint takes for redeeming it. One that is worth less, or
   over a tenth more, is refused, and so is one of any other mint: such a
   token is not touched, and the answer says so. What a token is worth over
-  the price, up to that tenth, is kept. Nothing is given back.
+  the price, up to that tenth, is kept. Nothing is given back. (A tenth of
+  a price under 10 sat is nothing: such a package takes its price exactly.)
 - What is bought is a package of its own, with the device that asked in it
   and its key in the answer, shown once. With the `key` of a package there
   already is, the bytes and the days are added to that one, and nobody is
@@ -206,19 +207,26 @@ POST /v1/orders  {"package": "1gb", "token": "cashuB…", "key": "…"}    added
   arrived. The key before it then opens nothing. Sent by anyone else, it is
   refused.
 - A package is granted when its price has arrived in the wallet, and not
-  before. If the mint's answer was lost, the order stays open (`202`, and
-  the code `not-yet`); the mint is asked what it signed for this wallet,
-  now and every twenty seconds, and the order is paid if it did. Sending the
-  same token again asks the same question and takes nothing twice.
+  before. If the mint's answer was lost, the mint is asked two things, at
+  once and then every twenty seconds: what it signed for this wallet, and
+  whether the token is spent. Signed and spent, the order is paid. Spent
+  and not signed, someone else spent the token, and nothing is granted.
+  Neither, the order stays open (`202`, and the code `not-yet`) for as long
+  as the wallet's request may still arrive, ten minutes at least. Sending
+  the same token again asks what became of it and takes nothing twice; a
+  token that could not be taken to the mint at all is answered `503`,
+  `try-again`, and is not touched.
 - Not sold to: a device on the exit's own list, which is carried as it is;
   a device that another client's inner IPv4 address clashes with (below,
   under *Accounts*), which would be carried over IPv6 only; anyone while
   the exit's daemon is not running. Their tokens are not touched either.
 - A mint is taken only if it says what it has signed (NUT-07 and NUT-09):
   that is what is gone by after a lost answer.
-- At most 30 tokens in a burst and one more every two seconds are taken to
+- At most 10 tokens in a burst and one more every six seconds are taken to
   a mint, for all buyers together, 8 at once and one at a time for an
   address. Past that the answer is `429`, and the token is not touched.
+  (The wallet library itself asks a mint no more than 20 things at once
+  and one every three seconds after that.)
 
 ```sh
 sudo fips-exit wallet    # what the wallet holds at each mint, and what was sold there
@@ -231,6 +239,11 @@ has its seed, 24 words in the file `seed` beside it, has all of it. Copy the
 seed somewhere safe, once: with it the wallet's contents are found again at
 the mints if the machine is lost, here (a start with the seed and no
 `wallet.db` counts again) or in any Cashu wallet that restores from a seed.
+The two belong together: the service does not start with a `wallet.db` and
+no seed, and a `wallet.db` that is older than its seed's use (an old copy
+put back) is found out when a mint is reached, and counts again before
+anything is sold. One wallet for a seed, ever: a second one running on a
+copy of it makes each ask the mint for what it signed for the other.
 Ecash is the mint's promise and nothing more: a mint that goes away takes
 what the wallet holds there with it, so name mints you would trust with
 that, or your own.

@@ -91,7 +91,8 @@ pub async fn fill(wallet: &Wallet, amount: u64) -> Result<(), String> {
     for _ in 0..100 {
         let state = wallet.check_mint_quote_status(&quote.id).await.map_err(said)?.state;
         if state == MintQuoteState::Paid {
-            wallet.mint(&quote.id, SplitTarget::default(), None).await.map_err(said)?;
+            // As few proofs as the amount takes: a token of it is short.
+            wallet.mint(&quote.id, SplitTarget::Value(Amount::from(amount)), None).await.map_err(said)?;
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

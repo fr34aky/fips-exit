@@ -234,27 +234,41 @@ IPv4 address derived from the client's fips address.
 - **Granting what did not arrive.** The one thing the payment service is
   for. A package is made in one place (`Store::order_settle`), for an order
   written down before its token went to the mint, and only on one of two
-  grounds: the wallet took the token without a hitch, or the mint says it
-  signed what this wallet asked for in exchange. Never on the wallet
-  library's conclusion after an answer was lost: it goes by whether the
-  token's proofs are spent, and a sender can spend them elsewhere first.
-  Serious: a package for a token that was spent by someone else, refused
-  by the mint, of another mint, worth less than the price, or counted
-  twice (a credit's key can exist once); and the wallet let to finish what
-  it began before what it asked the mint to sign was kept for every open
-  order, since afterwards nothing can be asked.
+  grounds: the wallet took the token without a hitch, or the mint says both
+  that it signed what this wallet asked for in exchange (NUT-09) and that
+  the token's proofs are spent (NUT-07), which one exchange does at once.
+  Never on one of the two alone. Spent and not signed is a token its sender
+  spent elsewhere first, which is what the wallet library's own conclusion
+  after a lost answer cannot tell from a payment. Signed and not spent is
+  a wallet whose file is behind its seed's use, asking for what the mint
+  signed before: so the wallet's next requests are asked about at a mint
+  before anything is sold there, a mint's "signed before" ends the order
+  and the selling until the wallet has counted again, and an order the mint
+  said that of is never paid on what is found signed later. Serious: a
+  package for a token that was spent by someone else, refused by the mint,
+  of another mint, worth less than the price, or counted twice (a credit's
+  key can exist once); and the wallet let to finish what it began before
+  what it asked the mint to sign was kept for every open order, since
+  afterwards nothing can be asked.
 - **A token taken, and nothing granted.** The other way round: whatever the
   service refuses, it must refuse before the token is taken to the mint, and
   say that the token was not touched; an order whose token did reach the
-  mint must stay open until the mint has said what it signed, across a
+  mint must stay open until the mint has said what became of it, across a
   restart, a lost answer and a closed connection. An order is forgotten only
-  when the mint says it signed nothing and the token is spent, or ten
-  minutes have passed.
+  when the mint says the token is spent and not for this wallet; or when it
+  says neither signed nor spent, ten minutes have passed, and the wallet has
+  nothing of it left that it could still be asking the mint for (while it
+  has, or could not finish, a request of its own may be on its way). And a
+  token sent again is answered with what became of it before anything that
+  is asked only of a new purchase: none of those may say "not touched" of a
+  token that was taken.
 - **The wallet's seed going anywhere.** The file `seed` in the state
   directory, for the service's user alone. It is what the wallet holds. It
   must never be logged, printed, put in an answer or an error, or sent; a
   seed file that holds something else is not replaced, and its contents not
-  repeated. The same for the tokens: one is not written to the log.
+  repeated; and none is made beside a wallet's file that has lost its own,
+  where it would be taken for the one that is gone. The same for the
+  tokens: one is not written to the log.
 - **The service asking anyone but its mints.** It has the internet now, to
   reach the mints in `MINTS` and nothing else. Anything that makes it open a
   connection to an address from a request, a token or a page is serious.
@@ -312,10 +326,18 @@ IPv4 address derived from the client's fips address.
   paying out and a limit are written (the next phases). Whoever takes the
   service over, or reads its state directory, has all that was paid since
   the operator last emptied it by hand, with the seed.
+- **Two wallets on one seed.** A copy of the seed in a second service, or
+  in another wallet while this one runs, makes each ask the mint for what
+  it signed for the other. That is found out (the mint refuses, selling
+  stops, the wallet counts again) and it is not safe all the same: between
+  one count and the next, with an answer of the mint's lost and a sender
+  who spends the token elsewhere in that moment, what the mint signed for
+  the other wallet would pass for a payment. The README says one wallet for
+  a seed.
 - **Anyone can keep others from paying.** The mint is asked for every token
   that passes the checks made here, and a token that will be refused there
   costs its sender nothing to make. So there is a budget for the whole
-  service, 30 tokens and one more every two seconds, and someone who uses
+  service, 10 tokens and one more every six seconds, and someone who uses
   it up keeps everyone from buying for as long as they go on. Members are
   carried all the same. A token need not carry the proof (NUT-12) that
   would let the service refuse a made-up one without asking: wallets in
@@ -382,6 +404,9 @@ IPv4 address derived from the client's fips address.
 - What a token is worth over the price, up to a tenth, is kept; more than
   that and it is not taken at all, so that a slip of a finger costs nobody
   a large token.
+- A purchase is answered while its connection lives (a minute), with "not
+  yet" if need be, and goes on by itself: a token half taken is not left
+  because a connection closed.
 - One thing at a time at a mint: a token taken, or what was interrupted put
   right, never both. Sales at one mint wait for each other.
 - The service says "reached" of a mint only when the mint itself answered,

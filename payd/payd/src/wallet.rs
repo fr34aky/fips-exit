@@ -16,9 +16,18 @@
 //! and `wallet.db`, the library's store. Whoever has the seed has what the
 //! wallet holds, and can find it again at the mints with any wallet that
 //! restores from a seed (NUT-13).
+//!
+//! What the wallet asks a mint to sign follows from the seed and a counter
+//! in the wallet's file. A file that is behind its seed's use (a new one, or
+//! an old copy put back) would ask for what the mint has signed already:
+//! the mint refuses that, and what it signed before must not be taken for
+//! a payment. So before anything is sold at a mint the wallet's next
+//! requests are asked about there, and a wallet that is behind counts again
+//! from its seed first. One wallet for a seed: two at once are each behind
+//! the other.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +35,10 @@ use std::time::Duration;
 
 use cdk::cdk_database::WalletDatabase;
 use cdk::mint_url::MintUrl;
-use cdk::nuts::{BlindedMessage, CurrencyUnit, ProofsMethods, RestoreRequest, Token};
+use cdk::nuts::{
+    BlindedMessage, CheckStateRequest, CurrencyUnit, PreMintSecrets, ProofsMethods, PublicKey, RestoreRequest, State,
+    Token,
+};
 use cdk::wallet::types::{
     KeysetLoadPolicy, OperationData, ReceiveSagaState, TransactionDirection, TransactionId, TransactionStatus,
     WalletSagaState,
@@ -44,6 +56,10 @@ pub const MINT_TIME: Duration = Duration::from_secs(25);
 /// bound on what a stranger can make this service, and the mint, work on.
 pub const MAX_TOKEN: usize = 24 * 1024;
 pub const MAX_PROOFS: usize = 64;
+/// How many of the wallet's next requests to a mint are asked about, to
+/// find out whether its file is behind its seed's use: as many as a wallet
+/// asks about at a time when it counts again.
+const AHEAD: u32 = 100;
 
 /// Why a token is not taken, found without asking the mint anything about
 /// it: the token is untouched.
@@ -67,6 +83,20 @@ pub struct Look {
     /// redeeming it.
     pub value: u64,
     pub fee: u64,
+    /// Its proofs as the mint knows them (their `Y`s, as JSON): what the
+    /// mint is asked about when it is asked whether they are spent.
+    pub inputs: String,
+}
+
+/// What a token's proofs are at the mint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Inputs {
+    /// All spent: by whoever the mint took them from.
+    Spent,
+    /// Some spent: by someone else, since an exchange takes all or none.
+    Partly,
+    /// None spent, yet.
+    Unspent,
 }
 
 /// What the wallet was in the middle of for a token, when it was
@@ -141,12 +171,22 @@ pub struct Mint {
     url: MintUrl,
     wallet: Wallet,
     db: Arc<WalletSqliteDatabase>,
+    seed: [u8; 64],
     /// Whether tokens are taken at it: it has been reached, and its keys
     /// are known.
     ready: AtomicBool,
     /// The seed was here and the wallet's file was not: what the seed has
-    /// at the mint is counted again before anything else is done there.
+    /// at the mint is counted again before anything else is done there. A
+    /// file says so until it is done, since the wallet's file is there from
+    /// the first start on.
     count_first: AtomicBool,
+    marker: PathBuf,
+    /// The wallet's next requests are to be asked about before anything is
+    /// sold: at the start, and when the mint has refused one as signed
+    /// already.
+    look_ahead: AtomicBool,
+    /// Told when this mint is to be reached again now.
+    again: Arc<tokio::sync::Notify>,
     /// One thing at a time at a mint: a token taken, or what was
     /// interrupted put right, never both at once.
     pub turn: tokio::sync::Mutex<()>,
@@ -174,11 +214,27 @@ impl Mint {
             if !keysets.iter().any(|keyset| keyset.unit == CurrencyUnit::Sat) {
                 return Err("it has no keys for sat".to_string());
             }
-            if self.count_first.load(Ordering::Relaxed) {
+            if self.count_first.load(Ordering::Relaxed) || self.look_ahead.load(Ordering::Relaxed) {
                 let _turn = self.turn.lock().await;
-                let found = self.count_again().await?;
+                if self.count_first.load(Ordering::Relaxed) || self.behind().await? {
+                    let found = self.count_again().await?;
+                    eprintln!("fips-exit-payd: {}: the wallet's file was behind its seed's use: {found}", self.name);
+                    if self.behind().await? {
+                        return Err(
+                            "it has signed more for this wallet's seed than the wallet knows of, and counting \
+                                    again did not find it: is another wallet using the seed?"
+                                .into(),
+                        );
+                    }
+                }
+                match std::fs::remove_file(&self.marker) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(format!("{}: {e}", self.marker.display()));
+                    }
+                    _ => {}
+                }
                 self.count_first.store(false, Ordering::Relaxed);
-                eprintln!("fips-exit-payd: {}: the wallet's file was new and its seed was not: {found}", self.name);
+                self.look_ahead.store(false, Ordering::Relaxed);
             }
             Ok(())
         }
@@ -190,6 +246,66 @@ impl Mint {
             _ => {}
         }
         reached
+    }
+
+    /// Has the mint signed any of the wallet's next requests already? Then
+    /// the wallet's file is behind what its seed was used for. The caller
+    /// holds [`Mint::turn`].
+    async fn behind(&self) -> Result<bool, String> {
+        let keyset = within(self.wallet.active_keyset()).await?.id;
+        let next = self.db.increment_keyset_counter(&keyset, 0).await.map_err(said)?;
+        let outputs = PreMintSecrets::restore_batch(keyset, &self.seed, next, next.saturating_add(AHEAD))
+            .map_err(said)?
+            .blinded_messages();
+        let answer = within(self.wallet.mint_connector().post_restore(RestoreRequest { outputs })).await?;
+        Ok(!answer.signatures.is_empty())
+    }
+
+    /// The mint has signed before what the wallet asked it to sign now:
+    /// nothing is sold here until the wallet has counted again, at once.
+    pub fn suspect(&self) {
+        // Counted again in full, not only looked ahead: the request the
+        // mint refused has moved the wallet's counter past what it signed
+        // before, and what was signed there is the wallet's all the same.
+        // Written down, so that a restart does not forget it.
+        self.count_first.store(true, Ordering::Relaxed);
+        if let Err(e) = std::fs::write(&self.marker, format!("{}\n", self.name)) {
+            eprintln!("fips-exit-payd: {}: {e}", self.marker.display());
+        }
+        self.look_ahead.store(true, Ordering::Relaxed);
+        if self.ready.swap(false, Ordering::Relaxed) {
+            eprintln!(
+                "fips-exit-payd: {}: THE MINT HAS SIGNED BEFORE WHAT THE WALLET ASKED OF IT NOW: the wallet's file is \
+                 behind its seed's use. Nothing is sold here until it has counted again.",
+                self.name
+            );
+        }
+        self.again.notify_one();
+    }
+
+    /// The receipt of `token`, if this wallet knows its mint's keys:
+    /// without them it has taken no token of it. Nothing is asked of the
+    /// mint.
+    pub async fn receipt(&self, token: &Token) -> Option<[u8; 32]> {
+        let keysets = self.db.get_mint_keysets(self.url.clone()).await.ok().flatten()?;
+        receipt_of(&token.proofs(&keysets).ok()?).ok()
+    }
+
+    /// What the proofs `inputs` (as [`Look`] has them) are at the mint
+    /// (NUT-07).
+    pub async fn inputs(&self, inputs: &str) -> Result<Inputs, String> {
+        let ys: Vec<PublicKey> = serde_json::from_str(inputs).map_err(said)?;
+        let answer =
+            within(self.wallet.mint_connector().post_check_state(CheckStateRequest { ys: ys.clone() })).await?;
+        let spent = ys
+            .iter()
+            .filter(|y| answer.states.iter().any(|state| state.y == **y && state.state == State::Spent))
+            .count();
+        Ok(match spent {
+            0 => Inputs::Unspent,
+            all if all == ys.len() => Inputs::Spent,
+            _ => Inputs::Partly,
+        })
     }
 
     /// What `token`, which names this mint, is: its proofs, its worth, the
@@ -212,12 +328,14 @@ impl Mint {
         }
         let value = proofs.total_amount().map_err(|_| no("The token's amounts do not add up"))?.to_u64();
         let receipt = receipt_of(&proofs).map_err(|e| no(&e))?;
+        let inputs = proofs.ys().ok().and_then(|ys| serde_json::to_string(&ys).ok());
+        let inputs = inputs.ok_or_else(|| no("The token's proofs cannot be read"))?;
         let fee = within(self.wallet.get_proofs_fee(&proofs))
             .await
             .map_err(|_| Refusal::MintAway(self.name.clone()))?
             .total
             .to_u64();
-        Ok(Look { receipt, value, fee })
+        Ok(Look { receipt, value, fee, inputs })
     }
 
     /// Redeem `token` at the mint, for `order`. What arrived, in sat.
@@ -302,7 +420,10 @@ impl Mint {
     /// How many sat the mint has signed of `outputs` (as [`Unfinished`]
     /// kept them): what this wallet asked it to sign in exchange for a
     /// token. Nothing, if the exchange did not happen; the mint signs them
-    /// for nobody else, since nobody else can ask for them.
+    /// for nobody else, since nobody else can ask for them. It may have
+    /// signed them for this wallet before, if the wallet's file is behind:
+    /// so this is a payment only together with the token's proofs being
+    /// spent ([`Mint::inputs`]), which one exchange does at once.
     pub async fn signed(&self, outputs: &str) -> Result<u64, String> {
         let outputs: Vec<BlindedMessage> = serde_json::from_str(outputs).map_err(said)?;
         let asked: Vec<_> = outputs.iter().map(|output| output.blinded_secret).collect();
@@ -354,11 +475,15 @@ impl Mint {
 /// The wallets, one for each accepted mint.
 pub struct Wallets {
     pub mints: Vec<Arc<Mint>>,
+    /// Told when a mint is to be reached again now.
+    again: Arc<tokio::sync::Notify>,
 }
 
 /// The seed in `path`, made if it is not there: 24 words, for this user
-/// alone. Whether it was there already.
-fn seed(path: &Path) -> Result<([u8; 64], bool), String> {
+/// alone. Whether it was there already. Not made beside a wallet's file
+/// that is there (`wallet_there`): what that holds was made with a seed
+/// that is gone, and a new one would only be mistaken for it.
+fn seed(path: &Path, wallet_there: bool) -> Result<([u8; 64], bool), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let wrong = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
@@ -369,6 +494,10 @@ fn seed(path: &Path) -> Result<([u8; 64], bool), String> {
             })?;
             Ok((mnemonic.to_seed_normalized(""), true))
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && wallet_there => Err(wrong(
+            &"the wallet's seed is missing, and its file (wallet.db) is there: what that holds was made with the \
+              seed. Put the seed back; or, for a new wallet, move wallet.db away",
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let entropy = random(32).map_err(|e| wrong(&e))?;
             let mnemonic = bip39::Mnemonic::from_entropy(&entropy).map_err(|e| wrong(&e))?;
@@ -389,10 +518,20 @@ impl Wallets {
     /// The wallets for `mints`, kept in `dir`. Nothing is asked of a mint
     /// here: [`Mint::reach`] does that.
     pub async fn open(dir: &Path, mints: &[String]) -> Result<Wallets, String> {
-        let (seed, seed_was_there) = seed(&dir.join("seed"))?;
         let file = dir.join("wallet.db");
         let file_was_there = file.exists();
+        let (seed, seed_was_there) = seed(&dir.join("seed"), file_was_there)?;
+        // A seed with no wallet's file: what the seed has at each mint is
+        // counted again there. Written down before the file is made, and
+        // until it is done for that mint: the file is there from now on.
+        let marker = |name: &str| dir.join(format!("recount-{}", &crate::store::hex(&Sha256::digest(name))[..16]));
+        if seed_was_there && !file_was_there {
+            for name in mints {
+                std::fs::write(marker(name), format!("{name}\n")).map_err(|e| format!("{}: {e}", dir.display()))?;
+            }
+        }
         let db = Arc::new(WalletSqliteDatabase::new(&file).await.map_err(|e| format!("{}: {e}", file.display()))?);
+        let again = Arc::new(tokio::sync::Notify::new());
         let mut opened = Vec::new();
         for name in mints {
             let url = MintUrl::from_str(name).map_err(|e| format!("MINTS: {name}: {e}"))?;
@@ -406,12 +545,16 @@ impl Wallets {
                 url,
                 wallet,
                 db: db.clone(),
+                seed,
                 ready: AtomicBool::new(false),
-                count_first: AtomicBool::new(seed_was_there && !file_was_there),
+                count_first: AtomicBool::new(marker(name).exists()),
+                marker: marker(name),
+                look_ahead: AtomicBool::new(true),
+                again: again.clone(),
                 turn: tokio::sync::Mutex::new(()),
             }));
         }
-        Ok(Wallets { mints: opened })
+        Ok(Wallets { mints: opened, again })
     }
 
     /// Whether a token is taken at any mint now.
@@ -419,12 +562,11 @@ impl Wallets {
         self.mints.iter().any(|mint| mint.ready())
     }
 
-    /// The wallet at the mint `token` names: an accepted one, and reached.
+    /// The wallet at the mint `token` names, which must be an accepted
+    /// one. Whether it is reached is another matter ([`Mint::ready`]).
     pub fn mint_of(&self, token: &Token) -> Result<&Arc<Mint>, Refusal> {
         let named = token.mint_url().map_err(|_| Refusal::Token("A token of one mint is taken".into()))?;
-        let mint =
-            self.mints.iter().find(|mint| mint.url == named).ok_or_else(|| Refusal::WrongMint(named.to_string()))?;
-        if mint.ready() { Ok(mint) } else { Err(Refusal::MintAway(mint.name.clone())) }
+        self.mints.iter().find(|mint| mint.url == named).ok_or_else(|| Refusal::WrongMint(named.to_string()))
     }
 
     pub fn named(&self, name: &str) -> Option<&Arc<Mint>> {
@@ -439,7 +581,10 @@ impl Wallets {
             for mint in &self.mints {
                 all &= mint.reach().await.is_ok();
             }
-            tokio::time::sleep(if all { Duration::from_secs(900) } else { Duration::from_secs(30) }).await;
+            tokio::select! {
+                () = tokio::time::sleep(if all { Duration::from_secs(900) } else { Duration::from_secs(30) }) => {}
+                () = self.again.notified() => {}
+            }
         }
     }
 }

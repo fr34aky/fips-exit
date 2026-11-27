@@ -182,6 +182,19 @@ class Tags(unittest.TestCase):
                     self.assertEqual(unseen, [], f"{name}:{number}")
 
 
+class PayPort(unittest.TestCase):
+    """PAY_PORT as the payment service takes it: ASCII digits, 1024 to 65535."""
+
+    def test_a_port_is_read_as_the_service_reads_it(self):
+        self.assertEqual(x.pay_port({}), 5170)
+        self.assertEqual(x.pay_port({"PAY_PORT": "6000"}), 6000)
+        self.assertEqual(x.pay_port({"PAY_PORT": "65535"}), 65535)
+        for bad in ("80", "1023", "65536", "05170", "+6000", "6000 ", "\u00b2", "\uff15\uff11\uff17\uff10", "http"):
+            self.assertIsNone(x.pay_port({"PAY_PORT": bad}, strict=False), repr(bad))
+            with self.assertRaises(SystemExit):
+                x.pay_port({"PAY_PORT": bad})
+
+
 class Event(unittest.TestCase):
     TAGS = [["d", "fips-exit"], ["v", "1"], ["access", "allow-list"], ["name", "Zürich ☕"],
             ["country", "CH"], ["expiration", "1800010800"]]

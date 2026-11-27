@@ -114,7 +114,8 @@ pub fn respond<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>) -> Response
         return refused;
     }
     let terms = || terms::terms(&site.config, &site.exit, peer);
-    let mut response = match request.uri().path() {
+    // A HEAD is answered as a GET; hyper sends the head of it and not the body.
+    match request.uri().path() {
         "/v1/terms" => match serde_json::to_vec(&terms()) {
             Ok(json) => answer(StatusCode::OK, "application/json", json),
             Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, "the terms could not be written"),
@@ -122,11 +123,7 @@ pub fn respond<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>) -> Response
         "/" => answer(StatusCode::OK, "text/html; charset=utf-8", terms::page(&terms())),
         "/style.css" => answer(StatusCode::OK, "text/css; charset=utf-8", terms::STYLE),
         _ => plain(StatusCode::NOT_FOUND, "nothing here"),
-    };
-    if request.method() == Method::HEAD {
-        *response.body_mut() = Full::new(Bytes::new());
     }
-    response
 }
 
 /// A place among the connections of one peer, given back when it is dropped.
@@ -308,6 +305,19 @@ mod tests {
         assert_eq!(terms["you"]["address"], "::1");
         assert_eq!(terms["price_msat_per_gb"], 2_000_000);
         assert_eq!(terms["methods"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_head_is_the_head_of_a_get() {
+        let at = server(Limits::default(), |_| true).await;
+        let get = exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: [fd14::1]:5170\r\nConnection: close\r\n\r\n").await;
+        let head = exchange(at, b"HEAD /v1/terms HTTP/1.1\r\nHost: [fd14::1]:5170\r\nConnection: close\r\n\r\n").await;
+        let (get_head, get_body) = get.split_once("\r\n\r\n").unwrap();
+        let length =
+            |text: &str| text.lines().find_map(|line| line.strip_prefix("content-length: ")).map(str::to_string);
+        assert_eq!(length(&head.replace("\r\n\r\n", "")), length(get_head), "{head}");
+        assert_eq!(length(get_head), Some(get_body.len().to_string()));
+        assert!(head.ends_with("\r\n\r\n"), "no body: {head:?}");
     }
 
     #[tokio::test]

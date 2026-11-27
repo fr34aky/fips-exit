@@ -8,6 +8,11 @@ Wants=network-online.target
 # MINTS, PAY_PORT) and answers on this node's fips address. Does nothing,
 # and succeeds, when ACCESS is not paid.
 ExecStart=/usr/local/sbin/fips-exit-payd
+# The exit opens the service's port to the mesh while it listens there, and
+# closes it when it stops: `up` looks, as root ("+"), and its failure (the
+# exit not running) is not the service's ("-").
+ExecStartPost=-+/usr/local/sbin/fips-exit up
+ExecStopPost=-+/usr/local/sbin/fips-exit up
 Restart=on-failure
 RestartSec=5
 

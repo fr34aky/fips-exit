@@ -284,16 +284,36 @@ def paid(config):
 DEFAULT_PAY_PORT = 5170
 
 
-def pay_port(config):
+def pay_port(config, strict=True):
     """The port the payment service answers on, on this node's fips
-    address: PAY_PORT, a number from 1024 to 65535, as the service itself
-    takes it (payd/payd/src/config.rs)."""
+    address: PAY_PORT, a number from 1024 to 65535, in ASCII digits, as the
+    service itself takes it (payd/payd/src/config.rs). A value that is not
+    one stops the script, or with `strict` false is None."""
     text = config.get("PAY_PORT", "")
     if not text:
         return DEFAULT_PAY_PORT
-    if not text.isdigit() or text.startswith("0") or not 1024 <= int(text) <= 65535:
+    if re.fullmatch(r"[1-9][0-9]{3,4}", text) and 1024 <= int(text) <= 65535:
+        return int(text)
+    if strict:
         die(f"PAY_PORT={text} in {CONFIG}: a port from 1024 to 65535")
-    return int(text)
+    return None
+
+
+def payd_listens(port, wait=10.0):
+    """Is the payment service listening on `port`? Asked of the kernel, in
+    this network namespace, so that the port is opened to the mesh for the
+    service and for nothing else that might listen there. While its process
+    runs and has not bound yet (it waits for fips's address, as the daemon
+    does) it is waited for, `wait` seconds at most."""
+    deadline = time.monotonic() + wait
+    while True:
+        shown = run("ss", "-Hltnp", f"sport = :{port}", check=False).stdout
+        if '"fips-exit-payd"' in shown:
+            return True
+        running = run("pgrep", "-x", "fips-exit-payd", check=False).returncode == 0
+        if not running or time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 def control(line, wait=0.0):
@@ -548,7 +568,7 @@ table inet {TABLE} {{
 UFW_TAG = "fips-exit"
 
 
-def fips_firewall(clients, config, on, resolver=False):
+def fips_firewall(clients, config, on, resolver=False, pay=None):
     """Let the clients' tunnel packets through fips's own firewall.
 
     That firewall drops what arrives on the mesh interface unless a drop-in
@@ -562,7 +582,10 @@ def fips_firewall(clients, config, on, resolver=False):
     opened only while the daemon says its resolver runs (`resolver`, from
     the answer `up` waited for), or whatever else listens there would be
     open to the mesh. And the payment service's port (PAY_PORT), to the
-    same address: anyone on the mesh may ask what the exit costs.
+    same address, only while the service listens there (`pay`): anyone on
+    the mesh may ask what the exit costs, and nothing else that might
+    listen on that port is to be reached. The service's unit runs `up`
+    when it starts and when it stops, so the port follows it.
     """
     firewall = config["FIPS_FIREWALL"]
     dropin = os.path.join(os.path.dirname(firewall), "fips.d", "fips-exit.nft")
@@ -573,8 +596,9 @@ def fips_firewall(clients, config, on, resolver=False):
     if on and paid(config):
         here = mesh_address(config)
         rule = ("# Written by fips-exit; do not edit.\n"
-                f"ip6 daddr {here} ip6 nexthdr {{ 4, 41, 44 }} accept\n"
-                f"ip6 daddr {here} tcp dport {pay_port(config)} accept\n")
+                f"ip6 daddr {here} ip6 nexthdr {{ 4, 41, 44 }} accept\n")
+        if pay:
+            rule += f"ip6 daddr {here} tcp dport {pay} accept\n"
         if resolver:
             rule += f"ip6 daddr {here} udp dport 53 accept\n"
     elif on and clients:
@@ -594,7 +618,7 @@ def fips_firewall(clients, config, on, resolver=False):
         run("nft", "-f", firewall)
 
 
-def ufw(clients, config, on, resolver=False):
+def ufw(clients, config, on, resolver=False, pay=None):
     """Let the tunnel through ufw, when ufw is what filters this host.
 
     ufw drops input and forwarding by default and has no syntax for
@@ -612,8 +636,8 @@ def ufw(clients, config, on, resolver=False):
         # fips_firewall.
         here = str(mesh_address(config))
         to_daemon = [["-i", config["MESH_IF"], "-d", here, "-p", proto, "-j", "ACCEPT"] for proto in ("4", "41")]
-        to_daemon.append(["-i", config["MESH_IF"], "-d", here, "-p", "tcp", "--dport", str(pay_port(config)),
-                          "-j", "ACCEPT"])
+        if pay:
+            to_daemon.append(["-i", config["MESH_IF"], "-d", here, "-p", "tcp", "--dport", str(pay), "-j", "ACCEPT"])
         if resolver:
             to_daemon.append(["-i", config["MESH_IF"], "-d", here, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
     else:
@@ -654,9 +678,10 @@ def cmd_up():
     tun = config["TUN"]
     if not tun_present(config):
         die(f"no interface {tun}: fips-exitd is not running (systemctl start fips-exit)")
-    resolver = False
+    resolver, pay = False, None
     if paid(config):
-        pay_port(config)  # checked before anything is changed
+        port = pay_port(config)  # checked before anything is changed
+        pay = port if payd_listens(port) else None
         # The daemon reads ACCESS when it starts; one that was started
         # before the config said paid has no socket, and carries no member.
         stat = daemon_stat(wait=5)
@@ -679,8 +704,8 @@ def cmd_up():
 
     remove_kernel_tunnels(config)
     run("nft", "-f", "-", stdin=ruleset(clients, config, wan))
-    fips_firewall(clients, config, True, resolver)
-    ufw(clients, config, True, resolver)
+    fips_firewall(clients, config, True, resolver, pay)
+    ufw(clients, config, True, resolver, pay)
 
     # Replies to a client's IPv6 traffic are addressed to its fips address,
     # which the main table routes into the mesh as it is. Forwarded packets
@@ -1308,9 +1333,12 @@ def cmd_status():
         stat = daemon_stat()
         print("access: paid, " + (f"{stat.get('accounts', '?')} account(s)" if stat
                                   else f"but the daemon does not answer on {CONTROL}"))
-        service = run("pgrep", "-x", "fips-exit-payd", check=False).returncode == 0
-        print(f"payment service fips-exit-payd: {'running' if service else 'not running'}, "
-              f"port {pay_port(config)}")
+        port = pay_port(config, strict=False)
+        if port is None:
+            print(f"payment service fips-exit-payd: PAY_PORT={config['PAY_PORT']} is not a port from 1024 to 65535")
+        else:
+            listening = payd_listens(port, wait=0)
+            print(f"payment service fips-exit-payd: {'answering' if listening else 'not answering'} on port {port}")
 
 
 def cmd_accounts():

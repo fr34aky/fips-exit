@@ -486,10 +486,21 @@ except OSError: print("unreachable")' $E "$2" "${3:-[$E]:5170}"
 conf "ACCESS=nonsense\n"
 "$payd" --config "$FIPS_EXIT_DIR/config" 2>&1 | grep -q "nothing to sell" || fail "the payment service on an exit that sells nothing"
 conf "ACCESS=paid\nPRICE_MSAT_PER_GB=2000000\nPACKAGES=\"1gb:1GB:1500:30 5gb:5GB:6000:90\"\nCOUNTRY=CH\nADVERT_NAME=\"An exit\"\n"
-grep -qx "ip6 daddr $E tcp dport 5170 accept" "$fw/fips.d/fips-exit.nft" || fail "the payment port in fips's firewall: $(cat "$fw/fips.d/fips-exit.nft")"
+# Nothing listens on the port yet, so it is not opened: whatever else might
+# listen there is not for the mesh.
+grep -q "dport 5170" "$fw/fips.d/fips-exit.nft" && fail "THE PAYMENT PORT WAS OPENED WITH NO SERVICE BEHIND IT"
+nc_listener() { python3 -c 'import socket,time; s=socket.socket(socket.AF_INET6); s.bind(("::",5170)); s.listen(1); time.sleep(30)' & }
+nc_listener; other=$!
+sleep 0.3
+"$here/fips-exit" up >/dev/null
+grep -q "dport 5170" "$fw/fips.d/fips-exit.nft" && fail "THE PAYMENT PORT WAS OPENED FOR SOMETHING THAT IS NOT THE SERVICE"
+kill $other; wait $other 2>/dev/null || true
 "$payd" --config "$FIPS_EXIT_DIR/config" --pub "$FIPS_EXIT_DIR/none.pub" 2>>"$FIPS_EXIT_DIR/payd.log" &
 payd_pid=$!
-for i in 1 2 3 4 5 6 7 8 9 10; do grep -q "the terms of" "$FIPS_EXIT_DIR/payd.log" 2>/dev/null && break; sleep 0.3; done
+# As the service's unit does when it has started: `up`, which waits for it to listen.
+"$here/fips-exit" up >/dev/null
+grep -qx "ip6 daddr $E tcp dport 5170 accept" "$fw/fips.d/fips-exit.nft" || fail "the payment port in fips's firewall: $(cat "$fw/fips.d/fips-exit.nft")"
+"$here/fips-exit" status | grep -q "payment service fips-exit-payd: answering on port 5170" || fail "status: $("$here/fips-exit" status)"
 r=$(http_get c3 /v1/terms)
 [ "${r%%
 *}" = 200 ] || fail "the terms from the mesh: $r $(cat "$FIPS_EXIT_DIR/payd.log")"
@@ -614,7 +625,16 @@ nft list chain inet fips_exit replies >/dev/null 2>&1 && fail "paid mode's marki
 grep -q "daddr" "$fw/fips.d/fips-exit.nft" && fail "fips's firewall is still open to the mesh: $(cat "$fw/fips.d/fips-exit.nft")"
 # The payment service still runs, and the mesh no longer reaches it.
 [ "$(http_get c3 /v1/terms)" = unreachable ] || fail "THE PAYMENT SERVICE WAS REACHABLE WITHOUT PAID MODE"
-kill $payd_pid
+# In paid mode again, and the service stops: as its unit does then, `up`, and
+# the port is closed.
+conf "ACCESS=paid\n"
+"$here/fips-exit" up >/dev/null
+grep -q "dport 5170" "$fw/fips.d/fips-exit.nft" || fail "the payment port after paid mode came back"
+kill $payd_pid; wait $payd_pid 2>/dev/null || true
+"$here/fips-exit" up >/dev/null
+grep -q "dport 5170" "$fw/fips.d/fips-exit.nft" && fail "THE PAYMENT PORT STAYED OPEN AFTER THE SERVICE STOPPED"
+conf ""
+"$here/fips-exit" up >/dev/null
 [ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "a member was served without paid mode"
 # The daemon would still answer this member, whose account has bytes: here it
 # is fips's firewall alone that keeps its query out.

@@ -160,7 +160,12 @@ sudo systemctl enable --now fips-exit-payd
   connection comes from, which fips authenticates. `methods` is empty: there
   is no way to pay yet.
 - In paid mode `fips-exit up` opens that port in fips's firewall and in ufw,
-  to this node's address, for the whole mesh.
+  to this node's address, for the whole mesh, while the service listens
+  there, and only then: nothing else that listens on the port is to be
+  reached. The service's unit runs `up` when it starts and stops, so the
+  port follows it. `status` says whether it answers.
+- It answers on the address of the node's npub (`/etc/fips/fips.pub`), and
+  shows the npub only when it is that address's.
 - The service reads the config when it starts: restart it after a change.
   With `ACCESS` other than `paid` it says so and stops.
 - It answers only requests for this exit's own name (`[address]:port` or

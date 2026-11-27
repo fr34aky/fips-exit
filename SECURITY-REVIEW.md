@@ -158,7 +158,12 @@ IPv4 address derived from the client's fips address.
   privilege and must stay so: a change that gives it a capability, a
   writable path outside its own, the control socket (before that is meant,
   with accounts), or the node's key. And its port must be opened in paid
-  mode only, to this node's address only: leaving paid mode closes it.
+  mode only, to this node's address only, and only while the service
+  itself listens there (`up` asks the kernel which process does): leaving
+  paid mode, or the service stopping, closes it.
+- **The payment service naming another node.** It shows an npub, and
+  answers to `<npub>.fips`, only when that npub's fips address is the one
+  it answers on; a stale key file is not believed.
 - **The node's key going anywhere.** `fips-exit advert` reads the fips
   identity's secret key. It must never be printed, logged, put in an error
   message or sent: only the signature leaves. That includes a key file that

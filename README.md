@@ -207,7 +207,8 @@ an optimisation, not a requirement.
 
 Optional paid public exits (an advert with price and country, prepaid data
 packages, pay-as-you-go) are designed in
-[`docs/paid-exit.md`](docs/paid-exit.md). None of it is implemented yet.
+[`docs/paid-exit.md`](docs/paid-exit.md). Its first phase is here: accounts
+and `ACCESS=paid`, above. Nothing yet announces an exit or takes a payment.
 
 ## Test
 

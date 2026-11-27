@@ -1,9 +1,12 @@
 # Paid public exits: design
 
-**Status: design. Nothing in this document is implemented.** It says what is
-to be built, in which order, and what was decided against. Each phase arrives
+**Status: phase 1 of ten is implemented** (accounts in the daemon and
+`ACCESS=paid` in the script; the README's *Accounts* section is what it does
+now). Everything from the advert on is design. This document says what is to
+be built, in which order, and what was decided against. Each phase arrives
 as its own pull request and moves the parts it implements from here into the
-README and `SECURITY-REVIEW.md`.
+README and `SECURITY-REVIEW.md`; where building a phase changed the design,
+the text here was changed with it.
 
 ## What this is for
 
@@ -153,9 +156,9 @@ daemon passed on.
 - Nothing arrives for a client that it did not ask for: `to_client` in the
   script's table carries only established and related traffic.
 - DNS through the daemon's resolver is answered for static clients and for
-  members of an account that still has bytes, and is not billed. It gets a
-  limit per source: today's limit of 64 queries in flight is for the whole
-  exit (`DNS_IN_FLIGHT`), so one member could use it all.
+  members of an account that still has bytes, and is not billed. A client
+  has 64 queries in flight at most, of 256 for the exit. Before, the 64 were
+  for the whole exit, so one member could have used them all.
 - A gigabyte is 10⁹ bytes. The amount due for `n` bytes at a price of `p`
   millisatoshi per gigabyte is `ceil(n × p / 10⁹)` millisatoshi.
 
@@ -214,7 +217,9 @@ to expect and something an attacker can arrange.
   smallest purchase keeps an address for ever.
 - An address that was given up is not handed to a different node at once:
   replies are routed by their destination alone (`Clients::route`), and the
-  new holder would receive what was still on its way to the old one.
+  new holder would receive what was still on its way to the old one. It is
+  kept for five minutes, and a member that waited for it has it within a
+  minute after. A client put on the operator's list does not wait.
 
 The real remedy is a wider inner address, or one the exit assigns, in a
 second version of the contract with fips2go. That is outside this design and
@@ -236,10 +241,16 @@ daemon is the only place where admission is decided.
   also take the host's own traffic to that range, so `up` refuses to start on
   a host that has an address or a route in it (an uplink behind carrier-grade
   NAT, Tailscale). Today the README only advises against such hosts.
-- **IPv6 route.** The return route for `fd00::/8` in table 5170 is selected
-  for packets arriving on the uplink only. Today's rule (`not iif lo`) would,
-  with one broad route, capture every forwarded packet to any unique-local
-  address: a Docker network, a fips gateway.
+- **IPv6 route.** One route for all of `fd00::/8` in table 5170, looked at
+  only for packets of connections that came out of the tunnel. Those are
+  marked there (one bit of the connection mark), and the routing rule reads
+  the mark. The default mode's rule (`not iif lo`) would, with one broad
+  route, capture every forwarded packet to any unique-local address; a rule
+  for everything arriving on the uplink, which was the first design, still
+  captured what a fips gateway forwards from its LAN into the mesh.
+- **`add` and `remove` tell the daemon first.** In this mode `up` can stop
+  at more things than before, and a removed client must be gone from the
+  daemon's table even then.
 - **Rules that need care in both modes:** the loop in `cmd_up` that removes
   stale routes must not remove the broad one; `fips_firewall` removes the
   drop-in when there are no static clients, which in paid mode would shut
@@ -456,6 +467,10 @@ wallet in the phone.
 
 - The inner IPv4 address: 22 bits, clashes and squatting (above).
 - Fragments from any mesh node reach the kernel's reassembly in paid mode.
+- The exit host itself can send to a member's inner address, and that is
+  counted against the member.
+- Paid mode uses one bit of the packet and connection marks. Other software
+  on the host that sets or clears that bit breaks IPv6 for the members.
 - No limit on a client's bandwidth, only on its bytes.
 - The country is a claim.
 - Channels rest on a draft.
@@ -467,7 +482,7 @@ and `SECURITY-REVIEW.md`.
 
 | # | What |
 |---|---|
-| 1 | The daemon's accounts and the control socket. Then paid mode in the script. |
+| 1 | **Done.** The daemon's accounts and the control socket. Then paid mode in the script. |
 | 2 | `fips-exit-proto` and its vectors; `fips-exit advert` and its timer. Free exits gain an advert and a country by this alone. |
 | 3 | The payment service's frame: configuration, schema, terms, the page, the unit, a CI job. |
 | 4 | Accounts without money: the service on the socket, a grant by hand, members, usage, pushing again after a restart. |

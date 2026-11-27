@@ -112,7 +112,9 @@ pub fn answer(status: StatusCode, kind: &'static str, body: impl Into<Bytes>) ->
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(kind));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
-    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    // Not "no-referrer": with it a browser sends `Origin: null` on a form,
+    // and the page's own forms could not be told from anyone's.
+    headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
@@ -134,12 +136,20 @@ fn media_type<B>(request: &Request<B>) -> String {
 }
 
 /// Did the request come from this exit's own page? A browser says where a
-/// request it sends comes from (`Origin`, and `Sec-Fetch-Site`); one that
-/// says nothing is not believed to come from here.
+/// request it sends comes from: `Origin`, which some browsers make `null`,
+/// and `Sec-Fetch-Site`, which no page can set. One of them must say this
+/// page, and neither may say another; one that says nothing is not
+/// believed to come from here.
 fn from_this_page<B>(site: &Site, request: &Request<B>) -> bool {
     let said = |name: &str| request.headers().get(name).and_then(|value| value.to_str().ok());
-    let origin_ours = said("origin").is_some_and(|origin| origin.eq_ignore_ascii_case(&site.origin));
-    origin_ours && said("sec-fetch-site").is_none_or(|site| site == "same-origin")
+    let (origin, fetch_site) = (said("origin"), said("sec-fetch-site"));
+    let origin_ours = origin.is_some_and(|origin| origin.eq_ignore_ascii_case(&site.origin));
+    let origin_hidden = origin.is_none_or(|origin| origin == "null");
+    match fetch_site {
+        Some("same-origin") => origin_ours || origin_hidden,
+        Some(_) => false,
+        None => origin_ours,
+    }
 }
 
 /// Not from another site: a JSON request may come from a program, which
@@ -414,6 +424,21 @@ mod tests {
         );
         assert_eq!(status(post("/leave", form, &[]), b""), StatusCode::FORBIDDEN);
         assert_eq!(status(post("/leave", form, &[("origin", "null")]), b""), StatusCode::FORBIDDEN);
+        // What a browser sends from this page when it hides the origin: the
+        // marker no page can set says same-origin.
+        assert_eq!(
+            status(post("/leave", form, &[("origin", "null"), ("sec-fetch-site", "same-origin")]), b""),
+            StatusCode::OK
+        );
+        assert_eq!(status(post("/leave", form, &[("sec-fetch-site", "same-origin")]), b""), StatusCode::OK);
+        assert_eq!(
+            status(post("/leave", form, &[("origin", "http://evil.example"), ("sec-fetch-site", "same-origin")]), b""),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(post("/leave", form, &[("origin", "null"), ("sec-fetch-site", "cross-site")]), b""),
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(status(post("/leave", form, &[("origin", "http://evil.example")]), b""), StatusCode::FORBIDDEN);
         assert_eq!(
             status(post("/leave", form, &[("origin", ours), ("sec-fetch-site", "cross-site")]), b""),

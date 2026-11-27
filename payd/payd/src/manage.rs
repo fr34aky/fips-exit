@@ -1,18 +1,20 @@
 //! A package managed by whoever holds its key, over the mesh.
 //!
 //! The key is given once, when the package is made; whoever has it sees the
-//! package and says who is in it. The address a request comes from is the
-//! caller (fips authenticates it), and that is all a caller needs to take
-//! itself out of a package (`leave`), or to move itself into one whose key
-//! it has, out of another that is still live: nobody can be held in a
-//! stranger's package by being put there.
+//! package and takes members out of it. A device is put in by nobody but
+//! itself: it asks, from its own address (fips authenticates it), with the
+//! key, and is moved out of whatever package it was in. And it can always
+//! take itself out, with no key at all (`leave`). So a key holder cannot
+//! hold a stranger's device in its package, take one out of the package it
+//! paid for, or learn where one is; to add a phone, the key is given to the
+//! phone, and it adds itself.
 //!
 //! The same, twice: as JSON for a client (fips2go), and as forms for the
 //! page, which has no script.
 //!
 //! ```text
 //! POST /v1/package           {"key"}                       the package
-//! POST /v1/package/members   {"key", "add": [], "remove": []}   the package, as it is now
+//! POST /v1/package/members   {"key", "add": [itself], "remove": [..]}   the package, as it is now
 //! POST /v1/leave             {}                            {"left": <id> | null}
 //! POST /package, /package/members, /leave                   the same, as forms, answered with a page
 //! ```
@@ -38,6 +40,8 @@ pub enum Fault {
     NoKey,
     /// Something in the request is not what it is to be.
     Bad(String),
+    /// A device other than the caller was to be put in.
+    NotItself,
     /// A member is in another package that is live.
     Elsewhere(Ipv6Addr),
     /// The store failed.
@@ -49,6 +53,7 @@ impl Fault {
         match self {
             Fault::NoKey => StatusCode::FORBIDDEN,
             Fault::Bad(_) => StatusCode::BAD_REQUEST,
+            Fault::NotItself => StatusCode::FORBIDDEN,
             Fault::Elsewhere(_) => StatusCode::CONFLICT,
             Fault::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -58,6 +63,7 @@ impl Fault {
         match self {
             Fault::NoKey => "no package has that key".into(),
             Fault::Bad(what) => what.clone(),
+            Fault::NotItself => "a device is added by itself: give it the key, and add it from it".into(),
             Fault::Elsewhere(address) => format!(
                 "{} is in another package; it can move itself here, from its own address, with this key",
                 site.store.name_of(*address)
@@ -78,46 +84,47 @@ impl From<Refused> for Fault {
     }
 }
 
-/// A key as `grant` gives it: 64 small hex digits. Anything else is no key,
-/// and is not looked for.
-fn well_formed(key: &str) -> bool {
-    key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+/// A key as `grant` gives it: 64 hex digits, in either case. Anything else
+/// is no key, and is not looked for.
+fn key_of(key: &str) -> Option<String> {
+    let key = key.trim().to_ascii_lowercase();
+    (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())).then_some(key)
 }
 
 fn by_key(site: &Site, key: &str) -> Result<Package, Fault> {
-    if !well_formed(key) {
-        return Err(Fault::NoKey);
-    }
-    site.store.package_with_key(key)?.ok_or(Fault::NoKey)
+    let key = key_of(key).ok_or(Fault::NoKey)?;
+    site.store.package_with_key(&key)?.ok_or(Fault::NoKey)
 }
 
-/// `who` as a member: an npub (remembered for its address) or a fips address.
-fn member(site: &Site, who: &str) -> Result<Ipv6Addr, Fault> {
-    let (address, npub) =
-        client(who).ok_or_else(|| Fault::Bad(format!("{:.80} is neither an npub nor a fips address", who)))?;
-    if let Some(npub) = npub {
-        site.store.remember(address, &npub)?;
-    }
-    Ok(address)
+/// `who` as an address, and the npub it was named by, if it was.
+fn named(who: &str) -> Result<(Ipv6Addr, Option<String>), Fault> {
+    client(who).ok_or_else(|| Fault::Bad(format!("{who:.80} is neither an npub nor a fips address")))
 }
 
-/// Take out `remove`, put in `add`, asked by `caller`.
+/// Take out `remove`, and put in `add`, which can only be the caller.
 fn change(site: &Site, caller: Ipv6Addr, key: &str, add: &[String], remove: &[String]) -> Result<Package, Fault> {
-    if add.len() + remove.len() > 2 * MAX_MEMBERS {
+    if add.len() > 1 || remove.len() > MAX_MEMBERS {
         return Err(Fault::Bad("too many at once".into()));
     }
-    let package = by_key(site, key)?;
-    let remove: Vec<Ipv6Addr> = remove.iter().map(|who| member(site, who)).collect::<Result<_, _>>()?;
-    let mut members: Vec<Ipv6Addr> = package.members.iter().copied().filter(|m| !remove.contains(m)).collect();
-    for who in add {
-        let address = member(site, who)?;
-        if !members.contains(&address) {
-            members.push(address);
+    let key = key_of(key).ok_or(Fault::NoKey)?;
+    let join = match add.first() {
+        Some(who) => {
+            let (address, npub) = named(who)?;
+            if address != caller {
+                return Err(Fault::NotItself);
+            }
+            Some((address, npub))
         }
+        None => None,
+    };
+    let remove: Vec<Ipv6Addr> = remove.iter().map(|who| named(who).map(|(a, _)| a)).collect::<Result<_, _>>()?;
+    let package = site.store.change_members(&key, join.as_ref().map(|(a, _)| *a), &remove, unix_now())?;
+    // The npub the device added itself by, kept now that it is in.
+    if let Some((address, Some(npub))) = join {
+        site.store.remember(address, &npub)?;
     }
-    site.store.set_members_for(&package.id, &members, unix_now(), Some(caller))?;
     site.changed.notify_one();
-    by_key(site, key)
+    Ok(package)
 }
 
 fn leave(site: &Site, caller: Ipv6Addr) -> Result<Option<String>, Fault> {
@@ -310,9 +317,7 @@ fn page(site: &Site, package: &Package, key: &str, caller: Ipv6Addr, notice: &st
 {notice}<p>{now}</p>
 <h2>Who is in it</h2>
 {members}
-{join}<form method=\"post\" action=\"/package/members\"><input type=\"hidden\" name=\"key\" value=\"{key}\">
-<label>Add a device: <input name=\"add\" placeholder=\"npub1…\" size=\"40\" required></label> <button>Add</button></form>
-<p class=\"you\">Whoever has this package's key manages it: keep it to yourself. A device can always take itself out of a package, from the exit's page.</p>
+{join}<p class=\"you\">Another device is added by itself: give it this package's key, open this exit's page on it, and add it there. Whoever has the key sees who is in the package and can take them out: keep it to those it is for. A device can always take itself out of a package, from the exit's page.</p>
 <p><a href=\"/\">Back</a></p>
 </main>
 </body>
@@ -330,7 +335,7 @@ fn html(status: StatusCode, text: String) -> Response<Full<Bytes>> {
 /// A form sent from the page to `path`, from `caller`.
 pub fn as_form(site: &Site, caller: Ipv6Addr, path: &str, body: &[u8]) -> Response<Full<Bytes>> {
     let fields = form_fields(body);
-    let key = field(&fields, "key").unwrap_or("").to_ascii_lowercase();
+    let key = key_of(field(&fields, "key").unwrap_or("")).unwrap_or_default();
     let plain = |status: StatusCode, text: String| {
         html(
             status,
@@ -429,20 +434,52 @@ mod tests {
         assert_eq!(seen["standing"], "live");
         assert_eq!(seen["members"], serde_json::json!([{"address": "fd99::1", "name": "fd99::1"}]));
         assert_eq!(seen["you"], false);
-        // Add by npub, and by address; remove one. The npub is shown.
+        // The key holder adds itself, and takes another out.
         let (status, seen) = call(
             &site,
             "fd77::7",
             "/v1/package/members",
-            serde_json::json!({ "key": key, "add": [NPUB, "fd77::7"], "remove": ["fd99::1"] }),
+            serde_json::json!({ "key": key, "add": ["fd77::7"], "remove": ["fd99::1"] }),
         );
         assert_eq!(status, StatusCode::OK, "{seen}");
-        assert_eq!(
-            seen["members"],
-            serde_json::json!([{"address": NPUB_ADDRESS, "name": NPUB}, {"address": "fd77::7", "name": "fd77::7"}])
-        );
+        assert_eq!(seen["members"], serde_json::json!([{"address": "fd77::7", "name": "fd77::7"}]));
         assert_eq!(seen["you"], true);
+        // A device that adds itself by its npub is shown by it.
+        let (status, seen) =
+            call(&site, NPUB_ADDRESS, "/v1/package/members", serde_json::json!({ "key": key, "add": [NPUB] }));
+        assert_eq!(status, StatusCode::OK, "{seen}");
+        let added = seen["members"].as_array().unwrap().iter().find(|m| m["address"] == NPUB_ADDRESS).cloned();
+        assert_eq!(added, Some(serde_json::json!({"address": NPUB_ADDRESS, "name": NPUB})));
         assert_eq!(site.store.package_of(a(NPUB_ADDRESS)).unwrap().unwrap().id, id);
+        // The key in capitals is the same key.
+        let (status, _) = call(&site, "fd77::7", "/v1/package", serde_json::json!({ "key": key.to_uppercase() }));
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A key holder cannot put another device in: not one in no package,
+    /// not one in another package, live or waiting for a top-up. Nor is its
+    /// npub remembered, nor is it told where that device is.
+    #[test]
+    fn nobody_is_put_in_but_by_itself() {
+        let site = site();
+        let (_, key) = site.store.grant(1000, 0, &[a("fd99::1")], "", unix_now()).unwrap();
+        let (elsewhere, _) = site.store.grant(1, 0, &[a("fd55::5")], "", unix_now()).unwrap();
+        site.store.fold_usage(&elsewhere, 1, 0).unwrap();
+        for stranger in [NPUB, "fd44::4", "fd55::5"] {
+            let (status, said) =
+                call(&site, "fd99::1", "/v1/package/members", serde_json::json!({ "key": key, "add": [stranger] }));
+            assert_eq!(status, StatusCode::FORBIDDEN, "{stranger}: {said}");
+            assert_eq!(said["error"], "a device is added by itself: give it the key, and add it from it");
+        }
+        assert_eq!(site.store.package_of(a("fd55::5")).unwrap().unwrap().id, elsewhere, "left where it was");
+        assert_eq!(site.store.name_of(a(NPUB_ADDRESS)), NPUB_ADDRESS, "a stranger's npub is not kept");
+        // Taking out what is not a member, by npub, keeps nothing either.
+        let (status, _) =
+            call(&site, "fd99::1", "/v1/package/members", serde_json::json!({ "key": key, "remove": [NPUB] }));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(site.store.name_of(a(NPUB_ADDRESS)), NPUB_ADDRESS);
+        let two = serde_json::json!({ "key": key, "add": ["fd99::1", "fd99::1"] });
+        assert_eq!(call(&site, "fd99::1", "/v1/package/members", two).0, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -450,7 +487,7 @@ mod tests {
         let site = site();
         let (_, key) = site.store.grant(1000, 0, &[a("fd99::1")], "", unix_now()).unwrap();
         let other = "0".repeat(64);
-        for wrong in [other.as_str(), "", "short", &key.to_uppercase(), &format!("{key}0")] {
+        for wrong in [other.as_str(), "", "short", &format!("{key}0"), &format!("{}g", &key[..63])] {
             let (status, said) = call(&site, "fd77::7", "/v1/package", serde_json::json!({ "key": wrong }));
             assert_eq!((status, said["error"].as_str()), (StatusCode::FORBIDDEN, Some("no package has that key")));
             let (status, _) =
@@ -478,7 +515,7 @@ mod tests {
         // The other key holder cannot take fd99::1.
         let (status, said) =
             call(&site, "fd55::5", "/v1/package/members", serde_json::json!({ "key": their_key, "add": ["fd99::1"] }));
-        assert_eq!(status, StatusCode::CONFLICT, "{said}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{said}");
         assert_eq!(site.store.package_of(a("fd99::1")).unwrap().unwrap().id, mine);
         // fd99::1, with their key, can move itself there.
         let (status, _) =

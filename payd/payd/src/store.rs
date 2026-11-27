@@ -377,6 +377,36 @@ impl Store {
         }
     }
 
+    /// A key holder's change, in one transaction, so that two at once do not
+    /// lose one: `remove` taken out of the package whose key this is, and
+    /// `join`, the caller itself, put in, out of whatever package it is in.
+    /// Nobody else is put in by a key: a device joins by asking itself.
+    pub fn change_members(
+        &self,
+        key: &str,
+        join: Option<Ipv6Addr>,
+        remove: &[Ipv6Addr],
+        now: u64,
+    ) -> Result<Package, Refused> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let id: String = tx
+            .query_row("SELECT id FROM packages WHERE key_hash = ?1", [key_hash(key)], |row| row.get(0))
+            .optional()?
+            .ok_or(Refused::NoPackage)?;
+        let package = Store::package_in(&tx, &id)?.ok_or(Refused::NoPackage)?;
+        let mut members: Vec<Ipv6Addr> = package.members.into_iter().filter(|m| !remove.contains(m)).collect();
+        if let Some(caller) = join
+            && !members.contains(&caller)
+        {
+            members.push(caller);
+        }
+        Store::seat(&tx, &id, &members, now, join)?;
+        let changed = Store::package_in(&tx, &id)?.ok_or(Refused::NoPackage)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Take `address` out of whatever package it is in. The package it was
     /// in, if any.
     pub fn leave(&self, address: Ipv6Addr) -> Result<Option<String>, Refused> {
@@ -537,6 +567,14 @@ mod tests {
         assert_eq!(store.set_members_for(&second, &[a(2), a(1)], NOW, Some(a(1))), Ok(()));
         assert_eq!(store.package_of(a(1)).unwrap().unwrap().id, second);
         assert!(store.package(&first).unwrap().unwrap().members.is_empty());
+        // A key holder's change: the caller in, out of where it was; others out.
+        let changed = store.change_members(&first_key, Some(a(2)), &[], NOW).unwrap();
+        assert_eq!(changed.members, vec![a(2)]);
+        assert_eq!(store.package_of(a(2)).unwrap().unwrap().id, first);
+        let changed = store.change_members(&first_key, None, &[a(2), a(9)], NOW).unwrap();
+        assert!(changed.members.is_empty());
+        assert_eq!(store.change_members("0", None, &[], NOW), Err(Refused::NoPackage));
+        store.set_members(&second, &[a(2), a(1)], NOW).unwrap();
         // And an address can always leave, whoever put it there.
         assert_eq!(store.leave(a(1)), Ok(Some(second.clone())));
         assert_eq!(store.package_of(a(1)).unwrap(), None);

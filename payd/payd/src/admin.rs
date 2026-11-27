@@ -34,20 +34,27 @@ const LINE_TIME: Duration = Duration::from_secs(10);
 /// The longest label, in characters.
 const MAX_LABEL: usize = 64;
 
-/// Members as the operator names them; an npub is remembered for its
-/// address, so that it is shown by it.
-fn members(store: &Store, word: &str) -> Result<Vec<Ipv6Addr>, String> {
+/// Members as the operator names them: npubs or fips addresses.
+fn members(word: &str) -> Result<Vec<(Ipv6Addr, Option<String>)>, String> {
     if word == "-" {
         return Ok(Vec::new());
     }
-    let named: Vec<(Ipv6Addr, Option<String>)> =
-        word.split(',').map(|who| client(who).ok_or_else(|| format!("err who {who}"))).collect::<Result<_, _>>()?;
-    for (address, npub) in &named {
+    word.split(',').map(|who| client(who).ok_or_else(|| format!("err who {who}"))).collect()
+}
+
+fn addresses(named: &[(Ipv6Addr, Option<String>)]) -> Vec<Ipv6Addr> {
+    named.iter().map(|(address, _)| *address).collect()
+}
+
+/// Once they are in: the npub each was named by, kept for its address, so
+/// that it is shown by it.
+fn remember(store: &Store, named: &[(Ipv6Addr, Option<String>)]) -> Result<(), String> {
+    for (address, npub) in named {
         if let Some(npub) = npub {
             store.remember(*address, npub).map_err(|e| format!("err {e}"))?;
         }
     }
-    Ok(named.into_iter().map(|(address, _)| address).collect())
+    Ok(())
 }
 
 fn days(word: &str) -> Result<u32, String> {
@@ -75,11 +82,12 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
         let store_said = |e: crate::store::Refused| format!("err {e}");
         match words[..] {
             ["grant", size, d, who, ref rest @ ..] => {
-                let (bytes, days, members, label) = (bytes(size)?, days(d)?, members(store, who)?, label(rest)?);
-                if members.is_empty() {
+                let (bytes, days, named, label) = (bytes(size)?, days(d)?, members(who)?, label(rest)?);
+                if named.is_empty() {
                     return Err("err who (a package is for someone)".into());
                 }
-                let (id, key) = store.grant(bytes, days, &members, &label, now).map_err(store_said)?;
+                let (id, key) = store.grant(bytes, days, &addresses(&named), &label, now).map_err(store_said)?;
+                remember(store, &named)?;
                 Ok(format!("ok {id} {key}\n"))
             }
             ["top-up", id, size, d] => {
@@ -87,7 +95,9 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
                 Ok("ok\n".into())
             }
             ["members", id, who] => {
-                store.set_members(id, &members(store, who)?, now).map_err(store_said)?;
+                let named = members(who)?;
+                store.set_members(id, &addresses(&named), now).map_err(store_said)?;
+                remember(store, &named)?;
                 Ok("ok\n".into())
             }
             ["revoke", id] => {

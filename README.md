@@ -199,10 +199,15 @@ sudo fips-exit revoke <package>                       # taken back
   POST /v1/leave            {}                                            this device out of its package
   ```
 
-  A device belongs to itself: one in a live package is not put in another
-  by that package's key holder, but it can move itself there with the key,
-  and it can always take itself out, with no key at all. Members are shown
-  by the npub they were named by.
+  The key holder sees who is in the package and can take them out. A
+  device is put in by nobody but itself: it asks, from its own address,
+  with the key (the page's *Add this device*), and is moved out of
+  whatever package it was in. To add a phone, give the key to the phone.
+  A device can always take itself out, with no key at all. So a key holder
+  cannot keep a stranger's device in its package, take one out of the
+  package it paid for, or learn whether one has a package here. Members
+  are shown by the npub they were named by. The operator's `grant` and
+  `members` can put any device in.
 - A request that changes something is JSON, or a form from the exit's own
   page (its `Origin`): a page on another site cannot make a device leave
   its package.

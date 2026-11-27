@@ -1401,9 +1401,13 @@ def payd(line):
 
 
 def who_list(text):
-    """Clients as the operator names them, npubs or fd addresses, as the
-    fips addresses the service is told."""
-    return ",".join(str(parse_client(who)) for who in text.split(",") if who)
+    """Clients as the operator names them, npubs or fd addresses, checked
+    here and passed on as named: the service keeps the npub a member was
+    named by, and shows it by it."""
+    named = [who.strip() for who in text.split(",") if who.strip()]
+    for who in named:
+        parse_client(who)
+    return ",".join(who.lower() if who.lower().startswith("npub1") else str(parse_client(who)) for who in named)
 
 
 def cmd_grant(size, days, who, *label):

@@ -265,8 +265,8 @@ def remove_kernel_tunnels(config):
     """Undo what versions before the daemon set up: one ip6tnl device per
     client (fx…) and a DF-clearing tc filter on the uplink."""
     links = json.loads(run("ip", "-j", "link", "show", "type", "ip6tnl").stdout or "[]")
-    for link in links:
-        if link["ifname"].startswith("fx"):
+    for link in links:  # ip prints {} for each link the type filter drops
+        if link.get("ifname", "").startswith("fx"):
             run("ip", "link", "del", link["ifname"])
     wan = config["WAN"] or None
     if wan is None:

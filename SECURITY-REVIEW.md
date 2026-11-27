@@ -89,15 +89,20 @@ IPv4 address derived from the client's fips address.
    address is not a fips address is closed at once. A request must name
    this exit in `Host`, `<npub>.fips:port` and nothing else, or it is
    answered 421: a page elsewhere must not be able to read what this one
-   says to a browser on the mesh. What a member is told of its package is
-   its own: what is left, until when, how many share it; not the key, and
-   not who the others are. Only `GET` and `HEAD`, three paths. A
-   header has 5 seconds and 16 KiB, a connection a minute; there are 64
-   connections at once and 8 from one address. What the service says back
-   is the operator's config and the caller's own address, and the
-   operator's text is escaped on the page, which has no script and loads
-   nothing from elsewhere.
-
+   says to a browser on the mesh. Three paths are `GET`/`HEAD` (the terms,
+   the page, its stylesheet) and six are `POST` (a package by its key, its
+   members, leave; each as JSON and as a form). A header has 5 seconds and
+   16 KiB, a body 8 KiB, a connection a minute; there are 64 connections at
+   once and 8 from one address.
+   What changes something is JSON (`application/json`, from a program or
+   this page, never with another site's `Origin` or `Sec-Fetch-Site`), or a
+   form from this exit's own page: its `Origin`, or the browser's own
+   `Sec-Fetch-Site: same-origin` where it hides the origin. A key that is
+   not 64 hex digits is not looked for; one that is no package's is told
+   nothing but that. What a member is told of its package is its own: what
+   is left, until when, how many share it; not the key, and not who the
+   others are. The operator's text is escaped on the pages, which have no
+   script and load nothing from elsewhere.
 9. **The operator's commands to the payment service**, on its socket in
    `/run/fips-exit-payd`, which only the service's user and root can open.
    Lines of words, each checked: a size, a number of days up to 3660,
@@ -188,8 +193,20 @@ IPv4 address derived from the client's fips address.
   hold up the others (what is to be dropped is dropped first); and never
   lose what the daemon counted, which it folds into its store before it
   decides anything. A package's key is kept only as its hash.
-- **An address in two packages.** A device is in one package at a time; it
-  may be moved only out of one that is no longer live.
+- **An address in two packages, or held in one.** A device is in one
+  package at a time, and is put in a package by nobody but itself (from
+  its own address, with the key) or the operator. A key holder may take
+  members out of its package and put only its own device in. Anything that
+  lets a stranger put a device in a package (keeping it from the one it
+  paid for, or from a grant), take it out of its own, or learn whether it
+  has one, is serious.
+- **A package's key going anywhere.** It is shown once, to the operator,
+  and kept as its hash. A key holder sees the package and its members'
+  npubs; nothing in the terms or on the page of a member shows the key.
+- **A page on another site changing a package.** Through a browser on the
+  mesh it could reach the exit; it must not be able to send a form the
+  service takes (`Origin`), nor JSON (which a browser sends elsewhere only
+  after asking, and the service does not answer that).
 - **The node's key going anywhere.** `fips-exit advert` reads the fips
   identity's secret key. It must never be printed, logged, put in an error
   message or sent: only the signature leaves. That includes a key file that

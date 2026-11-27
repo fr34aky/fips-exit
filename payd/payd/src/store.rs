@@ -15,7 +15,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 /// The schema, by version. Each step is applied once, in order.
-const SCHEMA: &[&str] = &["
+const SCHEMA: &[&str] = &[
+    "
     CREATE TABLE packages (
         -- The account's name in the daemon: 'p' and 16 hex digits.
         id TEXT PRIMARY KEY,
@@ -36,7 +37,17 @@ const SCHEMA: &[&str] = &["
         package TEXT NOT NULL REFERENCES packages(id) ON DELETE CASCADE
     );
     CREATE INDEX members_by_package ON members(package);
-"];
+",
+    "
+    -- The npub an address was named by, when it was: an address is the
+    -- hash of its npub, so the npub is a fact about the address, and is
+    -- what a person knows a node by.
+    CREATE TABLE names (
+        address TEXT PRIMARY KEY,
+        npub TEXT NOT NULL
+    );
+",
+];
 
 /// The most a package may be granted: what the daemon takes.
 pub const MAX_BYTES: u64 = u64::MAX / 4;
@@ -254,8 +265,11 @@ impl Store {
 
     /// Put `members` into package `id` and take every other address out of
     /// it. An address in another package that is live is refused, and
-    /// nothing changes; one in a package that is not live any more is moved.
-    fn seat(db: &Connection, id: &str, members: &[Ipv6Addr], now: u64) -> Result<(), Refused> {
+    /// nothing changes; one in a package that is not live any more is moved,
+    /// and so is `mover`, wherever it is: the address that asks for itself.
+    /// Nobody can be held in a stranger's package by being put there, since
+    /// it can always move itself out (or [`Store::leave`]).
+    fn seat(db: &Connection, id: &str, members: &[Ipv6Addr], now: u64, mover: Option<Ipv6Addr>) -> Result<(), Refused> {
         if members.len() > MAX_MEMBERS || members.iter().enumerate().any(|(at, m)| members[..at].contains(m)) {
             return Err(Refused::Members);
         }
@@ -264,6 +278,7 @@ impl Store {
                 .query_row("SELECT package FROM members WHERE address = ?1", [member.to_string()], |row| row.get(0))
                 .optional()?;
             if let Some(other) = other.filter(|other| other != id)
+                && mover != Some(*member)
                 && Store::package_in(db, &other)?.is_some_and(|p| p.standing(now) == Standing::Live)
             {
                 return Err(Refused::Elsewhere(*member));
@@ -302,7 +317,7 @@ impl Store {
             "INSERT INTO packages (id, key_hash, label, granted, until, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, key_hash(&key), label, as_i64(bytes), as_i64(until), as_i64(now)],
         )?;
-        Store::seat(&tx, &id, members, now)?;
+        Store::seat(&tx, &id, members, now, None)?;
         tx.commit()?;
         Ok((id, key))
     }
@@ -329,12 +344,78 @@ impl Store {
     }
 
     pub fn set_members(&self, id: &str, members: &[Ipv6Addr], now: u64) -> Result<(), Refused> {
+        self.set_members_for(id, members, now, None)
+    }
+
+    /// The same, asked by `mover` (the address a request came from), which
+    /// may move itself out of another live package.
+    pub fn set_members_for(
+        &self,
+        id: &str,
+        members: &[Ipv6Addr],
+        now: u64,
+        mover: Option<Ipv6Addr>,
+    ) -> Result<(), Refused> {
         let mut db = self.db();
         let tx = db.transaction()?;
         Store::package_in(&tx, id)?.ok_or(Refused::NoPackage)?;
-        Store::seat(&tx, id, members, now)?;
+        Store::seat(&tx, id, members, now, mover)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The package whose key this is, if any. The key itself is not kept:
+    /// its hash is looked for.
+    pub fn package_with_key(&self, key: &str) -> Result<Option<Package>, Refused> {
+        let db = self.db();
+        let id: Option<String> = db
+            .query_row("SELECT id FROM packages WHERE key_hash = ?1", [key_hash(key)], |row| row.get(0))
+            .optional()?;
+        match id {
+            Some(id) => Ok(Store::package_in(&db, &id)?),
+            None => Ok(None),
+        }
+    }
+
+    /// A key holder's change, in one transaction, so that two at once do not
+    /// lose one: `remove` taken out of the package whose key this is, and
+    /// `join`, the caller itself, put in, out of whatever package it is in.
+    /// Nobody else is put in by a key: a device joins by asking itself.
+    pub fn change_members(
+        &self,
+        key: &str,
+        join: Option<Ipv6Addr>,
+        remove: &[Ipv6Addr],
+        now: u64,
+    ) -> Result<Package, Refused> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let id: String = tx
+            .query_row("SELECT id FROM packages WHERE key_hash = ?1", [key_hash(key)], |row| row.get(0))
+            .optional()?
+            .ok_or(Refused::NoPackage)?;
+        let package = Store::package_in(&tx, &id)?.ok_or(Refused::NoPackage)?;
+        let mut members: Vec<Ipv6Addr> = package.members.into_iter().filter(|m| !remove.contains(m)).collect();
+        if let Some(caller) = join
+            && !members.contains(&caller)
+        {
+            members.push(caller);
+        }
+        Store::seat(&tx, &id, &members, now, join)?;
+        let changed = Store::package_in(&tx, &id)?.ok_or(Refused::NoPackage)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Take `address` out of whatever package it is in. The package it was
+    /// in, if any.
+    pub fn leave(&self, address: Ipv6Addr) -> Result<Option<String>, Refused> {
+        let db = self.db();
+        let id: Option<String> = db
+            .query_row("SELECT package FROM members WHERE address = ?1", [address.to_string()], |row| row.get(0))
+            .optional()?;
+        db.execute("DELETE FROM members WHERE address = ?1", [address.to_string()])?;
+        Ok(id)
     }
 
     /// Take package `id` back. Its members are carried no more; it is kept,
@@ -353,6 +434,23 @@ impl Store {
             params![id, as_i64(used_in), as_i64(used_out)],
         )?;
         Ok(())
+    }
+
+    /// Remember that `address` is `npub`'s. The caller has checked that it is.
+    pub fn remember(&self, address: Ipv6Addr, npub: &str) -> Result<(), Refused> {
+        self.db().execute(
+            "INSERT INTO names (address, npub) VALUES (?1, ?2) ON CONFLICT(address) DO UPDATE SET npub = excluded.npub",
+            params![address.to_string(), npub],
+        )?;
+        Ok(())
+    }
+
+    /// How a person knows `address`: its npub if it was ever named by it,
+    /// and otherwise the address.
+    pub fn name_of(&self, address: Ipv6Addr) -> String {
+        self.db()
+            .query_row("SELECT npub FROM names WHERE address = ?1", [address.to_string()], |row| row.get(0))
+            .unwrap_or_else(|_| address.to_string())
     }
 
     /// The package `address` is a member of, if there is one.
@@ -453,6 +551,38 @@ mod tests {
     }
 
     #[test]
+    fn a_key_finds_its_package_and_an_address_may_move_itself() {
+        let store = Store::in_memory();
+        let (first, first_key) = store.grant(1000, 0, &[a(1)], "", NOW).unwrap();
+        let (second, second_key) = store.grant(1000, 0, &[a(2)], "", NOW).unwrap();
+        assert_eq!(store.package_with_key(&first_key).unwrap().unwrap().id, first);
+        assert_eq!(store.package_with_key(&second_key).unwrap().unwrap().id, second);
+        for wrong in ["", "00", &first_key[..63], &format!("{first_key}0"), &first_key.to_uppercase()] {
+            assert_eq!(store.package_with_key(wrong).unwrap(), None, "{wrong:?}");
+        }
+        // Whoever holds the second key cannot take a(1) from the first, live
+        // package; a(1) itself, asking, can move.
+        assert_eq!(store.set_members_for(&second, &[a(2), a(1)], NOW, None), Err(Refused::Elsewhere(a(1))));
+        assert_eq!(store.set_members_for(&second, &[a(2), a(1)], NOW, Some(a(3))), Err(Refused::Elsewhere(a(1))));
+        assert_eq!(store.set_members_for(&second, &[a(2), a(1)], NOW, Some(a(1))), Ok(()));
+        assert_eq!(store.package_of(a(1)).unwrap().unwrap().id, second);
+        assert!(store.package(&first).unwrap().unwrap().members.is_empty());
+        // A key holder's change: the caller in, out of where it was; others out.
+        let changed = store.change_members(&first_key, Some(a(2)), &[], NOW).unwrap();
+        assert_eq!(changed.members, vec![a(2)]);
+        assert_eq!(store.package_of(a(2)).unwrap().unwrap().id, first);
+        let changed = store.change_members(&first_key, None, &[a(2), a(9)], NOW).unwrap();
+        assert!(changed.members.is_empty());
+        assert_eq!(store.change_members("0", None, &[], NOW), Err(Refused::NoPackage));
+        store.set_members(&second, &[a(2), a(1)], NOW).unwrap();
+        // And an address can always leave, whoever put it there.
+        assert_eq!(store.leave(a(1)), Ok(Some(second.clone())));
+        assert_eq!(store.package_of(a(1)).unwrap(), None);
+        assert_eq!(store.leave(a(1)), Ok(None));
+        assert_eq!(store.package(&second).unwrap().unwrap().members, vec![a(2)]);
+    }
+
+    #[test]
     fn the_store_outlives_the_service() {
         let dir = std::env::temp_dir().join(format!("fips-exit-payd-store-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -468,6 +598,12 @@ mod tests {
         assert_eq!((p.used_in, p.used_out, p.label.as_str(), p.members.clone()), (10, 20, "kept", vec![a(1)]));
         let version: i64 = store.db().pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
         assert_eq!(version, SCHEMA.len() as i64);
+        // A name, kept too.
+        store.remember(a(1), "npub1kept").unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.name_of(a(1)), "npub1kept");
+        assert_eq!(store.name_of(a(2)), a(2).to_string());
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }

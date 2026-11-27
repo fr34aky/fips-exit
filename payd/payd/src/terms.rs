@@ -186,7 +186,8 @@ pub fn page(terms: &Terms) -> String {
                 _ => "It was taken back by the operator.".to_string(),
             };
             format!(
-                "<h2>Your package</h2>\n<p>This device is in package <code>{}</code>, with {} device(s). {now}{ipv4}</p>\n",
+                "<h2>Your package</h2>\n<p>This device is in package <code>{}</code>, with {} device(s). {now}{ipv4}</p>\n\
+                 <form method=\"post\" action=\"/leave\"><button>Take this device out of it</button></form>\n",
                 escape(&p.id),
                 p.members
             )
@@ -212,6 +213,9 @@ pub fn page(terms: &Terms) -> String {
 <h2>Mints accepted</h2>
 {mints}
 <p class=\"note\">Nothing can be bought here yet: this exit takes no payment so far.</p>
+<h2>A package of yours</h2>
+<form method=\"post\" action=\"/package\"><label>Its key: <input name=\"key\" size=\"40\" autocomplete=\"off\" required></label>
+<button>Manage it</button></form>
 <p class=\"you\">You are <code>{you}</code> on the mesh. That address is how this exit knows you; nothing else is asked.</p>
 </main>
 </body>
@@ -236,6 +240,9 @@ th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(-
 td:nth-child(n+2), th:nth-child(n+2) { text-align: right; }
 .note { margin-top: 2rem; padding: .75rem 1rem; border: 1px solid var(--line); border-radius: .5rem; }
 .you { opacity: .75; font-size: .9rem; }
+form { margin: .5rem 0; }
+td form { margin: 0; }
+input, button { font: inherit; }
 ";
 
 #[cfg(test)]

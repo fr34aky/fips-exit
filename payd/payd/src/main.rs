@@ -13,6 +13,7 @@ mod admin;
 mod config;
 mod http;
 mod identity;
+mod manage;
 mod store;
 mod sync;
 mod terms;
@@ -194,8 +195,8 @@ async fn run() -> Result<(), String> {
         args.control.display()
     );
     tokio::spawn(sync::keep(store.clone(), args.control.clone(), seats.clone(), changed.clone()));
-    tokio::spawn(admin::serve(admin, store.clone(), changed));
-    let site = Arc::new(http::Site::new(config, exit, store, seats));
+    tokio::spawn(admin::serve(admin, store.clone(), changed.clone()));
+    let site = Arc::new(http::Site::new(config, exit, store, seats, changed));
     // With --listen, which tests use, a peer from anywhere is talked to.
     let admit: fn(IpAddr) -> bool = if args.listen.is_some() { |_| true } else { http::on_the_mesh };
     tokio::select! {

@@ -16,8 +16,15 @@ ExecStopPost=-+/usr/local/sbin/fips-exit up
 Restart=on-failure
 RestartSec=5
 
-# A user of its own, made for it and gone with it; nothing to keep yet.
+# A user of its own, made for it. Its packages are kept in
+# /var/lib/fips-exit-payd (systemd keeps them across restarts); the
+# operator's socket is in /run/fips-exit-payd, for this user and root.
 DynamicUser=yes
+StateDirectory=fips-exit-payd
+RuntimeDirectory=fips-exit-payd
+# The daemon opens its control socket to this group, which install.sh makes:
+# the service makes the daemon's accounts.
+SupplementaryGroups=fips-exit
 # No privilege at all, and as little as possible of the machine.
 CapabilityBoundingSet=
 AmbientCapabilities=

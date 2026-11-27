@@ -25,7 +25,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
-use crate::terms::{self, Exit};
+use crate::store::Store;
+use crate::sync::{Seats, unix_now};
+use crate::terms::{self, Exit, YourPackage};
 
 /// How much a peer may have of this service.
 #[derive(Debug, Clone, Copy)]
@@ -59,17 +61,30 @@ pub struct Site {
     pub exit: Exit,
     /// The `Host` headers this exit answers to, in small letters.
     pub hosts: Vec<String>,
+    pub store: Arc<Store>,
+    pub seats: Seats,
 }
 
 impl Site {
-    pub fn new(config: Config, exit: Exit) -> Site {
-        let port = config.port;
-        let mut hosts = vec![format!("[{}]:{port}", exit.address)];
-        if let Some(npub) = &exit.npub {
-            hosts.push(format!("{npub}.fips:{port}"));
-        }
-        let hosts = hosts.into_iter().map(|host| host.to_ascii_lowercase()).collect();
-        Site { config, exit, hosts }
+    pub fn new(config: Config, exit: Exit, store: Arc<Store>, seats: Seats) -> Site {
+        // The exit's name, and nothing else: its fips address is reached
+        // only by way of that name, which a browser then sends.
+        let hosts = vec![format!("{}.fips:{}", exit.npub, config.port).to_ascii_lowercase()];
+        Site { config, exit, hosts, store, seats }
+    }
+
+    /// The package `caller` is in, as the caller may see it.
+    fn package_of(&self, caller: Ipv6Addr) -> Option<YourPackage> {
+        let package = self.store.package_of(caller).ok().flatten()?;
+        let seat = self.seats.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&caller).cloned();
+        Some(YourPackage {
+            id: package.id.clone(),
+            standing: package.standing(unix_now()).word().to_string(),
+            bytes_left: package.left(),
+            until: (package.until != 0).then_some(package.until),
+            members: package.members.len(),
+            ipv4: seat.as_deref() != Some("no4"),
+        })
     }
 }
 
@@ -113,7 +128,7 @@ pub fn respond<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>) -> Response
         refused.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
         return refused;
     }
-    let terms = || terms::terms(&site.config, &site.exit, peer);
+    let terms = || terms::terms(&site.config, &site.exit, peer, site.package_of(peer));
     // A HEAD is answered as a GET; hyper sends the head of it and not the body.
     match request.uri().path() {
         "/v1/terms" => match serde_json::to_vec(&terms()) {
@@ -212,13 +227,13 @@ mod tests {
         .unwrap()
         .unwrap();
         let exit = Exit {
-            npub: Some("npub1Example".into()),
+            npub: "npub1Example".into(),
             address: "fd14::1".parse().unwrap(),
             name: "An exit".into(),
             about: String::new(),
             country: None,
         };
-        Arc::new(Site::new(config, exit))
+        Arc::new(Site::new(config, exit, Arc::new(Store::in_memory()), Seats::default()))
     }
 
     fn get(path: &str, host: &str) -> Request<()> {
@@ -229,12 +244,20 @@ mod tests {
     fn a_request_names_this_exit_or_is_refused() {
         let site = site();
         let peer = "fd99::2".parse().unwrap();
-        for host in ["[fd14::1]:5170", "[FD14::1]:5170", "npub1example.fips:5170", "NPUB1EXAMPLE.FIPS:5170"] {
+        for host in ["npub1example.fips:5170", "NPUB1EXAMPLE.FIPS:5170"] {
             assert_eq!(respond(&site, peer, &get("/v1/terms", host)).status(), StatusCode::OK, "{host}");
         }
-        for host in
-            ["[fd14::1]", "[fd14::1]:80", "fd14::1:5170", "evil.example", "npub1example.fips", "localhost:5170", ""]
-        {
+        // Not the bare address either: it is reached only by way of the name.
+        for host in [
+            "[fd14::1]:5170",
+            "[fd14::1]",
+            "fd14::1:5170",
+            "evil.example",
+            "npub1example.fips",
+            "npub1example.fips:80",
+            "localhost:5170",
+            "",
+        ] {
             assert_eq!(
                 respond(&site, peer, &get("/v1/terms", host)).status(),
                 StatusCode::MISDIRECTED_REQUEST,
@@ -247,7 +270,7 @@ mod tests {
 
     #[test]
     fn what_there_is_and_what_there_is_not() {
-        let (site, peer, host) = (site(), "fd99::2".parse().unwrap(), "[fd14::1]:5170");
+        let (site, peer, host) = (site(), "fd99::2".parse().unwrap(), "npub1example.fips:5170");
         let terms = respond(&site, peer, &get("/v1/terms", host));
         assert_eq!(terms.headers()[header::CONTENT_TYPE], "application/json");
         assert_eq!(terms.headers()[header::CACHE_CONTROL], "no-store");
@@ -297,7 +320,8 @@ mod tests {
     #[tokio::test]
     async fn the_terms_over_a_socket_say_who_asked() {
         let at = server(Limits::default(), |_| true).await;
-        let answer = exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: [fd14::1]:5170\r\nConnection: close\r\n\r\n").await;
+        let answer =
+            exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: npub1example.fips:5170\r\nConnection: close\r\n\r\n").await;
         assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
         let body = answer.split("\r\n\r\n").nth(1).unwrap();
         let terms: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -310,8 +334,10 @@ mod tests {
     #[tokio::test]
     async fn a_head_is_the_head_of_a_get() {
         let at = server(Limits::default(), |_| true).await;
-        let get = exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: [fd14::1]:5170\r\nConnection: close\r\n\r\n").await;
-        let head = exchange(at, b"HEAD /v1/terms HTTP/1.1\r\nHost: [fd14::1]:5170\r\nConnection: close\r\n\r\n").await;
+        let get =
+            exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: npub1example.fips:5170\r\nConnection: close\r\n\r\n").await;
+        let head =
+            exchange(at, b"HEAD /v1/terms HTTP/1.1\r\nHost: npub1example.fips:5170\r\nConnection: close\r\n\r\n").await;
         let (get_head, get_body) = get.split_once("\r\n\r\n").unwrap();
         let length =
             |text: &str| text.lines().find_map(|line| line.strip_prefix("content-length: ")).map(str::to_string);
@@ -323,7 +349,8 @@ mod tests {
     #[tokio::test]
     async fn a_peer_off_the_mesh_gets_nothing() {
         let at = server(Limits::default(), on_the_mesh).await;
-        let answer = exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: [fd14::1]:5170\r\nConnection: close\r\n\r\n").await;
+        let answer =
+            exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: npub1example.fips:5170\r\nConnection: close\r\n\r\n").await;
         assert_eq!(answer, "", "closed without a word");
     }
 
@@ -331,7 +358,7 @@ mod tests {
     async fn a_header_too_large_or_too_slow_ends_the_connection() {
         let limits = Limits { header_time: Duration::from_millis(500), ..Limits::default() };
         let at = server(limits, |_| true).await;
-        let mut big = b"GET /v1/terms HTTP/1.1\r\nHost: [fd14::1]:5170\r\nX-Filler: ".to_vec();
+        let mut big = b"GET /v1/terms HTTP/1.1\r\nHost: npub1example.fips:5170\r\nX-Filler: ".to_vec();
         big.extend(std::iter::repeat_n(b'x', 40_000));
         big.extend_from_slice(b"\r\n\r\n");
         let answer = exchange(at, &big).await;
@@ -352,11 +379,13 @@ mod tests {
         // Two that stay open and say nothing.
         let held = [TcpStream::connect(at).await.unwrap(), TcpStream::connect(at).await.unwrap()];
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let third = exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: [fd14::1]:5170\r\nConnection: close\r\n\r\n").await;
+        let third =
+            exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: npub1example.fips:5170\r\nConnection: close\r\n\r\n").await;
         assert_eq!(third, "", "a third from the same address is closed");
         drop(held);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let again = exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: [fd14::1]:5170\r\nConnection: close\r\n\r\n").await;
+        let again =
+            exchange(at, b"GET /v1/terms HTTP/1.1\r\nHost: npub1example.fips:5170\r\nConnection: close\r\n\r\n").await;
         assert!(again.starts_with("HTTP/1.1 200"), "places are given back: {again:.40}");
     }
 }

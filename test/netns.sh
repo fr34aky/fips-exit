@@ -18,7 +18,31 @@ export FIPS_EXIT_DIR=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$FIPS_EXIT_DIR"' EXIT
 mount -t tmpfs tmpfs /run
 
-E=fd0e::1 C1=fd11:2233:4455:6677::1 C2=fd99:8877:6655:4433::2 C3=fd55:aaaa:bbbb:cccc::3
+# The exit is a node with a key: its npub is its name on the mesh, and its
+# address is the one fips derives from it (fd and SHA-256 of the key).
+NPUB=$(python3 -c '
+import hashlib
+key = hashlib.sha256(b"fips-exit test exit").digest()
+A = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+def polymod(values):
+    c = 1
+    for v in values:
+        top = c >> 25; c = (c & 0x1ffffff) << 5 ^ v
+        for i, g in enumerate((0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)):
+            c ^= g if top >> i & 1 else 0
+    return c
+acc = bits = 0; data = []
+for b in key:
+    acc, bits = acc << 8 | b, bits + 8
+    while bits >= 5: bits -= 5; data.append(acc >> bits & 31)
+if bits: data.append(acc << (5 - bits) & 31)
+hrp = [ord(c) >> 5 for c in "npub"] + [0] + [ord(c) & 31 for c in "npub"]
+check = polymod(hrp + data + [0] * 6) ^ 1
+print("npub1" + "".join(A[v] for v in data + [check >> 5 * (5 - i) & 31 for i in range(6)]))')
+E=$(python3 -c '
+import hashlib, ipaddress
+print(ipaddress.IPv6Address(b"\xfd" + hashlib.sha256(hashlib.sha256(b"fips-exit test exit").digest()).digest()[:15]))')
+C1=fd11:2233:4455:6677::1 C2=fd99:8877:6655:4433::2 C3=fd55:aaaa:bbbb:cccc::3
 C1V4=100.81.34.51 C2V4=100.89.136.119 C3V4=100.85.170.170
 fail() { echo "FAIL: $*"; exit 1; }
 ok() { echo "ok: $*"; }
@@ -481,7 +505,7 @@ c = http.client.HTTPConnection(sys.argv[1], 5170, timeout=4)
 try:
     c.request("GET", sys.argv[2], headers={"Host": sys.argv[3]})
     r = c.getresponse(); print(r.status); sys.stdout.write(r.read().decode())
-except OSError: print("unreachable")' $E "$2" "${3:-[$E]:5170}"
+except OSError: print("unreachable")' $E "$2" "${3:-$NPUB.fips:5170}"
 }
 conf "ACCESS=nonsense\n"
 "$payd" --config "$FIPS_EXIT_DIR/config" 2>&1 | grep -q "nothing to sell" || fail "the payment service on an exit that sells nothing"
@@ -495,8 +519,21 @@ sleep 0.3
 "$here/fips-exit" up >/dev/null
 grep -q "dport 5170" "$fw/fips.d/fips-exit.nft" && fail "THE PAYMENT PORT WAS OPENED FOR SOMETHING THAT IS NOT THE SERVICE"
 kill $other; wait $other 2>/dev/null || true
-"$payd" --config "$FIPS_EXIT_DIR/config" --pub "$FIPS_EXIT_DIR/none.pub" 2>>"$FIPS_EXIT_DIR/payd.log" &
-payd_pid=$!
+mkdir -p /run/fips-exit-payd "$FIPS_EXIT_DIR/state"
+echo $NPUB > "$FIPS_EXIT_DIR/fips.pub"
+# Without the node's npub, or with another node's, the service does not start:
+# the npub is the way to it.
+"$payd" --config "$FIPS_EXIT_DIR/config" --pub "$FIPS_EXIT_DIR/none.pub" --state "$FIPS_EXIT_DIR/state" 2>&1 \
+  | grep -q "has no npub" || fail "the payment service started without the node's npub"
+echo npub19gvc005p4zwlf6qldnd8yvpumyqcn4xkhedjwrfqs43udk27gkmqu9p3yl > "$FIPS_EXIT_DIR/other.pub"
+"$payd" --config "$FIPS_EXIT_DIR/config" --pub "$FIPS_EXIT_DIR/other.pub" --state "$FIPS_EXIT_DIR/state" 2>&1 \
+  | grep -q "is not this node" || fail "the payment service started with another node's npub"
+start_payd() {
+  "$payd" --config "$FIPS_EXIT_DIR/config" --pub "$FIPS_EXIT_DIR/fips.pub" --state "$FIPS_EXIT_DIR/state" \
+    2>>"$FIPS_EXIT_DIR/payd.log" &
+  payd_pid=$!
+}
+start_payd
 # As the service's unit does when it has started: `up`, which waits for it to listen.
 "$here/fips-exit" up >/dev/null
 grep -qx "ip6 daddr $E tcp dport 5170 accept" "$fw/fips.d/fips-exit.nft" || fail "the payment port in fips's firewall: $(cat "$fw/fips.d/fips-exit.nft")"
@@ -509,10 +546,10 @@ printf '%s' "${r#*
 import json, sys
 t = json.load(sys.stdin)
 assert t["version"] == 1, t
-assert t["you"] == {"address": sys.argv[1]}, t["you"]
-assert t["exit"] == {"npub": None, "address": sys.argv[2], "name": "An exit", "about": "", "country": "CH"}, t["exit"]
+assert t["you"] == {"address": sys.argv[1], "package": None}, t["you"]
+assert t["exit"] == {"npub": sys.argv[3], "address": sys.argv[2], "name": "An exit", "about": "", "country": "CH"}, t["exit"]
 assert t["price_msat_per_gb"] == 2000000 and t["methods"] == [] and t["mints"] == [], t
-assert [p["id"] for p in t["packages"]] == ["1gb", "5gb"] and t["packages"][1]["bytes"] == 5000000000, t' $C3 $E \
+assert [p["id"] for p in t["packages"]] == ["1gb", "5gb"] and t["packages"][1]["bytes"] == 5000000000, t' $C3 $E $NPUB \
   || fail "the terms said: ${r#*
 }"
 r=$(http_get c3 /)
@@ -520,7 +557,72 @@ case "$r" in "200
 "*"<title>An exit</title>"*"5 GB"*"You are <code>$C3</code>"*) ;; *) fail "the page: $r" ;; esac
 [ "$(http_get c3 /v1/terms "evil.example")" = "421
 not this exit's name" ] || fail "a request for another name: $(http_get c3 /v1/terms evil.example)"
+# Nor its bare address: that is reached only by way of the npub.
+[ "$(http_get c3 /v1/terms "[$E]:5170" | head -1)" = 421 ] || fail "a request by the bare address was answered"
 ok "the payment service tells any node on the mesh what the exit costs, and who it is"
+
+# --- a package the operator gives away, kept by the payment service -------------
+# The service keeps it, and keeps the daemon's account for it as it says:
+# the member is carried, counted, cut off when it is used up, carried again
+# when it is topped up, and nothing is lost when the daemon or the service
+# starts again.
+account_of() { ctl usage | awk -v p="$1" '$2 == p { print $3, $4, $5 }'; }
+wait_for() { # a shell condition, for up to ten seconds
+  for i in $(seq 40); do eval "$1" && return 0; sleep 0.25; done; return 1
+}
+out=$("$here/fips-exit" grant 400 0 $C3 a test package) || fail "grant: $out"
+package=$(printf '%s\n' "$out" | awk '$1 == "package" { print $2 }')
+key=$(printf '%s\n' "$out" | awk '$1 == "key" { print $2 }')
+[ ${#key} = 64 ] || fail "grant said: $out"
+wait_for '[ -n "$(account_of $package)" ]' || fail "the package was not put in the daemon: $(ctl usage) $(tail -3 "$FIPS_EXIT_DIR/payd.log")"
+for i in 1 2 3; do
+  [ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "exchange $i of a package's member"
+done
+[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A PACKAGE'S MEMBER WAS CARRIED PAST ITS BYTES"
+wait_for '"$here/fips-exit" packages | grep -q "^$package  *used-up"' || fail "packages: $("$here/fips-exit" packages)"
+wait_for '[ -z "$(account_of $package)" ]' || fail "a used-up package was not dropped from the daemon"
+r=$(http_get c3 /v1/terms)
+printf '%s' "${r#*
+}" | python3 -c '
+import json, sys
+p = json.load(sys.stdin)["you"]["package"]
+assert p["id"] == sys.argv[1] and p["standing"] == "used-up" and p["bytes_left"] == 0 and p["members"] == 1, p' $package \
+  || fail "the terms for a member: ${r#*
+}"
+"$here/fips-exit" top-up $package 10000 >/dev/null || fail "top-up"
+wait_for '[ -n "$(account_of $package)" ]' || fail "a topped-up package was not put again"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member after a top-up"
+ok "a package given away is carried, counted, cut off when used up, and carried again when topped up"
+
+# The daemon starts again, empty: the service puts the package back, with
+# what it had used when it last asked, every two seconds. (What was used
+# after that and before the daemon stopped is forgiven: a few seconds.)
+sleep 3
+used_before=$(account_of $package | awk '{ print $2 + $3 }')
+kill $daemon_pid; wait $daemon_pid 2>/dev/null || true
+for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 || break; sleep 0.2; done
+ACCESS=paid DNS_UPSTREAMS=8.8.8.2 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>>"$FIPS_EXIT_DIR/daemon.log" &
+daemon_pid=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && break; sleep 0.2; done
+"$here/fips-exit" up >/dev/null
+wait_for '[ -n "$(account_of $package)" ]' || fail "THE PACKAGE WAS NOT PUT BACK AFTER THE DAEMON STARTED AGAIN"
+used_after=$(account_of $package | awk '{ print $2 + $3 }')
+[ "$used_after" -ge "$used_before" ] || fail "what the package had used was lost: $used_before, then $used_after"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member after the daemon started again"
+# The service starts again: its packages are kept.
+kill $payd_pid; wait $payd_pid 2>/dev/null || true
+start_payd
+"$here/fips-exit" up >/dev/null
+wait_for '"$here/fips-exit" packages 2>/dev/null | grep -q "^$package  *live .*a test package"' \
+  || fail "the package after the service started again: $("$here/fips-exit" packages 2>&1)"
+ok "nothing is lost when the daemon or the payment service starts again"
+
+"$here/fips-exit" revoke $package >/dev/null || fail "revoke"
+wait_for '[ -z "$(account_of $package)" ]' || fail "a revoked package was not dropped"
+[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A REVOKED PACKAGE'S MEMBER WAS CARRIED"
+[ "$(ctl "check $C3")" = "ok free v4" ] || fail "after revoke: $(ctl "check $C3")"
+"$here/fips-exit" grant 1GB 0 2001:db8::1 >/dev/null 2>&1 && fail "a package for an address that is not a fips address"
+ok "a revoked package's member is not carried"
 
 # --- a removed client is cut off, even when `up` then stops -------------------------
 # `remove` saves the list and applies it. If applying stops at something (here:

@@ -17,6 +17,16 @@ NAT to the uplink, and the firewall.
   fips-exit accounts                       who else is carried, and for how much (ACCESS=paid)
   fips-exit advert [show]                  say on Nostr that this exit exists; or show what would be said
 
+With ACCESS=paid and the payment service running (fips-exit-payd), packages
+the operator gives away, without payment:
+
+  fips-exit grant <size> <days> <who>[,<who>…] [label]   a package: size like 1GB, days 0 for no end,
+                                                         who an npub or an fd address; prints its key
+  fips-exit packages                                     the packages, what each has left, and who is in it
+  fips-exit top-up <id> <size> [days]                    more bytes, and more days
+  fips-exit members <id> <who>[,<who>…]                  who shares it, in place of who did
+  fips-exit revoke <id>                                  take it back
+
 Needs root, iproute2, nftables, and fips-exitd (systemctl start fips-exit).
 """
 
@@ -40,6 +50,8 @@ CONFIG = os.path.join(DIR, "config")
 # The daemon's socket: for accounts when the config says ACCESS=paid, and
 # for the counts of the clients on the list when it says CLIENT_COUNTS=on.
 CONTROL = os.environ.get("FIPS_EXIT_CONTROL", "/run/fips-exit/control.sock")
+# The payment service's socket for the operator.
+PAYD_ADMIN = os.environ.get("FIPS_EXIT_PAYD_ADMIN", "/run/fips-exit-payd/admin.sock")
 
 TABLE = "fips_exit"  # nftables table (inet)
 ROUTE_TABLE = "5170"  # per-client IPv6 return routes
@@ -365,6 +377,15 @@ def uplink(config):
             if route.get("dev"):
                 return route["dev"]
     die(f"no default route; set WAN=<interface> in {CONFIG}")
+
+
+def mesh_addresses(config):
+    """Every fips address of the mesh interface."""
+    shown = run("ip", "-j", "-6", "addr", "show", "dev", config["MESH_IF"], check=False)
+    return [ipaddress.IPv6Address(info["local"])
+            for interface in json.loads(shown.stdout or "[]") if shown.returncode == 0
+            for info in interface.get("addr_info", [])
+            if ipaddress.IPv6Address(info["local"]) in MESH]
 
 
 def mesh_address(config):
@@ -1339,6 +1360,97 @@ def cmd_status():
         else:
             listening = payd_listens(port, wait=0)
             print(f"payment service fips-exit-payd: {'answering' if listening else 'not answering'} on port {port}")
+            # The exit's name on the mesh, its npub, is the only way to it:
+            # its address is reached only once that name was resolved.
+            try:
+                with open("/etc/fips/fips.pub") as file:
+                    npub = file.read().strip()
+                if key_address(bech32_key(npub, "npub")) in mesh_addresses(config):
+                    print(f"  http://{npub}.fips:{port}/")
+                else:
+                    print(f"  /etc/fips/fips.pub ({npub}) is not this node: the service will not start")
+            except (OSError, ValueError):
+                print("  /etc/fips/fips.pub has no npub: the service will not start")
+
+
+def payd(line):
+    """One command to the payment service's socket for the operator; the
+    lines of its answer, the last beginning `ok`, or the script stops with
+    what was said."""
+    peer = socket.socket(socket.AF_UNIX)
+    peer.settimeout(10)
+    try:
+        peer.connect(PAYD_ADMIN)
+        peer.sendall(line.encode() + b"\n")
+        peer.shutdown(socket.SHUT_WR)
+        answer = b""
+        while True:
+            data = peer.recv(65536)
+            if not data:
+                break
+            answer += data
+    except OSError as error:
+        die(f"the payment service does not answer on {PAYD_ADMIN} ({error.strerror or error}): "
+            "is it running? (systemctl start fips-exit-payd)")
+    finally:
+        peer.close()
+    lines = answer.decode(errors="replace").splitlines()
+    if not lines or not lines[-1].startswith("ok"):
+        die(lines[-1][4:] if lines and lines[-1].startswith("err ") else f"the payment service said: {lines}")
+    return lines
+
+
+def who_list(text):
+    """Clients as the operator names them, npubs or fd addresses, as the
+    fips addresses the service is told."""
+    return ",".join(str(parse_client(who)) for who in text.split(",") if who)
+
+
+def cmd_grant(size, days, who, *label):
+    _, package, key = payd(f"grant {size} {days} {who_list(who)} {' '.join(label)}".rstrip())[-1].split()
+    print(f"package {package}")
+    print(f"key     {key}")
+    print("The key manages the package; it is shown once and not kept. The members are carried from now on.")
+
+
+def cmd_packages():
+    lines = payd("packages")
+    print(f"{'package':<18} {'standing':<9} {'left':>12} {'used':>12}  {'until':<16}  members  label")
+    for line in lines[:-1]:
+        fields = line.split(" ", 8)
+        _, package, standing, granted, used_in, used_out, until, members = fields[:8]
+        label = fields[8] if len(fields) > 8 else ""
+        used = int(used_in) + int(used_out)
+        left = max(0, int(granted) - used)
+        end = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(until))) if int(until) else "-"
+        print(f"{package:<18} {standing:<9} {human_bytes(left):>12} {human_bytes(used):>12}  {end:<16}  "
+              f"{0 if members == '-' else len(members.split(','))}  {label}")
+        for member in [] if members == "-" else members.split(","):
+            print(f"{'':<20}{member}")
+    if len(lines) == 1:
+        print("(none)")
+
+
+def human_bytes(n):
+    for size, unit in ((10**12, "TB"), (10**9, "GB"), (10**6, "MB"), (10**3, "kB")):
+        if n >= size:
+            return f"{n / size:.1f} {unit}"
+    return f"{n} B"
+
+
+def cmd_top_up(package, size, days="0"):
+    payd(f"top-up {package} {size} {days}")
+    print(f"{package}: topped up")
+
+
+def cmd_members(package, who):
+    payd(f"members {package} {who_list(who) if who != '-' else '-'}")
+    print(f"{package}: members set")
+
+
+def cmd_revoke(package):
+    payd(f"revoke {package}")
+    print(f"{package}: taken back; its members are no longer carried")
 
 
 def cmd_accounts():
@@ -1368,7 +1480,9 @@ def cmd_accounts():
 
 def main(argv):
     commands = {"up": cmd_up, "down": cmd_down, "add": cmd_add, "remove": cmd_remove,
-                "list": cmd_list, "status": cmd_status, "accounts": cmd_accounts, "advert": cmd_advert}
+                "list": cmd_list, "status": cmd_status, "accounts": cmd_accounts, "advert": cmd_advert,
+                "grant": cmd_grant, "packages": cmd_packages, "top-up": cmd_top_up, "members": cmd_members,
+                "revoke": cmd_revoke}
     if len(argv) < 2 or argv[1] not in commands:
         sys.exit(__doc__)
     try:

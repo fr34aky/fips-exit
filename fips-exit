@@ -379,6 +379,15 @@ def uplink(config):
     die(f"no default route; set WAN=<interface> in {CONFIG}")
 
 
+def mesh_addresses(config):
+    """Every fips address of the mesh interface."""
+    shown = run("ip", "-j", "-6", "addr", "show", "dev", config["MESH_IF"], check=False)
+    return [ipaddress.IPv6Address(info["local"])
+            for interface in json.loads(shown.stdout or "[]") if shown.returncode == 0
+            for info in interface.get("addr_info", [])
+            if ipaddress.IPv6Address(info["local"]) in MESH]
+
+
 def mesh_address(config):
     shown = run("ip", "-j", "-6", "addr", "show", "dev", config["MESH_IF"], check=False)
     if shown.returncode != 0:
@@ -1356,7 +1365,7 @@ def cmd_status():
             try:
                 with open("/etc/fips/fips.pub") as file:
                     npub = file.read().strip()
-                if key_address(bech32_key(npub, "npub")) == mesh_address(config):
+                if key_address(bech32_key(npub, "npub")) in mesh_addresses(config):
                     print(f"  http://{npub}.fips:{port}/")
                 else:
                     print(f"  /etc/fips/fips.pub ({npub}) is not this node: the service will not start")

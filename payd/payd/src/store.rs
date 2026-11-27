@@ -114,6 +114,8 @@ pub enum Refused {
     Members,
     /// More bytes than the daemon takes.
     TooMuch,
+    /// Its time is over, and a top-up gave it no more days.
+    Over,
     /// The database said no.
     Store(String),
 }
@@ -125,6 +127,7 @@ impl std::fmt::Display for Refused {
             Refused::Elsewhere(address) => write!(f, "elsewhere {address}"),
             Refused::Members => write!(f, "members (at most {MAX_MEMBERS}, none twice)"),
             Refused::TooMuch => f.write_str("too-much"),
+            Refused::Over => f.write_str("over (its time has ended: give it days too)"),
             Refused::Store(e) => write!(f, "store {e}"),
         }
     }
@@ -310,6 +313,10 @@ impl Store {
         let db = self.db();
         let package = Store::package_in(&db, id)?.ok_or(Refused::NoPackage)?;
         let granted = package.granted.checked_add(bytes).filter(|g| *g <= MAX_BYTES).ok_or(Refused::TooMuch)?;
+        // Bytes alone would leave it as over as it was, and say otherwise.
+        if days == 0 && package.until != 0 && now >= package.until {
+            return Err(Refused::Over);
+        }
         let until = match (package.until, days) {
             (0, _) | (_, 0) => package.until,
             (until, days) => until.max(now) + u64::from(days) * 86_400,
@@ -434,6 +441,7 @@ mod tests {
         // More days: from its end, or from now once that has passed.
         store.top_up(&id, 0, 2, NOW).unwrap();
         assert_eq!(store.package(&id).unwrap().unwrap().until, NOW + 3 * 86_400);
+        assert_eq!(store.top_up(&id, 500, 0, NOW + 10 * 86_400), Err(Refused::Over), "bytes alone, when it is over");
         store.top_up(&id, 0, 1, NOW + 10 * 86_400).unwrap();
         assert_eq!(store.package(&id).unwrap().unwrap().until, NOW + 11 * 86_400);
         store.revoke(&id).unwrap();

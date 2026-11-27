@@ -131,55 +131,101 @@ pub async fn round(store: &Store, control: &PathBuf, sync: &mut Sync, seats: &Se
         }
     }
     let now = unix_now();
-    for package in store.packages().map_err(|e| e.to_string())? {
-        let standing = package.standing(now);
-        if standing != Standing::Live {
-            if there.contains(&package.id) || sync.pushed.contains_key(&package.id) {
-                let answer = daemon.tell(&format!("drop {}", package.id)).await;
-                if answer.is_ok() || answer.as_ref().is_err_and(|e| e.ends_with("err no-account")) {
-                    sync.pushed.remove(&package.id);
-                    if there.contains(&package.id) {
-                        done.push(format!("{} is {}: dropped", package.id, standing.word()));
-                    }
-                } else {
-                    answer?;
-                }
+    let packages = store.packages().map_err(|e| e.to_string())?;
+    // First what is not to be carried: every account of the service's that
+    // is not a live package (used up, over, revoked, or not in the store at
+    // all, which is the truth). Before anything is put, so that an address
+    // a package gave up is free when another takes it.
+    let live: HashMap<&str, &crate::store::Package> =
+        packages.iter().filter(|p| p.standing(now) == Standing::Live).map(|p| (p.id.as_str(), p)).collect();
+    let mut gone: Vec<String> =
+        there.iter().chain(sync.pushed.keys()).filter(|id| !live.contains_key(id.as_str())).cloned().collect();
+    gone.sort();
+    gone.dedup();
+    for id in gone {
+        let answer = daemon.tell(&format!("drop {id}")).await;
+        if answer.is_ok() || answer.as_ref().is_err_and(|e| e.ends_with("err no-account")) {
+            sync.pushed.remove(&id);
+            if there.contains(&id) {
+                let why = packages.iter().find(|p| p.id == id).map_or("not in the store", |p| p.standing(now).word());
+                done.push(format!("{id} is {why}: dropped"));
             }
-            continue;
-        }
-        let wanted = Pushed { granted: package.granted, until: package.until, members: package.members.clone() };
-        if sync.pushed.get(&package.id) == Some(&wanted) && there.contains(&package.id) {
-            continue;
-        }
-        let members = if package.members.is_empty() {
-            "-".to_string()
         } else {
-            package.members.iter().map(Ipv6Addr::to_string).collect::<Vec<_>>().join(",")
+            answer?;
+        }
+    }
+    // Then every live package that changed. One the daemon refuses is said
+    // and passed over, and tried again in the next round, after the others:
+    // it must not hold up the packages behind it.
+    let mut failed = Vec::new();
+    for attempt in 0..2 {
+        let todo: Vec<&crate::store::Package> = if attempt == 0 {
+            packages.iter().filter(|p| live.contains_key(p.id.as_str())).collect()
+        } else {
+            std::mem::take(&mut failed).into_iter().map(|(p, _)| p).collect()
         };
-        let answer = daemon
-            .tell(&format!(
+        for package in todo {
+            let wanted = Pushed { granted: package.granted, until: package.until, members: package.members.clone() };
+            if sync.pushed.get(&package.id) == Some(&wanted) && there.contains(&package.id) {
+                continue;
+            }
+            let members = if package.members.is_empty() {
+                "-".to_string()
+            } else {
+                package.members.iter().map(Ipv6Addr::to_string).collect::<Vec<_>>().join(",")
+            };
+            let command = format!(
                 "put {} {} {} {} {members} {}",
                 package.id, package.granted, package.used_in, package.used_out, package.until
-            ))
-            .await?;
-        let mut seated = seats.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        for word in answer.split_whitespace().skip(1) {
-            if let Some((address, seat)) = word.split_once('=')
-                && let Ok(address) = address.parse()
-            {
-                seated.insert(address, seat.to_string());
+            );
+            let answer = match daemon.tell(&command).await {
+                Ok(answer) => answer,
+                // The daemon answered no: this package waits. A daemon that
+                // does not answer at all ends the round.
+                Err(e) if e.contains(": err ") => {
+                    failed.push((package, e));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let mut seated = seats.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for word in answer.split_whitespace().skip(1) {
+                if let Some((address, seat)) = word.split_once('=')
+                    && let Ok(address) = address.parse()
+                {
+                    seated.insert(address, seat.to_string());
+                }
             }
+            drop(seated);
+            if !there.contains(&package.id) {
+                done.push(format!(
+                    "{} put: {} member(s), {} bytes left",
+                    package.id,
+                    package.members.len(),
+                    package.left()
+                ));
+            }
+            sync.pushed.insert(package.id.clone(), wanted);
         }
-        drop(seated);
-        if !there.contains(&package.id) {
-            done.push(format!(
-                "{} put: {} member(s), {} bytes left",
-                package.id,
-                package.members.len(),
-                package.left()
-            ));
+    }
+    for (package, e) in failed {
+        done.push(format!("{} could not be put, and is tried again: {e}", package.id));
+    }
+    // How each member sits: an address carried for IPv6 only gets its inner
+    // IPv4 address when that is free, without its package changing, so it
+    // is asked again; and an address in no live package is nobody's here.
+    let members: HashSet<Ipv6Addr> = live.values().flat_map(|p| p.members.iter().copied()).collect();
+    let waiting: Vec<Ipv6Addr> = {
+        let mut seated = seats.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        seated.retain(|address, _| members.contains(address));
+        seated.iter().filter(|(_, seat)| seat.as_str() == "no4").map(|(address, _)| *address).collect()
+    };
+    for address in waiting {
+        let answer = daemon.tell(&format!("check {address}")).await?;
+        let seat = answer.split_whitespace().last().unwrap_or("").to_string();
+        if seat == "v4" || seat == "no4" {
+            seats.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(address, seat);
         }
-        sync.pushed.insert(package.id.clone(), wanted);
     }
     Ok(done)
 }
@@ -237,6 +283,8 @@ mod tests {
         epoch: u64,
         accounts: HashMap<String, (u64, u64, u64, u64, Vec<String>)>,
         heard: Vec<String>,
+        /// An account this daemon refuses to put.
+        refuse: Option<String>,
     }
 
     async fn fake(path: PathBuf, daemon: Arc<Mutex<FakeDaemon>>) {
@@ -265,6 +313,8 @@ mod tests {
                                 out.push_str(&format!("ok {}\n", d.accounts.len()));
                                 out
                             }
+                            ["put", name, ..] if d.refuse.as_deref() == Some(name) => "err elsewhere fd00::1\n".into(),
+                            ["check", _] => "ok member x v4\n".into(),
                             ["put", name, g, i, o, members, until] => {
                                 let members: Vec<String> = if members == "-" {
                                     vec![]
@@ -358,6 +408,28 @@ mod tests {
         round(&store, &path, &mut sync, &seats).await.unwrap();
         let names: Vec<String> = daemon.lock().unwrap().accounts.keys().cloned().collect();
         assert_eq!(names, vec!["by-hand".to_string()]);
+        // An account that looks like the service's and is in no package
+        // (its store was lost, say): dropped. The store is the truth.
+        daemon.lock().unwrap().accounts.insert("p00000000000000ff".into(), (1000, 0, 0, 0, vec![]));
+        round(&store, &path, &mut sync, &seats).await.unwrap();
+        assert!(!daemon.lock().unwrap().accounts.contains_key("p00000000000000ff"));
+        // A package the daemon refuses does not hold up the others.
+        let (blocked, _) = store.grant(1000, 0, &[address(7)], "", now).unwrap();
+        let (behind, _) = store.grant(1000, 0, &[address(8)], "", now - 1).unwrap();
+        daemon.lock().unwrap().refuse = Some(blocked.clone());
+        let done = round(&store, &path, &mut sync, &seats).await.unwrap();
+        assert!(done.iter().any(|line| line.contains("could not be put")), "{done:?}");
+        assert!(daemon.lock().unwrap().accounts.contains_key(&behind));
+        daemon.lock().unwrap().refuse = None;
+        round(&store, &path, &mut sync, &seats).await.unwrap();
+        assert!(daemon.lock().unwrap().accounts.contains_key(&blocked), "tried again, and put");
+        // A member carried for IPv6 only is asked again, and its seat follows.
+        seats.lock().unwrap().insert(address(8), "no4".into());
+        round(&store, &path, &mut sync, &seats).await.unwrap();
+        assert_eq!(seats.lock().unwrap().get(&address(8)).map(String::as_str), Some("v4"));
+        store.revoke(&behind).unwrap();
+        round(&store, &path, &mut sync, &seats).await.unwrap();
+        assert!(!seats.lock().unwrap().contains_key(&address(8)), "nobody's once its package is gone");
         // A package that is over, and that the daemon still has after the
         // service started again: dropped all the same.
         let (old, _) = store.grant(1000, 1, &[address(3)], "", now - 2 * 86_400).unwrap();

@@ -1708,8 +1708,11 @@ fn run() -> Result<(), String> {
             Ok(listener) => {
                 eprintln!("fips-exitd: {what} over {control}");
                 // Accounts are made by a payment service that is not root.
-                // The counts alone are root's to read.
-                if state.accounts {
+                // The counts alone are root's to read. Only the socket's own
+                // directory, which the unit makes for it, is given to the
+                // group: a socket put anywhere else (--control) stays root's,
+                // and so does the directory it is in.
+                if state.accounts && control == CONTROL_SOCKET {
                     share_with_group(control, CONTROL_GROUP);
                 }
                 let state = state.clone();

@@ -174,11 +174,18 @@ IPv4 address derived from the client's fips address.
 - **The payment service naming another node.** It answers to
   `<npub>.fips`, and starts at all, only when that npub's fips address is
   one this node has; a stale key file is not believed.
+- **The daemon's socket given away further than meant.** In paid mode the
+  daemon gives the socket, and the directory systemd made for it, to the
+  group `fips-exit`. Only that socket at its own place: one put anywhere
+  else with `--control` stays root's, and so does its directory, which may
+  be shared with others (`/run` itself).
 - **The payment service making accounts it should not.** It is in the
   daemon's admission now: whatever it puts is carried. It must put a
   package's members, for the package's bytes and end, only while the
-  package is live, and drop it when it is used up, over or revoked; never
-  touch an account that is not its own (`p` and 16 hex digits); and never
+  package is live, and drop it when it is used up, over or revoked, or
+  when its store does not know it; never touch an account that is not its
+  own (`p` and 16 hex digits); never let one package the daemon refuses
+  hold up the others (what is to be dropped is dropped first); and never
   lose what the daemon counted, which it folds into its store before it
   decides anything. A package's key is kept only as its hash.
 - **An address in two packages.** A device is in one package at a time; it

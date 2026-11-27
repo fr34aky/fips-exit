@@ -827,15 +827,21 @@ const DNS_IN_FLIGHT: usize = 256;
 /// a client on its own is refused nothing it was given then.
 const DNS_IN_FLIGHT_PER_CLIENT: usize = 64;
 
+/// A setting as systemd hands it over from the config file: possibly quoted,
+/// and with whatever followed a `#` on the line. Unset is empty.
+fn plain(setting: Option<&str>) -> &str {
+    setting.map(|s| s.split('#').next().unwrap_or("").trim().trim_matches('"').trim()).unwrap_or("")
+}
+
+/// Where the control socket is when the config says `ACCESS=paid` and
+/// nothing on the command line says otherwise.
+const CONTROL_SOCKET: &str = "/run/fips-exit/control.sock";
+
 /// The resolvers to forward to, from `DNS_UPSTREAMS` (IP addresses, spaces
 /// or commas between them) or, when that is unset, the host's
 /// `/etc/resolv.conf`. `Ok(None)`: `DNS_UPSTREAMS=off`, no resolver is run.
 fn dns_upstreams(setting: Option<&str>, resolv_conf: &str) -> Result<Option<Vec<SocketAddr>>, String> {
-    // As systemd hands it over from the config file: possibly quoted, and
-    // with whatever followed a `#` on the line.
-    let setting = setting
-        .map(|s| s.split('#').next().unwrap_or("").trim().trim_matches('"').trim())
-        .unwrap_or("");
+    let setting = plain(setting);
     if setting == "off" {
         return Ok(None);
     }
@@ -1406,22 +1412,6 @@ fn run() -> Result<(), String> {
         resolver: AtomicBool::new(false),
     });
 
-    // Accounts, for whatever sells access. After the TUN, which a second
-    // daemon could not have opened: the socket of a running one is never
-    // replaced. A socket that cannot be made is said loudly and is not
-    // fatal: the clients on the operator's list are carried without it, and
-    // nobody else is.
-    if !args.control.is_empty() {
-        match control_listener(&args.control) {
-            Ok(listener) => {
-                eprintln!("fips-exitd: accounts over {}", args.control);
-                let state = state.clone();
-                std::thread::spawn(move || serve_control(state, listener));
-            }
-            Err(e) => eprintln!("fips-exitd: NO ACCOUNTS: {}: {e}", args.control),
-        }
-    }
-
     for (socket, proto) in [(socket4.as_raw_fd(), PROTO_IPV4), (socket6.as_raw_fd(), PROTO_IPV6)] {
         let (state, tun) = (state.clone(), tun.as_raw_fd());
         std::thread::spawn(move || {
@@ -1454,6 +1444,27 @@ fn run() -> Result<(), String> {
                     Ipv6Addr::from(local)
                 ),
             }
+        }
+    }
+    // Accounts, for whatever sells access: with `--control`, or at the usual
+    // place when the config says `ACCESS=paid`. After the TUN, which a second
+    // daemon could not have opened: the socket of a running one is never
+    // replaced. And after the resolver, so that from the socket's first
+    // answer `stat` says how it is. A socket that cannot be made is said
+    // loudly and is not fatal: the clients on the operator's list are
+    // carried without it, and nobody else is.
+    let control = match (args.control.as_str(), plain(std::env::var("ACCESS").ok().as_deref())) {
+        ("", "paid") => CONTROL_SOCKET,
+        (path, _) => path,
+    };
+    if !control.is_empty() {
+        match control_listener(control) {
+            Ok(listener) => {
+                eprintln!("fips-exitd: accounts over {control}");
+                let state = state.clone();
+                std::thread::spawn(move || serve_control(state, listener));
+            }
+            Err(e) => eprintln!("fips-exitd: NO ACCOUNTS: {control}: {e}"),
         }
     }
     {
@@ -2019,6 +2030,10 @@ mod tests {
         // A comment after the value arrives with it from the unit's environment.
         assert_eq!(dns_upstreams(Some("9.9.9.9  # quad9"), conf), Ok(Some(vec![at("9.9.9.9")])));
         assert_eq!(dns_upstreams(Some("off # for now"), conf), Ok(None));
+        // The same reading for every setting that comes that way.
+        assert_eq!(plain(Some("\"paid\"  # sells access")), "paid");
+        assert_eq!(plain(Some(" paid ")), "paid");
+        assert_eq!(plain(None), "");
         assert!(dns_upstreams(Some("dns.example.org"), conf).is_err(), "a name is not an address");
         assert!(dns_upstreams(None, "search lan\n").is_err(), "nothing to forward to");
         // No more than four are asked.

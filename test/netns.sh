@@ -9,6 +9,8 @@
 #
 # The clients use the kernel's own ip6tnl, i.e. the same wire format the
 # phone speaks. Needs the daemon built (cargo build --release).
+# First the exit as it is by default, for the clients on its list; then the
+# same exit with ACCESS=paid, where it also carries the members of accounts.
 # Run as: unshare -Urnm test/netns.sh
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -97,12 +99,14 @@ daemon="$here/target/release/fips-exitd"
 ok "up without the daemon is refused"
 sock="$FIPS_EXIT_DIR/control.sock"
 DNS_UPSTREAMS=8.8.8.2 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 --control "$sock" 2>"$FIPS_EXIT_DIR/daemon.log" &
+daemon_pid=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && [ -S "$sock" ] && break; sleep 0.2; done
 ip link show fipsexit0 >/dev/null 2>&1 || fail "the daemon did not create its TUN: $(cat "$FIPS_EXIT_DIR/daemon.log")"
 
 # --- the control socket: root's alone, and no peer on it stops anything ---------
-# Accounts are made over it (further down). It runs through everything
-# below, with a peer that says nothing and after one that sent no command.
+# Accounts are made over it (in the second half, ACCESS=paid). It is there
+# through this half too, with a peer that says nothing and after one that
+# sent no command.
 ctl() { # bytes to send, as Python would write them -> the daemon's answer
   python3 -c '
 import ast, socket, sys
@@ -260,23 +264,26 @@ print(len(reply.recv(4096)))' $C1 $E 2001:4860:1::2 | grep -qx 100 || fail "frag
 ok "a 1280-byte IPv6 packet sent as two outer fragments is reassembled by the exit"
 
 # --- TCP MSS ------------------------------------------------------------------
-ip netns exec inet python3 -c '
-import socket
-s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0); s.bind(("::", 4445)); s.listen(4)
-while True:
-    c, _ = s.accept(); c.sendall(b"y" * 200000); c.close()' &
-sleep 0.5
-fetch() { ip netns exec c1 python3 -c '
+for port in 4445 25; do   # 25 for the second half: mail is not for members
+  ip netns exec inet python3 -c '
 import socket, sys
-s = socket.create_connection((sys.argv[1], 4445), timeout=5); n = 0
+s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0); s.bind(("::", int(sys.argv[1]))); s.listen(4)
+while True:
+    c, _ = s.accept(); c.sendall(b"y" * 200000); c.close()' $port &
+done
+sleep 0.5
+fetch() { # netns address [port] -> bytes received, or nothing
+  ip netns exec "$1" python3 -c '
+import socket, sys
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5); n = 0
 while True:
     d = s.recv(65536)
     if not d: break
     n += len(d)
-print(n)' "$1"; }
-[ "$(fetch 8.8.8.2)" = 200000 ] || fail "TCP over IPv4"
-[ "$(fetch 2001:4860:1::2)" = 200000 ] || fail "TCP over IPv6"
+print(n)' "$2" "${3:-4445}" 2>/dev/null || true; }
+[ "$(fetch c1 8.8.8.2)" = 200000 ] || fail "TCP over IPv4"
+[ "$(fetch c1 2001:4860:1::2)" = 200000 ] || fail "TCP over IPv6"
 ok "TCP transfers complete in both families"
 
 # --- DNS for the clients, and only for them ------------------------------------
@@ -327,41 +334,6 @@ printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n" > "$FIPS_EXIT_DIR/con
 "$here/fips-exit" up >/dev/null
 ok "a bad BLOCK_CIDRS entry is refused"
 
-# --- a member of an account: carried while the account has bytes ---------------
-# An account is how an address that is not on the operator's list uses the
-# exit, for a number of bytes. Nothing in the script makes one yet, so the
-# routes and the set entries it makes for a client are made by hand here.
-[ "$(ctl "check $C3")" = "ok free v4" ] || fail "check: $(ctl "check $C3")"
-# The second member is on the operator's list, which wins: not counted.
-[ "$(ctl "put pkg 0 0 0 $C3,$C2")" = "ok $C3=v4 $C2=static" ] || fail "put: $(ctl "check $C3")"
-ip route replace $C3V4 dev fipsexit0
-ip -6 route replace $C3 dev fipsexit0 table 5170
-nft add element inet fips_exit clients4 "{ $C3V4 }"
-nft add element inet fips_exit clients6 "{ $C3 }"
-[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A MEMBER WAS CARRIED WITHOUT A GRANT"
-[ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a member without a grant got DNS"
-# 400 bytes. A request is 31 (20 + 8 + "100") and its answer 128: two
-# exchanges fit, the third crosses the line with its answer, and that was
-# the last. A name is answered and not counted.
-[ "$(ctl "grant pkg 400")" = ok ] || fail "grant"
-r=$(resolve c3 $C3 example.com)
-[ "${r% size=*}" = "answers=1 rcode=0 tc=0" ] || fail "a member's DNS query: $r"
-for i in 1 2 3; do
-  [ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "exchange $i of a member with bytes left"
-done
-[ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "a client on the list, also a member"
-[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A MEMBER WAS CARRIED PAST ITS GRANT"
-[ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a member without bytes left got DNS"
-[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384\nok 1')" ] || fail "usage: $(ctl usage)"
-# The same put again, as after a lost answer, takes nothing back; a larger
-# grant carries the member again.
-[ "$(ctl "put pkg 0 0 0 $C3,$C2")" = "ok $C3=v4 $C2=static" ] || fail "put again"
-[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384\nok 1')" ] || fail "a repeated put changed the count: $(ctl usage)"
-[ "$(ctl "grant pkg 1000")" = ok ] || fail "grant"
-[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member after a larger grant"
-[ "$(ctl "usage pkg")" = "$(printf 'account pkg 1000 124 512\nok 1')" ] || fail "usage: $(ctl usage)"
-ok "a member is carried for the bytes its account was granted, counted exactly, and no further"
-
 # --- no upstream answers: the client is told at once ---------------------------
 kill $dns_pid
 r=$(resolve c2 $C2 example.com)
@@ -373,17 +345,163 @@ ok "with no upstream answering, a client gets SERVFAIL instead of silence"
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "removed client still passes"
 [ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "remaining client broke on removal"
 ok "removing a client cuts it off and leaves the others"
-# `remove` had the daemon read the list again: the account is as it was.
-[ "$(ctl "usage pkg")" = "$(printf 'account pkg 1000 124 512\nok 1')" ] || fail "THE ACCOUNT WAS LOST AT A RELOAD: $(ctl usage)"
-case "$(ctl stat)" in "ok epoch="*" accounts=1 resolver=1") ;; *) fail "stat: $(ctl stat)" ;; esac
-[ "$(ctl "drop pkg")" = ok ] || fail "drop"
-[ "$(ctl "check $C3")" = "ok free v4" ] || fail "after drop: $(ctl "check $C3")"
-ok "an account outlives a reload of the client list, and is gone when dropped"
-legacy fx55667788 $C2
-PATH="$FIPS_EXIT_DIR/bin:$PATH" "$here/fips-exit" down >/dev/null || fail "down with empty objects in ip's list of links"
+"$here/fips-exit" down >/dev/null || fail "down with empty objects in ip's list of links"
 ip link show fx55667788 >/dev/null 2>&1 && fail "down left an old fx tunnel device"
 ip route show dev fipsexit0 | grep -q . && fail "routes left after down"
 ip -6 rule show | grep -q "lookup 5170" && fail "rule left after down"
 nft list table inet fips_exit >/dev/null 2>&1 && fail "table left after down"
 ok "down removes everything"
+
+# ================================ ACCESS=paid ==================================
+# The same exit as a paid one: besides the clients on the list it carries the
+# members of accounts, each for the bytes its account was granted. Nothing
+# here sells anything; the accounts are made over the socket as a payment
+# service would make them.
+#
+# This half also has fips's own firewall in front of the daemon, as fips
+# ships it (packaging/common/fips.nft): what arrives on the mesh interface is
+# dropped unless a drop-in admits it. A stand-in with the same rules, and
+# neighbour discovery let through, because this "mesh" is a bridge. The
+# script writes its drop-in beside it. The first half has no firewall at
+# all, so that what is refused there is refused by the daemon.
+fw="$FIPS_EXIT_DIR/fips"
+mkdir -p "$fw/fips.d"
+cat > "$fw/fips.nft" <<NFT
+add table inet fips
+flush table inet fips
+table inet fips {
+    chain inbound {
+        type filter hook input priority 0; policy accept;
+        iifname != "fips0" return
+        ct state established,related accept
+        meta nfproto ipv6 icmpv6 type { echo-request, nd-neighbor-solicit, nd-neighbor-advert } accept
+        include "$fw/fips.d/*.nft"
+        counter drop
+    }
+}
+NFT
+nft -f "$fw/fips.nft"
+conf() { printf "WAN=wan\nFIPS_FIREWALL=$fw/fips.nft\nBLOCK_CIDRS=9.9.9.0/24\n$1" > "$FIPS_EXIT_DIR/config"; }
+conf "ACCESS=nonsense\n"
+"$here/fips-exit" up >/dev/null 2>&1 && fail "up accepted an ACCESS that is neither word"
+"$here/fips-exit" down >/dev/null || fail "down was stopped by a config that up refuses"
+conf "ACCESS=paid\n"
+# The daemon reads ACCESS when it starts. This one was started without it and
+# has no socket where the script looks: nothing may be opened for it.
+out=$("$here/fips-exit" up 2>&1) && fail "up in paid mode went ahead without the daemon's socket"
+case "$out" in *"no control socket"*) ;; *) fail "up without the socket said: $out" ;; esac
+nft list table inet fips_exit >/dev/null 2>&1 && fail "a table was made for a daemon without a socket"
+ok "paid mode is refused while the daemon was not started for it"
+
+# As the unit starts it: the config as its environment, the socket in /run.
+kill $daemon_pid
+for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 || break; sleep 0.2; done
+mkdir -m 750 /run/fips-exit
+sock=/run/fips-exit/control.sock
+ACCESS=paid DNS_UPSTREAMS=8.8.8.2 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>>"$FIPS_EXIT_DIR/daemon.log" &
+daemon_pid=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && break; sleep 0.2; done
+ip netns exec inet python3 "$FIPS_EXIT_DIR/dns.py" &
+
+# A host that is in the clients' range itself cannot route all of it to them.
+ip addr add 100.70.0.1/24 dev wan
+out=$("$here/fips-exit" up 2>&1) && fail "up in paid mode on a host inside 100.64.0.0/10"
+case "$out" in *"100.70.0.1 on wan"*) ;; *) fail "up on such a host said: $out" ;; esac
+ip addr del 100.70.0.1/24 dev wan
+"$here/fips-exit" up >/dev/null
+ip route show dev fipsexit0 | grep -q "^100.64.0.0/10 " || fail "routes in paid mode: $(ip route show dev fipsexit0)"
+ip -6 rule show | grep "lookup 5170" | grep -q "iif wan" || fail "rule in paid mode: $(ip -6 rule show | grep 5170)"
+case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver=1") ;; *) fail "stat: $(ctl stat)" ;; esac
+# What it opened in fips's firewall: the tunnel and the resolver, to this
+# node's own address, from anyone. Admission is the daemon's alone now.
+grep -qx "ip6 daddr $E ip6 nexthdr { 4, 41, 44 } accept" "$fw/fips.d/fips-exit.nft" || fail "drop-in: $(cat "$fw/fips.d/fips-exit.nft")"
+grep -qx "ip6 daddr $E udp dport 53 accept" "$fw/fips.d/fips-exit.nft" || fail "drop-in: $(cat "$fw/fips.d/fips-exit.nft")"
+ok "paid mode starts where the clients' range is free, and not where the host uses it"
+
+# --- nobody is carried for being on the mesh ------------------------------------
+[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A NODE WITHOUT AN ACCOUNT WAS CARRIED"
+[ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a node without an account got DNS"
+[ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "a client on the list, in paid mode"
+ok "paid mode carries the clients on the list, and no node that has no account"
+
+# --- two members share an account, to the byte -------------------------------------
+# 400 bytes. A request is 31 (20 + 8 + "100") and its answer 128: two
+# exchanges fit, the third crosses the line with its answer, and that was the
+# last, for both members. A name is answered and not counted.
+[ "$(ctl "check $C3")" = "ok free v4" ] || fail "check: $(ctl "check $C3")"
+[ "$(ctl "put pkg 400 0 0 $C3,$C1,$C2")" = "ok $C3=v4 $C1=v4 $C2=static" ] || fail "put: $(ctl "check $C3")"
+r=$(resolve c3 $C3 example.com)
+[ "${r% size=*}" = "answers=1 rcode=0 tc=0" ] || fail "a member's DNS query: $r"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member's first exchange"
+[ "$(ask c1 4 8.8.8.2 100)" = 100 ] || fail "the other member's exchange"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "the exchange that crosses the line"
+[ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "A MEMBER WAS CARRIED PAST ITS ACCOUNT'S GRANT"
+[ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a member without bytes left got DNS"
+[ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "a client on the list, also a member"
+[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384\nok 1')" ] || fail "usage: $(ctl usage)"
+# The same put again, as after a lost answer, takes nothing back.
+[ "$(ctl "put pkg 400 0 0 $C3,$C1,$C2")" = "ok $C3=v4 $C1=v4 $C2=static" ] || fail "put again"
+[ "$(ctl "usage pkg")" = "$(printf 'account pkg 400 93 384\nok 1')" ] || fail "a repeated put changed the count: $(ctl usage)"
+ok "members share their account's bytes, counted exactly, and are carried no further"
+
+# --- what a member gets, and what it does not ---------------------------------------
+[ "$(ctl "grant pkg 1000000")" = ok ] || fail "grant"
+[ "$(ask c3 6 2001:4860:1::2 100)" = 100 ] || fail "a member over IPv6"
+[ "$(ask c3 4 8.8.8.2 1252)" = 1252 ] || fail "a 1280-byte packet towards a member"
+[ "$(fetch c3 8.8.8.2)" = 200000 ] || fail "TCP for a member"
+# The internet only, as for any client; and no mail between servers, which
+# the clients on the list may send.
+[ "$(ask c3 4 192.168.77.2 100)" = timeout ] || fail "A MEMBER REACHED A PRIVATE ADDRESS ON THE UPLINK'S LAN"
+ip netns exec c3 ping -c 1 -W 1 -q $C2V4 >/dev/null 2>&1 && fail "a member reached another client"
+[ -z "$(fetch c3 8.8.8.2 25)" ] || fail "A MEMBER REACHED PORT 25"
+[ "$(fetch c2 8.8.8.2 25)" = 200000 ] || fail "a client on the list and port 25"
+"$here/fips-exit" accounts | grep -Eq "^pkg +1000000 +[0-9]+ +[0-9]+ +[0-9]+$" || fail "accounts: $("$here/fips-exit" accounts)"
+ok "a member reaches the internet in both families and nothing else, and not port 25"
+
+# --- the list changes, the accounts stay --------------------------------------------
+before=$(ctl "usage pkg")
+"$here/fips-exit" add $C1 phone-one >/dev/null
+[ "$(ctl "usage pkg")" = "$before" ] || fail "THE ACCOUNT CHANGED AT A RELOAD: $(ctl usage)"
+[ "$(ctl "check $C1")" = "ok static" ] || fail "check: $(ctl "check $C1")"
+[ "$(ask c1 4 8.8.8.2 100)" = 100 ] || fail "a member that was put on the list"
+[ "$(ctl "usage pkg")" = "$before" ] || fail "a client on the list was counted: $(ctl usage)"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member after the list was read again"
+ok "an account outlives a reload of the list, and a client on the list is not counted"
+
+# --- back to the list alone, and away -------------------------------------------------
+conf ""
+"$here/fips-exit" up >/dev/null
+ip route show dev fipsexit0 | grep -q "100.64.0.0/10" && fail "the clients' whole range is still routed after paid mode"
+ip -6 rule show | grep "lookup 5170" | grep -q "iif wan" && fail "paid mode's rule is still there"
+grep -q "daddr" "$fw/fips.d/fips-exit.nft" && fail "fips's firewall is still open to the mesh: $(cat "$fw/fips.d/fips-exit.nft")"
+[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "a member was served without paid mode"
+# The daemon would still answer this member, whose account has bytes: here it
+# is fips's firewall alone that keeps its query out.
+[ "$(resolve c3 $C3 example.com)" = timeout ] || fail "fips's firewall let a member's query through without paid mode"
+[ "$(ask c1 4 8.8.8.2 100)" = 100 ] || fail "a client on the list after paid mode, through fips's firewall"
+r=$(resolve c1 $C1 example.com)
+[ "${r% size=*}" = "answers=1 rcode=0 tc=0" ] || fail "a listed client's DNS through fips's firewall: $r"
+conf "ACCESS=paid\n"
+"$here/fips-exit" up >/dev/null
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member after paid mode came back"
+"$here/fips-exit" down >/dev/null
+ip route show dev fipsexit0 | grep -q . && fail "routes left after down in paid mode"
+ip -6 rule show | grep -q "lookup 5170" && fail "rule left after down in paid mode"
+ip -6 route show table 5170 2>/dev/null | grep -q . && fail "IPv6 routes left after down in paid mode"
+nft list table inet fips_exit >/dev/null 2>&1 && fail "table left after down in paid mode"
+[ -e "$fw/fips.d/fips-exit.nft" ] && fail "the drop-in in fips's firewall was left after down"
+ok "leaving paid mode, and down, remove what it made"
+
+# --- without a resolver, port 53 stays shut --------------------------------------
+# Whatever else listened there would otherwise be open to the whole mesh.
+kill $daemon_pid
+for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 || break; sleep 0.2; done
+ACCESS=paid DNS_UPSTREAMS=off "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>>"$FIPS_EXIT_DIR/daemon.log" &
+for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && break; sleep 0.2; done
+"$here/fips-exit" up >/dev/null
+case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver=0") ;; *) fail "stat without a resolver: $(ctl stat)" ;; esac
+grep -q "nexthdr { 4, 41, 44 } accept" "$fw/fips.d/fips-exit.nft" || fail "drop-in: $(cat "$fw/fips.d/fips-exit.nft")"
+grep -q "dport 53" "$fw/fips.d/fips-exit.nft" && fail "PORT 53 WAS OPENED TO THE MESH WITH NO RESOLVER BEHIND IT"
+"$here/fips-exit" down >/dev/null
+ok "port 53 is opened to the mesh only while the daemon's resolver runs"
 echo PASS

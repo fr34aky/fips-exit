@@ -14,6 +14,7 @@ NAT to the uplink, and the firewall.
   fips-exit up                             apply the client list (needs fips-exitd running)
   fips-exit down                           remove everything this script made
   fips-exit status                         what is in place right now
+  fips-exit accounts                       who else is carried, and for how much (ACCESS=paid)
 
 Needs root, iproute2, nftables, and fips-exitd (systemctl start fips-exit).
 """
@@ -22,17 +23,24 @@ import hashlib
 import ipaddress
 import json
 import os
+import socket
 import subprocess
 import sys
+import time
 
 DIR = os.environ.get("FIPS_EXIT_DIR", "/etc/fips-exit")
 CLIENTS = os.path.join(DIR, "clients")
 CONFIG = os.path.join(DIR, "config")
 
+# The daemon's socket for accounts, when the config says ACCESS=paid.
+CONTROL = os.environ.get("FIPS_EXIT_CONTROL", "/run/fips-exit/control.sock")
+
 TABLE = "fips_exit"  # nftables table (inet)
 ROUTE_TABLE = "5170"  # per-client IPv6 return routes
 RULE_PRIORITY = "5170"
 MESH = ipaddress.ip_network("fd00::/8")
+# Where every client's inner IPv4 address is (inner_ipv4 below).
+INNER4 = ipaddress.ip_network("100.64.0.0/10")
 
 # A mesh packet is at most 1280 bytes, so an inner packet beside the 40-byte
 # outer header travels whole up to 1240 and as two fragments above that. TCP
@@ -222,8 +230,10 @@ def save_clients(clients):
 def load_config():
     # TUN: the daemon's device. FIPS_FIREWALL: fips's own nftables file
     # (default-deny input on its TUN); empty = leave it alone.
+    # ACCESS: who is carried. allow-list: the clients on the list. paid:
+    # those, and the members of the accounts something makes in the daemon.
     config = {"MESH_IF": "fips0", "WAN": "", "TUN": "fipsexit0",
-              "FIPS_FIREWALL": "/etc/fips/fips.nft"}
+              "FIPS_FIREWALL": "/etc/fips/fips.nft", "ACCESS": "allow-list"}
     try:
         for line in open(CONFIG):
             key, _, value = line.split("#")[0].partition("=")
@@ -232,6 +242,45 @@ def load_config():
     except FileNotFoundError:
         pass
     return config
+
+
+def paid(config):
+    return config["ACCESS"] == "paid"
+
+
+def control(line, wait=0.0):
+    """One command to the daemon's control socket; its answer as lines, the
+    last of which begins `ok` or `err`. None when there is no daemon on the
+    socket within `wait` seconds: it makes the socket a moment after its
+    TUN device, which is what `up` at the start of the service waits for."""
+    deadline = time.monotonic() + wait
+    while True:
+        peer = socket.socket(socket.AF_UNIX)
+        peer.settimeout(5)
+        try:
+            peer.connect(CONTROL)
+            peer.sendall(line.encode() + b"\n")
+            peer.shutdown(socket.SHUT_WR)
+            answer = b""
+            while True:
+                data = peer.recv(65536)
+                if not data:
+                    return answer.decode().splitlines()
+                answer += data
+        except OSError:
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.2)
+        finally:
+            peer.close()
+
+
+def daemon_stat(wait=0.0):
+    """The daemon's `stat` as a dict, or None when it has no socket."""
+    answer = control("stat", wait)
+    if not answer or not answer[-1].startswith("ok "):
+        return None
+    return dict(field.split("=", 1) for field in answer[-1].split()[1:] if "=" in field)
 
 
 def uplink(config):
@@ -255,6 +304,43 @@ def mesh_address(config):
             if address in MESH:
                 return address
     die(f"{config['MESH_IF']} has no fips address")
+
+
+def inner_range_in_use(config):
+    """What on this host already uses 100.64.0.0/10, other than the tunnel.
+
+    In paid mode the whole range is routed to the TUN device, since the
+    members are not known in advance. On a host that is in that range
+    itself (an uplink behind carrier-grade NAT, Tailscale, a resolver at
+    100.100.100.100), that route would take the host's own traffic."""
+    tun, found = config["TUN"], []
+    for interface in json.loads(run("ip", "-j", "-4", "addr", "show").stdout or "[]"):
+        if interface.get("ifname") in (None, tun):
+            continue
+        for info in interface.get("addr_info", []):
+            if info.get("local") and ipaddress.IPv4Address(info["local"]) in INNER4:
+                found.append(f"the address {info['local']} on {interface['ifname']}")
+    for route in json.loads(run("ip", "-j", "-4", "route", "show").stdout or "[]"):
+        dst = route.get("dst")
+        if dst in (None, "default") or route.get("dev") == tun:
+            continue
+        if ipaddress.ip_network(dst, strict=False).overlaps(INNER4):
+            found.append(f"the route {dst} via {route.get('dev')}")
+    # The daemon's resolvers, as it reads them (src/main.rs, dns_upstreams).
+    named = config.get("DNS_UPSTREAMS", "").replace(",", " ").split()
+    if not named:
+        try:
+            named = [line.split()[1].split("%")[0] for line in open("/etc/resolv.conf")
+                     if line.split("#")[0].split()[:1] == ["nameserver"] and len(line.split()) > 1]
+        except OSError:
+            named = []
+    for text in named:
+        try:
+            if ipaddress.ip_address(text) in INNER4:
+                found.append(f"the resolver {text}")
+        except ValueError:
+            pass
+    return found
 
 
 def tun_present(config):
@@ -299,13 +385,31 @@ def ruleset(clients, config, wan):
     set4 = ", ".join(str(inner_ipv4(a)) for a, _ in clients)
     set6 = ", ".join(str(a) for a, _ in clients)
     blocked4, blocked6 = blocked(config)
+    if paid(config):
+        # The members of an account are not known here, so anything from the
+        # clients' ranges may pass: the daemon has already admitted it, for
+        # each packet, and is the only place where that is decided.
+        from4, from6 = f"ip saddr != {INNER4} drop", f"ip6 saddr != {MESH} drop"
+        # Mail between servers is not for someone who bought access. The
+        # clients on the list are the operator's own.
+        members_only = ("ip saddr != @clients4 tcp dport 25 drop\n"
+                        "        ip6 saddr != @clients6 tcp dport 25 drop")
+        # The answer is recognised by what it quotes (the next header of the
+        # packet inside the ICMPv6 message: bytes 8 + 6), whoever it is for.
+        unreachable = (f'oifname "{mesh}" icmpv6 type destination-unreachable icmpv6 code port-unreachable '
+                       "@th,112,8 { 4, 41 } drop")
+    else:
+        from4, from6 = "ip saddr != @clients4 drop", "ip6 saddr != @clients6 drop"
+        members_only = ""
+        unreachable = (f'oifname "{mesh}" ip6 daddr @clients6 icmpv6 type destination-unreachable '
+                       "icmpv6 code port-unreachable drop")
     return f"""
 table inet {TABLE}
 delete table inet {TABLE}
 table inet {TABLE} {{
-    # The clients' inner addresses. The daemon already admits a packet only
-    # from the client its source address belongs to; this is the same list
-    # for the rules below.
+    # The inner addresses of the clients on the list. The daemon already
+    # admits a packet only from the client its source address belongs to;
+    # this is the same list for the rules below.
     set clients4 {{
         type ipv4_addr
         {"elements = { " + set4 + " }" if set4 else ""}
@@ -335,13 +439,14 @@ table inet {TABLE} {{
         oifname "{tun}" jump to_client
     }}
     chain from_client {{
-        meta nfproto ipv4 ip saddr != @clients4 drop
-        meta nfproto ipv6 ip6 saddr != @clients6 drop
+        meta nfproto ipv4 {from4}
+        meta nfproto ipv6 {from6}
         # The internet only: not this host's other networks, not each other,
         # and not the uplink's own LAN or anything else that is not public.
         oifname != "{wan}" drop
         ip daddr @blocked4 drop
         ip6 daddr @blocked6 drop
+        {members_only}
         meta nfproto ipv4 tcp flags syn tcp option maxseg size > {MSS4} tcp option maxseg size set {MSS4}
         meta nfproto ipv6 tcp flags syn tcp option maxseg size > {MSS6} tcp option maxseg size set {MSS6}
         accept
@@ -362,7 +467,7 @@ table inet {TABLE} {{
     # because no kernel tunnel matches it. Those go nowhere.
     chain output {{
         type filter hook output priority filter; policy accept;
-        oifname "{mesh}" ip6 daddr @clients6 icmpv6 type destination-unreachable icmpv6 code port-unreachable drop
+        {unreachable}
     }}
     chain nat {{
         type nat hook postrouting priority srcnat; policy accept;
@@ -375,6 +480,11 @@ table inet {TABLE} {{
 UFW_TAG = "fips-exit"
 
 
+def resolver_runs():
+    stat = daemon_stat()
+    return bool(stat) and stat.get("resolver") == "1"
+
+
 def fips_firewall(clients, config, on):
     """Let the clients' tunnel packets through fips's own firewall.
 
@@ -382,6 +492,12 @@ def fips_firewall(clients, config, on):
     under fips.d allows it. Ours admits IP-in-IPv6 (and its fragments) and
     DNS queries (UDP port 53, for the daemon's resolver) from the clients'
     addresses, and nothing else.
+
+    In paid mode the clients' addresses are not known here, so both are
+    admitted from any node of the mesh, to this node's own address: the
+    firewall is then no second lock in front of the daemon. Port 53 is
+    opened only while the daemon says its resolver runs, or whatever else
+    listens there would be open to the mesh.
     """
     firewall = config["FIPS_FIREWALL"]
     dropin = os.path.join(os.path.dirname(firewall), "fips.d", "fips-exit.nft")
@@ -389,7 +505,13 @@ def fips_firewall(clients, config, on):
         return
     before = open(dropin).read() if os.path.exists(dropin) else None
     rule = None
-    if on and clients:
+    if on and paid(config):
+        here = mesh_address(config)
+        rule = ("# Written by fips-exit; do not edit.\n"
+                f"ip6 daddr {here} ip6 nexthdr {{ 4, 41, 44 }} accept\n")
+        if resolver_runs():
+            rule += f"ip6 daddr {here} udp dport 53 accept\n"
+    elif on and clients:
         addresses = ", ".join(str(a) for a, _ in clients)
         # The tunnel, and the clients' DNS queries to the daemon's resolver.
         rule = ("# Written by fips-exit; do not edit.\n"
@@ -419,16 +541,23 @@ def ufw(clients, config, on):
         listed = run(tool, "-S", chain, check=False)
         return listed.stdout.splitlines() if listed.returncode == 0 else None
 
-    wanted = {
-        ("ip6tables", "ufw6-before-input"): [
+    if on and paid(config):
+        # From any node of the mesh, to this node's own address: see
+        # fips_firewall.
+        here = str(mesh_address(config))
+        to_daemon = [["-i", config["MESH_IF"], "-d", here, "-p", proto, "-j", "ACCEPT"] for proto in ("4", "41")]
+        if resolver_runs():
+            to_daemon.append(["-i", config["MESH_IF"], "-d", here, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+    else:
+        to_daemon = [
             ["-i", config["MESH_IF"], "-s", str(a), "-p", proto, "-j", "ACCEPT"]
             for a, _ in clients for proto in ("4", "41")
         ] + [
             # DNS queries to the daemon's resolver.
             ["-i", config["MESH_IF"], "-s", str(a), "-p", "udp", "--dport", "53", "-j", "ACCEPT"]
             for a, _ in clients
-        ],
-    }
+        ]
+    wanted = {("ip6tables", "ufw6-before-input"): to_daemon}
     for tool, chain in (("iptables", "ufw-before-forward"), ("ip6tables", "ufw6-before-forward")):
         wanted[(tool, chain)] = [["-i", config["TUN"], "-j", "ACCEPT"], ["-o", config["TUN"], "-j", "ACCEPT"]]
     for (tool, chain), specs in wanted.items():
@@ -445,11 +574,26 @@ def ufw(clients, config, on):
 
 def cmd_up():
     config = load_config()
+    # A word that is neither must not quietly mean one of them. Said here
+    # and not where the config is read: `down` reads it too, and must not
+    # be stopped by it.
+    if config["ACCESS"] not in ("allow-list", "paid"):
+        die(f"ACCESS={config['ACCESS']} in {CONFIG}: allow-list or paid")
     clients = served(load_clients())
     wan = uplink(config)
     tun = config["TUN"]
     if not tun_present(config):
         die(f"no interface {tun}: fips-exitd is not running (systemctl start fips-exit)")
+    if paid(config):
+        # The daemon reads ACCESS when it starts; one that was started
+        # before the config said paid has no socket, and carries no member.
+        if daemon_stat(wait=5) is None:
+            die(f"ACCESS=paid, but fips-exitd has no control socket at {CONTROL}: "
+                "systemctl restart fips-exit")
+        in_use = inner_range_in_use(config)
+        if in_use:
+            die(f"ACCESS=paid routes all of {INNER4} to the clients, and this host uses it: "
+                + "; ".join(in_use) + ". Such a host cannot be a paid exit.")
 
     sysctl("net.ipv4.ip_forward", "1")
     sysctl("net.ipv6.conf.all.forwarding", "1")
@@ -468,21 +612,36 @@ def cmd_up():
     # which the main table routes into the mesh as it is. Forwarded packets
     # (never this host's own, so not the daemon's) look here first and find
     # the tunnel.
+    #
+    # In paid mode the members are not known here, so the routes are the
+    # clients' whole ranges, and what the daemon finds no client for it
+    # drops. The IPv6 one is then looked at for what arrives on the uplink
+    # only, which is where a reply comes from: for everything forwarded it
+    # would take every packet to a unique-local address, a container's or a
+    # LAN's behind a fips gateway as well.
+    if paid(config):
+        select, routes4, routes6 = ["iif", wan], [str(INNER4)], [str(MESH)]
+    else:
+        select = ["not", "iif", "lo"]
+        routes4 = [str(inner_ipv4(a)) for a, _ in clients]
+        routes6 = [str(a) for a, _ in clients]
     run("ip", "-6", "rule", "del", "priority", RULE_PRIORITY, check=False)
-    run("ip", "-6", "rule", "add", "not", "iif", "lo", "to", str(MESH),
+    run("ip", "-6", "rule", "add", *select, "to", str(MESH),
         "lookup", ROUTE_TABLE, "priority", RULE_PRIORITY)
     run("ip", "-6", "route", "flush", "table", ROUTE_TABLE, check=False)
-    wanted4 = {str(inner_ipv4(a)) for a, _ in clients}
+    for route in routes4:
+        run("ip", "route", "replace", route, "dev", tun)
+    for route in routes6:
+        run("ip", "-6", "route", "replace", route, "dev", tun, "table", ROUTE_TABLE)
+    # What an earlier `up` left: another client's route, or the other mode's.
     for route in json.loads(run("ip", "-j", "route", "show", "dev", tun).stdout or "[]"):
-        if route.get("dst") and route["dst"] not in wanted4:
+        if route.get("dst") and route["dst"] not in routes4:
             run("ip", "route", "del", route["dst"], "dev", tun)
-    for address, _ in clients:
-        run("ip", "route", "replace", str(inner_ipv4(address)), "dev", tun)
-        run("ip", "-6", "route", "replace", str(address), "dev", tun, "table", ROUTE_TABLE)
 
     # The daemon re-reads the client list on SIGHUP.
     run("pkill", "-HUP", "-x", "fips-exitd", check=False)
-    print(f"fips-exit: up, {len(clients)} client(s), uplink {wan}, tunnel {tun}")
+    also = ", and the members of accounts" if paid(config) else ""
+    print(f"fips-exit: up, {len(clients)} client(s){also}, uplink {wan}, tunnel {tun}")
 
 
 def cmd_down():
@@ -555,11 +714,31 @@ def cmd_status():
         print(f"{config['TUN']}: {stats['rx']['packets']} packets from clients, "
               f"{stats['tx']['packets']} to clients")
     print(f"clients: {len(load_clients())}")
+    if paid(config):
+        stat = daemon_stat()
+        print("access: paid, " + (f"{stat.get('accounts', '?')} account(s)" if stat
+                                  else f"but the daemon has no control socket at {CONTROL}"))
+
+
+def cmd_accounts():
+    """The accounts the daemon holds: what each may use and has used."""
+    if not paid(load_config()):
+        die(f"no accounts: ACCESS is not paid in {CONFIG}")
+    answer = control("usage")
+    if not answer or not answer[-1].startswith("ok"):
+        die(f"no answer from fips-exitd on {CONTROL}" + (f": {answer[-1]}" if answer else ""))
+    rows = [line.split()[1:] for line in answer[:-1] if line.startswith("account ")]
+    print(f"{'account':<32} {'granted':>15} {'from members':>15} {'to members':>15} {'left':>15}")
+    for name, granted, used_in, used_out in rows:
+        left = max(0, int(granted) - int(used_in) - int(used_out))
+        print(f"{name:<32} {granted:>15} {used_in:>15} {used_out:>15} {left:>15}")
+    if not rows:
+        print("(none)")
 
 
 def main(argv):
     commands = {"up": cmd_up, "down": cmd_down, "add": cmd_add, "remove": cmd_remove,
-                "list": cmd_list, "status": cmd_status}
+                "list": cmd_list, "status": cmd_status, "accounts": cmd_accounts}
     if len(argv) < 2 or argv[1] not in commands:
         sys.exit(__doc__)
     try:

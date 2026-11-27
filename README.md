@@ -65,10 +65,12 @@ script sends. The list is `/etc/fips-exit/clients`. `/etc/fips-exit/config`
 takes `WAN=<interface>` (default: the interface of the default route),
 `MESH_IF=<interface>` (default `fips0`), `TUN=<name>` (default `fipsexit0`)
 `BLOCK_CIDRS=<networks>` (IPv4 or IPv6, space separated: further
-destinations no client may reach) and `DNS_UPSTREAMS=<addresses>` (the
+destinations no client may reach), `DNS_UPSTREAMS=<addresses>` (the
 resolvers the clients' lookups are forwarded to; default: the host's
-`/etc/resolv.conf`; `off` for no DNS at all). The daemon reads the last one
-when it starts: `sudo systemctl restart fips-exit` after changing it.
+`/etc/resolv.conf`; `off` for no DNS at all) and `ACCESS=paid` (see
+*Accounts* below; default `allow-list`, the list alone). The daemon reads
+the last two when it starts: `sudo systemctl restart fips-exit` after
+changing them.
 
 On the client, enter this node's npub as the exit node. A direct fips link
 between client and exit (add the exit as a peer) keeps latency down; it is
@@ -76,11 +78,11 @@ not required.
 
 ### Accounts
 
-The daemon can also carry addresses that are not on the list, for a number
-of bytes: the *members of an account*. This is the base for selling access,
-not the selling. Nothing in this repository makes an account yet, the unit
-does not turn it on, and the script's routes and firewall are still made for
-the clients on the list only.
+With `ACCESS=paid` in the config the exit also carries addresses that are
+not on the list, for a number of bytes: the *members of an account*. This is
+the base for selling access, not the selling: nothing in this repository
+makes an account yet. Whatever does, does it over the daemon's socket,
+below.
 
 - An account has bytes granted and bytes used. Its members share them.
 - A member's packet is counted once it has been passed on: the length of the
@@ -96,10 +98,11 @@ the clients on the list only.
   minutes after its holder gave it up.
 - Accounts are kept in memory. After a restart there are none.
 
-Accounts are made over a Unix socket, which the daemon opens only when it is
-started with `--control <path>`, for root alone. One command a line; every
-answer ends in a line that begins `ok` or `err`; every number is a total, so
-that a command sent twice changes nothing.
+Accounts are made over a Unix socket, `/run/fips-exit/control.sock`, which
+the daemon opens only with `ACCESS=paid` (or `--control <path>`), for root
+alone. One command a line; every answer ends in a line that begins `ok` or
+`err`; every number is a total, so that a command sent twice changes
+nothing.
 
 ```text
 put <account> <granted> <used_in> <used_out> <address,…|->   make it, or raise its numbers; replace its members
@@ -112,6 +115,22 @@ stat                                                          epoch=<start> acco
 ```
 
 Whoever can write to that socket decides who uses the exit and for how much.
+`sudo fips-exit accounts` shows the accounts and what each has used.
+
+What `ACCESS=paid` changes on the machine, beyond what the list alone does:
+
+- **The firewalls are opened to the whole mesh, not to the listed clients.**
+  The members are not known to the script, so fips's firewall and ufw admit
+  tunnel packets (next header 4, 41 and 44) from any node of the mesh to this
+  node's fips address, and DNS queries while the daemon's resolver runs. The
+  daemon is then the only place where it is decided who is carried.
+- **All of `100.64.0.0/10` is routed to the tunnel**, and `fd00::/8` for
+  what arrives on the uplink. `up` refuses to start on a host that has an
+  address, a route or a resolver in `100.64.0.0/10` itself: that route would
+  take the host's own traffic.
+- **A member cannot connect to TCP port 25.** A client on the list can.
+- Leaving paid mode again (`ACCESS=allow-list`, restart) puts back the
+  routes and openings for the listed clients alone.
 
 ## Packet sizes
 
@@ -196,8 +215,12 @@ The second runs the daemon and the script against the real kernel, without
 root and without fips: network namespaces stand in for two clients, the
 exit and the internet, and a 1280-byte link stands in for the mesh. It
 checks both families, NAT, full-size packets in both directions, TCP, the
-binding of a client to its addresses, isolation, removal and teardown, and
-an account: its member counted to the byte and cut off at the grant.
+binding of a client to its addresses, isolation, removal and teardown. Then
+the same exit with `ACCESS=paid`, behind a stand-in for fips's firewall: no
+node without an account is carried, two members share an account counted to
+the byte and are cut off at the grant, a member reaches the internet and
+neither the uplink's LAN nor port 25, and leaving the mode removes what it
+made.
 
 ## Contributing
 

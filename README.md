@@ -90,8 +90,10 @@ the clients on the list only.
   further. The packet that crosses the line still is.
 - DNS is answered for a member while its account has bytes, and not counted.
 - A client on the list is never counted, and wins over a member with the
-  same address or the same derived IPv4 address. A member whose derived IPv4
-  address is another client's is carried for IPv6 only.
+  same address or the same derived IPv4 address, at once. A member whose
+  derived IPv4 address is another client's is carried for IPv6 only, and
+  gets the address within a minute of its becoming free, which is five
+  minutes after its holder gave it up.
 - Accounts are kept in memory. After a restart there are none.
 
 Accounts are made over a Unix socket, which the daemon opens only when it is
@@ -139,8 +141,8 @@ an optimisation, not a requirement.
   clients are answered, so it is not an open resolver for the mesh. It caches
   nothing and validates nothing: it is as good as the resolver behind it,
   which also sees the names (from the exit, not from the client). An answer
-  too large for one mesh packet is returned truncated; UDP only. At most 16
-  of one client's queries are being forwarded at a time, of 64 in all; one
+  too large for one mesh packet is returned truncated; UDP only. At most 64
+  of one client's queries are being forwarded at a time, of 256 in all; one
   more is dropped, and the client's resolver asks again.
 
 - **A client reaches the public internet and nothing else.** Not this host,

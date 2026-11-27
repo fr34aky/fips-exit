@@ -198,6 +198,10 @@ struct Clients {
     /// Inner IPv4 addresses given up: the last holder, and until when only
     /// that holder may have the address back.
     held: HashMap<[u8; 4], ([u8; 16], Instant)>,
+    /// Whether some member sits without its inner IPv4 address. It is
+    /// seated again from time to time ([`Clients::seat_all`]), and gets the
+    /// address once nobody holds it and nobody is waited for.
+    waiting: bool,
 }
 
 /// The operator's list: `<fips address> [name]` per line, `#` comments. A
@@ -254,10 +258,14 @@ impl Clients {
     /// Replace the operator's list and leave the accounts as they are. A
     /// client on the list wins over a member: it takes the member's place
     /// when it is the same address, and the inner IPv4 address when that is
-    /// what they share. A member that a removed line was in front of is
-    /// seated again.
+    /// what they share. It takes them at once, with no wait: the list is the
+    /// operator's word, and what was still on its way to the member then
+    /// reaches a client of the operator's own.
+    ///
+    /// A member that a removed line stood in front of is seated again, with
+    /// its own address at once, and with an inner IPv4 address the removed
+    /// client held once the wait for that client is over.
     fn set_list(&mut self, list: Vec<[u8; 16]>, now: Instant) {
-        self.held.retain(|_, (_, until)| now < *until);
         let old: Vec<[u8; 16]> =
             self.by_v6.iter().filter(|(_, client)| matches!(client, Client::Static)).map(|(addr, _)| *addr).collect();
         for addr in &old {
@@ -269,6 +277,16 @@ impl Clients {
             self.held.remove(&inner_ipv4(addr));
         }
         self.listed = list.len();
+        self.seat_all(now);
+    }
+
+    /// Seat every account's members again. A member that sits keeps what it
+    /// has; one that waited for its inner IPv4 address gets it if it is
+    /// free by now. Done when the list changes, and once a minute while
+    /// someone waits.
+    fn seat_all(&mut self, now: Instant) {
+        self.held.retain(|_, (_, until)| now < *until);
+        self.waiting = false;
         let names: Vec<String> = self.accounts.keys().cloned().collect();
         for name in names {
             self.seat(&name, now);
@@ -314,6 +332,7 @@ impl Clients {
                     true
                 }
             };
+            self.waiting |= !has_v4;
             seats.push((addr, if has_v4 { Seat::V4 } else { Seat::No4 }));
         }
         seats
@@ -800,11 +819,13 @@ const DNS_MAX_REPLY: usize = 1232;
 const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 /// Queries being forwarded at once. Each is a thread waiting on a socket;
 /// beyond this a query is dropped and the client's resolver asks again.
-const DNS_IN_FLIGHT: usize = 64;
+const DNS_IN_FLIGHT: usize = 256;
 /// And of those, the most for one client. A query whose upstreams are all
 /// silent holds its place for their timeouts together; without this, one
 /// client asking fast enough has every place and nobody else gets a name.
-const DNS_IN_FLIGHT_PER_CLIENT: usize = 16;
+/// 64 is what the whole exit had before clients were counted one by one, so
+/// a client on its own is refused nothing it was given then.
+const DNS_IN_FLIGHT_PER_CLIENT: usize = 64;
 
 /// The resolvers to forward to, from `DNS_UPSTREAMS` (IP addresses, spaces
 /// or commas between them) or, when that is unset, the host's
@@ -1209,10 +1230,11 @@ enum Line {
 }
 
 /// Read one line into `line`, without its end: at most [`CONTROL_MAX_LINE`]
-/// bytes, and all of it within [`CONTROL_TIMEOUT`].
+/// bytes, and all of it within [`CONTROL_TIMEOUT`] of its first byte. (The
+/// wait for that first byte is the socket's own timeout, the same length.)
 fn read_line(reader: &mut BufReader<&UnixStream>, line: &mut Vec<u8>) -> Line {
     line.clear();
-    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    let mut deadline = None;
     loop {
         let available = match reader.fill_buf() {
             Ok(available) => available,
@@ -1234,7 +1256,7 @@ fn read_line(reader: &mut BufReader<&UnixStream>, line: &mut Vec<u8>) -> Line {
         if ended {
             return Line::Read;
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= *deadline.get_or_insert_with(|| Instant::now() + CONTROL_TIMEOUT) {
             return Line::Over;
         }
     }
@@ -1275,14 +1297,27 @@ impl Drop for Place {
 }
 
 /// The control socket: a thread for each peer, [`CONTROL_CONNECTIONS`] at
-/// most. Returns only if the socket fails.
-fn serve_control(state: Arc<State>, listener: UnixListener) -> io::Error {
+/// most. Never returns. A peer that cannot be taken (no descriptor left, no
+/// memory) is said once and the next one is waited for: to stop listening
+/// would leave the accounts as they are, with nothing left that could
+/// change them or read them.
+fn serve_control(state: Arc<State>, listener: UnixListener) -> ! {
     let open = Arc::new(AtomicUsize::new(0));
+    let mut failing = false;
     loop {
         let stream = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return e,
+            Ok((stream, _)) => {
+                failing = false;
+                stream
+            }
+            Err(e) => {
+                if !failing {
+                    eprintln!("fips-exitd: control socket: {e}; trying again");
+                }
+                failing = true;
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
         };
         // Counted down when the session ends, however it ends.
         let place = Place(open.clone());
@@ -1290,7 +1325,9 @@ fn serve_control(state: Arc<State>, listener: UnixListener) -> io::Error {
             continue;
         }
         let state = state.clone();
-        std::thread::spawn(move || {
+        // A thread that cannot be started is that peer's loss, like a place
+        // that is taken: the peer is closed and its place given back.
+        let _ = std::thread::Builder::new().spawn(move || {
             let _place = place;
             control_session(&state, &stream);
         });
@@ -1379,10 +1416,7 @@ fn run() -> Result<(), String> {
             Ok(listener) => {
                 eprintln!("fips-exitd: accounts over {}", args.control);
                 let state = state.clone();
-                std::thread::spawn(move || {
-                    let e = serve_control(state, listener);
-                    eprintln!("fips-exitd: NO ACCOUNTS: control socket: {e}");
-                });
+                std::thread::spawn(move || serve_control(state, listener));
             }
             Err(e) => eprintln!("fips-exitd: NO ACCOUNTS: {}: {e}", args.control),
         }
@@ -1430,6 +1464,11 @@ fn run() -> Result<(), String> {
             loop {
                 std::thread::sleep(Duration::from_secs(60));
                 state.reload_if_asked();
+                // A member that waits for its inner IPv4 address has it
+                // within a minute of its becoming free.
+                if state.clients().waiting {
+                    state.clients_mut().seat_all(Instant::now());
+                }
                 let c = &state.counters;
                 let now = (
                     c.to_internet.load(Ordering::Relaxed),
@@ -1752,11 +1791,44 @@ mod tests {
         assert_eq!(at(&mut c, &format!("put two 100 0 0 {rival}"), t0), format!("ok {rival}=no4\n"));
         // The last holder may have it back at once.
         assert_eq!(at(&mut c, &format!("check {C}"), t0), "ok free v4\n");
-        // After the wait the other gets it, the next time its account is put.
+        assert!(c.waiting);
+        // Seated again before the wait is over: still without it.
+        c.seat_all(t0 + HOLD_DOWN - Duration::from_secs(1));
+        assert_eq!(at(&mut c, &format!("check {rival}"), t0), "ok member two no4\n");
+        assert!(c.waiting);
+        // After the wait the other gets it, without anyone asking: the
+        // daemon seats those who wait once a minute.
         let later = t0 + HOLD_DOWN + Duration::from_secs(1);
-        assert_eq!(at(&mut c, &format!("check {rival}"), later), "ok member two no4\n");
-        assert_eq!(at(&mut c, &format!("put two 100 0 0 {rival}"), later), format!("ok {rival}=v4\n"));
+        c.seat_all(later);
+        assert_eq!(at(&mut c, &format!("check {rival}"), later), "ok member two v4\n");
+        assert!(!c.waiting && c.held.is_empty());
+        let packet = v4(inner_ipv4(&addr(rival)), [1, 1, 1, 1], 60);
+        assert!(c.admits(PROTO_IPV4, &addr(rival), &packet).carried().is_some());
         assert_eq!(at(&mut c, &format!("put one 100 0 0 {C}"), later), format!("ok {C}=no4\n"));
+        assert!(c.waiting);
+    }
+
+    /// A member that shares its inner IPv4 address with a client on the
+    /// list has it once that client is off the list and the wait for it is
+    /// over; and a client put on the list takes it from a member at once.
+    #[test]
+    fn a_member_gets_the_ipv4_address_a_listed_client_gave_up() {
+        let rival = "fd95:aaaa::9";
+        let (member, listed) = (addr(C), addr(rival));
+        let mut c = Clients::default();
+        let t0 = Instant::now();
+        c.set_list(vec![listed], t0);
+        assert_eq!(at(&mut c, &format!("put pkg 1000 0 0 {C}"), t0), format!("ok {C}=no4\n"));
+        c.set_list(Vec::new(), t0);
+        assert_eq!(at(&mut c, &format!("check {C}"), t0), "ok member pkg no4\n", "the wait for the removed client");
+        c.seat_all(t0 + HOLD_DOWN + Duration::from_secs(1));
+        assert_eq!(at(&mut c, &format!("check {C}"), t0), "ok member pkg v4\n");
+        assert_eq!(c.route(&v4([1, 1, 1, 1], inner_ipv4(&member), 60)).carried(), Some((PROTO_IPV4, member)));
+        // Back on the list: the operator's client has the address at once.
+        c.set_list(vec![listed], t0 + HOLD_DOWN + Duration::from_secs(2));
+        assert_eq!(c.route(&v4([1, 1, 1, 1], inner_ipv4(&member), 60)).carried(), Some((PROTO_IPV4, listed)));
+        assert_eq!(at(&mut c, &format!("check {C}"), t0), "ok member pkg no4\n");
+        assert!(c.waiting);
     }
 
     #[test]

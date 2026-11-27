@@ -120,7 +120,8 @@ IPv4 address derived from the client's fips address.
 - **Two members that derive one inner IPv4 address.** 22 bits of the fips
   address, so a clash can be found in seconds, on purpose. The first holder
   keeps the address and the other is carried for IPv6 only; an address that
-  was given up is kept from others for five minutes. Whoever makes accounts
+  was given up is kept from others for five minutes, and whoever waited for
+  it has it within a minute after that. Whoever makes accounts
   can ask first (`check`), and has to drop accounts that are finished, or
   the smallest one holds an address for ever. The remedy is a wider inner
   address, which is a change to the contract with fips2go.
@@ -158,12 +159,20 @@ IPv4 address derived from the client's fips address.
   makes the accounts keeps the books, and this errs in the client's favour.
 - Whoever can write to the control socket decides who uses the exit and for
   how many bytes. That is what the socket is for. It cannot touch the list.
+- A client put on the list takes its place, and its inner IPv4 address, from
+  a member that had either, at once and without the five minutes. The list
+  is the operator's word, and what was still on its way to the member then
+  reaches a client of the operator's own.
+- The control socket is listened on for as long as the daemon runs. A peer
+  that cannot be taken is logged once and the next one is waited for; the
+  daemon does not stop, since a restart would empty the accounts.
 - The control socket speaks lines of words, not JSON: a JSON parser written
   by hand has no place in a root daemon with one dependency.
 - A member is counted before the firewall decides, so a packet to a
   destination the exit refuses is counted and then dropped. The README says
   so.
 - DNS for a member is not counted. It is answered only while the account has
-  bytes, and each client has a limit on queries in flight.
+  bytes, and each client has a limit on queries in flight: 64, which is what
+  the whole exit had before, of 256.
 - A control socket that cannot be made is logged and the daemon keeps
   running, like the resolver.

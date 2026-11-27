@@ -183,7 +183,8 @@ because its reply was lost changes nothing.
   daemon are forgiven. That is a few seconds of traffic, in the client's
   favour.
 - Limits: a line is at most 4096 bytes; an account name is 1 to 64 of
-  `[A-Za-z0-9._-]`; a number is 1 to 20 digits without a sign; an account has
+  `[A-Za-z0-9._-]`; a number is digits only and at most a quarter of what a
+  u64 holds, so that adding real traffic to it cannot wrap; an account has
   at most 32 members; there are at most 16384 accounts; four connections at
   once, each with a five-second timeout.
 - A line the daemon cannot use gets `err <reason>` and the connection goes

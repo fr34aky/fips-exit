@@ -112,12 +112,30 @@ struct Account {
     used_in: AtomicU64,
     /// Bytes carried towards its members.
     used_out: AtomicU64,
+    /// When the account ends, whatever is left of its bytes: Unix seconds,
+    /// or 0 for no end. Unlike the other three this one can be set, by the
+    /// one command that is for it (`until`): it is a time somebody sold,
+    /// and may be put later or earlier. `put` only ever moves it later.
+    until: AtomicU64,
+}
+
+/// The time, in Unix seconds. A clock that cannot be read ends every account
+/// that has an end.
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(u64::MAX, |since| since.as_secs())
 }
 
 impl Account {
     /// May another packet be carried? The packet that crosses the line was:
     /// the overdraft is one packet for each thread that carries packets.
+    ///
+    /// And is it still its time? At the second it ends, it has ended. The
+    /// clock is asked only for an account that has an end.
     fn funded(&self) -> bool {
+        let until = self.until.load(Ordering::Relaxed);
+        if until != 0 && unix_now() >= until {
+            return false;
+        }
         let used = self.used_in.load(Ordering::Relaxed).saturating_add(self.used_out.load(Ordering::Relaxed));
         used < self.granted.load(Ordering::Relaxed)
     }
@@ -135,7 +153,8 @@ impl Account {
 enum Client {
     /// On the operator's list: carried, and not counted.
     Static,
-    /// A member of an account: carried while the account has bytes left.
+    /// A member of an account: carried while the account has bytes left,
+    /// and until its end if it has one.
     Member(Arc<Account>),
 }
 
@@ -145,7 +164,7 @@ enum Client {
 enum Verdict<T> {
     /// Not a client's packet, or not a packet.
     Refused,
-    /// A member's, whose account has no bytes left.
+    /// A member's, whose account has no bytes left, or whose time is over.
     Exhausted,
     Carry(T, Option<Arc<Account>>),
 }
@@ -400,11 +419,13 @@ impl Clients {
         &mut self,
         name: &str,
         numbers: [u64; 3],
+        until: Option<u64>,
         members: Vec<[u8; 16]>,
         now: Instant,
     ) -> Result<Seats, String> {
         self.may_join(name, &members)?;
-        if !self.accounts.contains_key(name) {
+        let made = !self.accounts.contains_key(name);
+        if made {
             if self.accounts.len() >= MAX_ACCOUNTS {
                 return Err("too-many-accounts".into());
             }
@@ -412,6 +433,26 @@ impl Clients {
         }
         if let Some(entry) = self.accounts.get(name) {
             entry.account.raise(numbers[0], numbers[1], numbers[2]);
+            // The end comes with the numbers, and before a member is
+            // seated: an account that is put again after its time must not
+            // be carried for the moment until a second command says so. On
+            // an account that was there already, a put is like its numbers
+            // and takes nothing back: it moves an end later, and neither
+            // earlier nor away. A put that arrives late, after the end was
+            // extended, must not cut the extension off. Anything else about
+            // the end is `until`'s to say.
+            match until {
+                Some(until) if made => entry.account.until.store(until, Ordering::Relaxed),
+                // (Nothing else writes the end meanwhile: this holds the
+                // table for writing, and `until` holds it for reading.)
+                Some(until) if until != 0 => {
+                    let end = entry.account.until.load(Ordering::Relaxed);
+                    if end != 0 && until > end {
+                        entry.account.until.store(until, Ordering::Relaxed);
+                    }
+                }
+                _ => {}
+            }
         }
         self.set_members(name, members, now)
     }
@@ -426,6 +467,17 @@ impl Clients {
         match self.accounts.get(name) {
             Some(entry) => {
                 entry.account.granted.fetch_max(granted, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set when an account ends: Unix seconds, or 0 for no end.
+    fn until(&self, name: &str, until: u64) -> bool {
+        match self.accounts.get(name) {
+            Some(entry) => {
+                entry.account.until.store(until, Ordering::Relaxed);
                 true
             }
             None => false,
@@ -447,18 +499,19 @@ impl Clients {
         }
     }
 
-    /// One line for each account, or for the one named: its name and its
-    /// three numbers.
+    /// One line for each account, or for the one named: its name, its
+    /// three numbers, and when it ends (0 for no end).
     fn usage(&self, name: Option<&str>) -> Vec<String> {
         self.accounts
             .iter()
             .filter(|(account, _)| name.is_none_or(|wanted| wanted == account.as_str()))
             .map(|(account, entry)| {
                 format!(
-                    "account {account} {} {} {}",
+                    "account {account} {} {} {} {}",
                     entry.account.granted.load(Ordering::Relaxed),
                     entry.account.used_in.load(Ordering::Relaxed),
-                    entry.account.used_out.load(Ordering::Relaxed)
+                    entry.account.used_out.load(Ordering::Relaxed),
+                    entry.account.until.load(Ordering::Relaxed)
                 )
             })
             .collect()
@@ -665,7 +718,8 @@ struct Counters {
     to_internet: AtomicU64,
     to_clients: AtomicU64,
     refused: AtomicU64,
-    /// Packets of members whose account had no bytes left, either way.
+    /// Packets of members whose account had no bytes left or was over,
+    /// either way.
     exhausted: AtomicU64,
     unrouted: AtomicU64,
     send_failed: AtomicU64,
@@ -1068,8 +1122,9 @@ fn serve_dns(state: Arc<State>, socket: UdpSocket, upstreams: Vec<SocketAddr>) -
 // difference, so a command sent again because its answer was lost changes
 // nothing.
 //
-//   put <account> <granted> <used_in> <used_out> <address,…|->
+//   put <account> <granted> <used_in> <used_out> <address,…|-> [until]
 //   grant <account> <granted>
+//   until <account> <unix seconds|0>
 //   members <account> <address,…|->
 //   drop <account>
 //   usage [account]
@@ -1091,8 +1146,9 @@ const MAX_NUMBER: u64 = u64::MAX / 4;
 
 #[derive(Debug, PartialEq)]
 enum Command {
-    Put { name: String, numbers: [u64; 3], members: Vec<[u8; 16]> },
+    Put { name: String, numbers: [u64; 3], members: Vec<[u8; 16]>, until: Option<u64> },
     Grant { name: String, granted: u64 },
+    Until { name: String, until: u64 },
     Members { name: String, members: Vec<[u8; 16]> },
     Drop { name: String },
     Usage { name: Option<String> },
@@ -1105,6 +1161,16 @@ fn account_name(word: &str) -> Result<String, String> {
     let fits = (1..=64).contains(&word.len())
         && word.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
     if fits { Ok(word.to_string()) } else { Err("name".into()) }
+}
+
+/// The latest end an account may have: the last second of the year 9999.
+/// Far beyond any time that is sold, and well below a time written in
+/// milliseconds or nanoseconds by mistake, which is refused for it.
+const MAX_UNTIL: u64 = 253_402_300_799;
+
+/// An account's end: Unix seconds up to [`MAX_UNTIL`], or 0 for none.
+fn end(word: &str) -> Result<u64, String> {
+    number(word).ok().filter(|until| *until <= MAX_UNTIL).ok_or_else(|| "number".into())
 }
 
 /// A count of bytes: digits only, at most [`MAX_NUMBER`].
@@ -1157,12 +1223,14 @@ fn parse_command(line: &[u8]) -> Result<Command, String> {
     }
     let words: Vec<&str> = line.split(' ').filter(|word| !word.is_empty()).collect();
     match words.as_slice() {
-        ["put", name, granted, used_in, used_out, members] => Ok(Command::Put {
+        ["put", name, granted, used_in, used_out, members, until @ ..] if until.len() <= 1 => Ok(Command::Put {
             name: account_name(name)?,
             numbers: [number(granted)?, number(used_in)?, number(used_out)?],
             members: member_list(members)?,
+            until: until.first().map(|until| end(until)).transpose()?,
         }),
         ["grant", name, granted] => Ok(Command::Grant { name: account_name(name)?, granted: number(granted)? }),
+        ["until", name, until] => Ok(Command::Until { name: account_name(name)?, until: end(until)? }),
         ["members", name, members] => {
             Ok(Command::Members { name: account_name(name)?, members: member_list(members)? })
         }
@@ -1173,7 +1241,7 @@ fn parse_command(line: &[u8]) -> Result<Command, String> {
         ["stat"] => Ok(Command::Stat),
         [] => Err("syntax".into()),
         [
-            "put" | "grant" | "members" | "drop" | "usage" | "check" | "stat",
+            "put" | "grant" | "until" | "members" | "drop" | "usage" | "check" | "stat",
             ..,
         ] => Err("arguments".into()),
         _ => Err("command".into()),
@@ -1198,8 +1266,11 @@ fn control_reply(state: &State, line: &[u8], now: Instant) -> String {
         Err(reason) => return format!("err {reason}\n"),
     };
     let done = match command {
-        Command::Put { name, numbers, members } => {
-            state.clients_mut().put(&name, numbers, members, now).map(|seats| seats_line(&seats))
+        Command::Put { name, numbers, members, until } => {
+            state.clients_mut().put(&name, numbers, until, members, now).map(|seats| seats_line(&seats))
+        }
+        Command::Until { name, until } => {
+            if state.clients().until(&name, until) { Ok("ok\n".into()) } else { Err("no-account".into()) }
         }
         Command::Members { name, members } => {
             state.clients_mut().set_members(&name, members, now).map(|seats| seats_line(&seats))
@@ -1513,7 +1584,7 @@ fn run() -> Result<(), String> {
                 );
                 if now != last {
                     eprintln!(
-                        "fips-exitd: packets to internet {}, to clients {}, refused {}, out of bytes {}, \
+                        "fips-exitd: packets to internet {}, to clients {}, refused {}, out of bytes or time {}, \
                          unrouted {}; DNS answered {}, refused {}, failed {}",
                         now.0, now.1, now.2, now.3, now.4, now.5, now.6, now.7
                     );
@@ -1712,17 +1783,17 @@ mod tests {
         assert!(!send(&c, m, 100), "300 of 250 used");
         assert!(!reply_to(&c, m, 100));
         assert!(!c.resolves_for(&m));
-        assert_eq!(ctl(&mut c, "usage pkg"), "account pkg 250 200 100\nok 1\n");
+        assert_eq!(ctl(&mut c, "usage pkg"), "account pkg 250 200 100 0\nok 1\n");
         // More is granted: it is carried again, from where it stood.
         assert_eq!(ctl(&mut c, "grant pkg 1000"), "ok\n");
         assert!(send(&c, m, 100));
-        assert_eq!(ctl(&mut c, "usage"), "account pkg 1000 300 100\nok 1\n");
+        assert_eq!(ctl(&mut c, "usage"), "account pkg 1000 300 100 0\nok 1\n");
         // IPv4 too, from its own derived address.
         assert!(c.admits(PROTO_IPV4, &m, &v4(inner_ipv4(&m), [1, 1, 1, 1], 60)).carried().is_some());
         assert_eq!(c.route(&v4([1, 1, 1, 1], inner_ipv4(&m), 60)).carried(), Some((PROTO_IPV4, m)));
         // A client on the operator's list is carried and never counted.
         assert!(send(&c, addr(A), 1280));
-        assert_eq!(ctl(&mut c, "usage"), "account pkg 1000 300 100\nok 1\n");
+        assert_eq!(ctl(&mut c, "usage"), "account pkg 1000 300 100 0\nok 1\n");
     }
 
     #[test]
@@ -1755,13 +1826,79 @@ mod tests {
         let put = format!("put pkg 1000 400 100 {C}");
         assert_eq!(ctl(&mut c, &put), format!("ok {C}=v4\n"));
         assert!(send(&c, addr(C), 50));
-        assert_eq!(ctl(&mut c, "usage"), "account pkg 1000 450 100\nok 1\n");
+        assert_eq!(ctl(&mut c, "usage"), "account pkg 1000 450 100 0\nok 1\n");
         // The same put again, and an older grant: the counts stay.
         assert_eq!(ctl(&mut c, &put), format!("ok {C}=v4\n"));
         assert_eq!(ctl(&mut c, "grant pkg 500"), "ok\n");
         assert_eq!(ctl(&mut c, "grant pkg 1000"), "ok\n");
-        assert_eq!(ctl(&mut c, "usage"), "account pkg 1000 450 100\nok 1\n");
+        assert_eq!(ctl(&mut c, "usage"), "account pkg 1000 450 100 0\nok 1\n");
         assert_eq!(ctl(&mut c, "grant nobody 5"), "err no-account\n");
+    }
+
+    /// An account may have an end: from that second on its members are not
+    /// carried, whatever is left of its bytes.
+    #[test]
+    fn an_account_ends_at_its_time() {
+        let mut c = Clients::default();
+        let m = addr(C);
+        let (past, future) = (unix_now() - 1, unix_now() + 3600);
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C}")), format!("ok {C}=v4\n"));
+        assert!(send(&c, m, 100), "no end");
+        assert_eq!(ctl(&mut c, &format!("until pkg {future}")), "ok\n");
+        assert!(send(&c, m, 100) && reply_to(&c, m, 100) && c.resolves_for(&m), "before its end");
+        assert_eq!(ctl(&mut c, "usage"), format!("account pkg 1000 200 100 {future}\nok 1\n"));
+        // Over: not for packets either way, and not for names. Its bytes are as they were.
+        assert_eq!(ctl(&mut c, &format!("until pkg {past}")), "ok\n");
+        assert!(matches!(c.admits(PROTO_IPV6, &m, &v6(m, [0x20; 16], 100)), Verdict::Exhausted));
+        assert!(matches!(c.route(&v6([0x20; 16], m, 100)), Verdict::Exhausted));
+        assert!(!c.resolves_for(&m));
+        assert_eq!(ctl(&mut c, "usage"), format!("account pkg 1000 200 100 {past}\nok 1\n"));
+        // At the second it ends, it has ended.
+        let now = unix_now();
+        assert_eq!(ctl(&mut c, &format!("until pkg {now}")), "ok\n");
+        assert!(!send(&c, m, 100));
+        // More bytes do not give it more time; a later end does, and so does none.
+        assert_eq!(ctl(&mut c, "grant pkg 100000"), "ok\n");
+        assert!(!send(&c, m, 100));
+        assert_eq!(ctl(&mut c, &format!("until pkg {future}")), "ok\n");
+        assert!(send(&c, m, 100));
+        assert_eq!(ctl(&mut c, &format!("until pkg {past}")), "ok\n");
+        assert_eq!(ctl(&mut c, "until pkg 0"), "ok\n");
+        assert!(send(&c, m, 100));
+        assert_eq!(ctl(&mut c, "until nobody 0"), "err no-account\n");
+        // Put with its end, as after the daemon started again: an account
+        // whose time is over is not carried for a moment in between, and a
+        // put without an end leaves the end as it is.
+        let mut c = Clients::default();
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} {past}")), format!("ok {C}=v4\n"));
+        assert!(!send(&c, m, 100));
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C}")), format!("ok {C}=v4\n"));
+        assert!(!send(&c, m, 100));
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} {future}")), format!("ok {C}=v4\n"));
+        assert!(send(&c, m, 100));
+        // On an account that is there, a put takes nothing back: the one
+        // that made it, arriving again after the end was extended, does not
+        // cut the extension off; nor does it take an end away, or give one
+        // to an account that has none.
+        let end_of = |c: &mut Clients| {
+            let usage = ctl(c, "usage pkg");
+            usage.lines().next().unwrap().rsplit(' ').next().unwrap().to_string()
+        };
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} {past}")), format!("ok {C}=v4\n"));
+        assert_eq!(end_of(&mut c), future.to_string(), "an earlier end in a put");
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} 0")), format!("ok {C}=v4\n"));
+        assert_eq!(end_of(&mut c), future.to_string(), "no end in a put");
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} {}", future + 60)), format!("ok {C}=v4\n"));
+        assert_eq!(end_of(&mut c), (future + 60).to_string(), "a later end in a put");
+        assert_eq!(ctl(&mut c, "until pkg 0"), "ok\n");
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} {past}")), format!("ok {C}=v4\n"));
+        assert_eq!(end_of(&mut c), "0", "an end in a put for an account that has none");
+        assert!(send(&c, m, 100));
+        assert_eq!(ctl(&mut c, &format!("until pkg {future}")), "ok\n");
+        // A member on the operator's list is not the account's concern.
+        c.set_list(vec![m], Instant::now());
+        assert_eq!(ctl(&mut c, &format!("until pkg {past}")), "ok\n");
+        assert!(send(&c, m, 100));
     }
 
     #[test]
@@ -1771,7 +1908,7 @@ mod tests {
         assert_eq!(ctl(&mut c, &format!("put pkg 0 0 0 {A},{C}")), format!("ok {A}=static {C}=v4\n"));
         assert!(send(&c, addr(A), 100));
         assert!(!send(&c, addr(C), 100));
-        assert_eq!(ctl(&mut c, "usage"), "account pkg 0 0 0\nok 1\n");
+        assert_eq!(ctl(&mut c, "usage"), "account pkg 0 0 0 0\nok 1\n");
         assert_eq!(ctl(&mut c, &format!("check {A}")), "ok static\n");
         // The list is read again without A, and with a new client that has
         // C's inner IPv4 address. The account is still there; A is now only
@@ -1785,7 +1922,7 @@ mod tests {
         assert!(send(&c, addr(A), 100));
         assert_eq!(ctl(&mut c, &format!("check {C}")), "ok member pkg no4\n");
         assert_eq!(c.route(&v4([1, 1, 1, 1], inner_ipv4(&addr(C)), 60)).carried(), Some((PROTO_IPV4, addr(rival))));
-        assert_eq!(ctl(&mut c, "usage"), "account pkg 10000 100 0\nok 1\n");
+        assert_eq!(ctl(&mut c, "usage"), "account pkg 10000 100 0 0\nok 1\n");
     }
 
     /// Two addresses that derive one inner IPv4 address: the first keeps it,
@@ -1871,7 +2008,7 @@ mod tests {
             c.set_list(parse_list(&list), Instant::now());
             assert!(send(&c, addr(C), 100), "after a reload to {list:?}");
         }
-        assert_eq!(ctl(&mut c, "usage"), "account pkg 500 400 0\nok 1\n");
+        assert_eq!(ctl(&mut c, "usage"), "account pkg 500 400 0 0\nok 1\n");
         assert_eq!(c.len(), 2);
     }
 
@@ -1898,9 +2035,15 @@ mod tests {
             Ok(Command::Put {
                 name: "pkg-1.a_B".into(),
                 numbers: [10, 2, 3],
-                members: vec![fd("fd11::1"), fd("fd22::2")]
+                members: vec![fd("fd11::1"), fd("fd22::2")],
+                until: None,
             })
         );
+        assert_eq!(
+            parse_command(b"put x 1 0 0 - 1800000000"),
+            Ok(Command::Put { name: "x".into(), numbers: [1, 0, 0], members: vec![], until: Some(1_800_000_000) })
+        );
+        assert_eq!(parse_command(b"until x 0"), Ok(Command::Until { name: "x".into(), until: 0 }));
         assert_eq!(parse_command(b"  stat  "), Ok(Command::Stat));
         assert_eq!(parse_command(b"usage"), Ok(Command::Usage { name: None }));
         assert_eq!(parse_command(b"members x -"), Ok(Command::Members { name: "x".into(), members: vec![] }));
@@ -1915,6 +2058,16 @@ mod tests {
         bad(b"PUT a 1 0 0 -", "command");
         bad(b"stat please", "arguments");
         bad(b"put pkg 10 2 3", "arguments");
+        bad(b"put pkg 10 2 3 - 5 6", "arguments");
+        bad(b"put pkg 10 2 3 - soon", "number");
+        bad(b"until pkg", "arguments");
+        bad(b"until pkg tomorrow", "number");
+        bad(b"until pkg -1", "number");
+        // A time in milliseconds or nanoseconds is not a time in seconds.
+        bad(b"until pkg 1800000000000", "number");
+        bad(b"put pkg 10 2 3 - 1800000000000000000", "number");
+        assert!(parse_command(format!("until pkg {MAX_UNTIL}").as_bytes()).is_ok());
+        bad(format!("until pkg {}", MAX_UNTIL + 1).as_bytes(), "number");
         bad(b"grant pkg", "arguments");
         bad(b"grant a/b 1", "name");
         bad(b"grant ../../etc/passwd 1", "name");
@@ -1941,8 +2094,8 @@ mod tests {
     fn no_line_makes_the_parser_panic_or_the_table_change() {
         let mut c = Clients::default();
         assert_eq!(ctl(&mut c, &format!("put pkg 500 1 2 {C}")), format!("ok {C}=v4\n"));
-        let words: [&[u8]; 14] = [
-            b"put", b"grant", b"members", b"drop", b"usage", b"check", b"stat", b"pkg", b"-", b"1",
+        let words: [&[u8]; 15] = [
+            b"put", b"grant", b"until", b"members", b"drop", b"usage", b"check", b"stat", b"pkg", b"-", b"1",
             b"fd55:aaaa:bbbb:cccc::3", b",", b"\xff", b"99999999999999999999",
         ];
         // A fixed sequence, not a random one: the same lines every run.
@@ -1966,7 +2119,11 @@ mod tests {
             // must be answered and must leave it alone.
             let changes = matches!(
                 parse_command(&line),
-                Ok(Command::Put { .. } | Command::Grant { .. } | Command::Members { .. } | Command::Drop { .. })
+                Ok(Command::Put { .. }
+                    | Command::Grant { .. }
+                    | Command::Until { .. }
+                    | Command::Members { .. }
+                    | Command::Drop { .. })
             );
             if changes {
                 continue;
@@ -1976,7 +2133,7 @@ mod tests {
             let last = reply.trim_end().lines().last().unwrap_or("");
             assert!(last.starts_with("ok") || last.starts_with("err "), "{line:?} -> {reply:?}");
         }
-        assert_eq!(ctl(&mut c, "usage"), "account pkg 500 1 2\nok 1\n");
+        assert_eq!(ctl(&mut c, "usage"), "account pkg 500 1 2 0\nok 1\n");
     }
 
     /// The socket itself: root's alone, a line too long ends the session,
@@ -2019,15 +2176,15 @@ mod tests {
         assert_eq!(talk(b"stat\n"), "ok epoch=42 accounts=0 resolver=0\n");
         let mut lines = b"nonsense\n\xff\xfe\n".to_vec();
         lines.extend_from_slice(format!("put pkg 9 0 0 {C}\nusage\n").as_bytes());
-        assert_eq!(talk(&lines), format!("err command\nerr syntax\nok {C}=v4\naccount pkg 9 0 0\nok 1\n"));
+        assert_eq!(talk(&lines), format!("err command\nerr syntax\nok {C}=v4\naccount pkg 9 0 0 0\nok 1\n"));
         // The account outlives the connection that made it.
-        assert_eq!(talk(b"usage pkg\n"), "account pkg 9 0 0\nok 1\n");
+        assert_eq!(talk(b"usage pkg\n"), "account pkg 9 0 0 0\nok 1\n");
         // A line with no end within the limit: one answer, and nothing after
         // it is read as a command.
         let mut long = vec![b'x'; CONTROL_MAX_LINE + 1];
         long.extend_from_slice(b"\ndrop pkg\n");
         assert_eq!(talk(&long), "err line\n");
-        assert_eq!(talk(b"usage pkg\n"), "account pkg 9 0 0\nok 1\n");
+        assert_eq!(talk(b"usage pkg\n"), "account pkg 9 0 0 0\nok 1\n");
         // A line of exactly the limit is still a line.
         let mut full = vec![b' '; CONTROL_MAX_LINE - 4];
         full.extend_from_slice(b"stat\n");

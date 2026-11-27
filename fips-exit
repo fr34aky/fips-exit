@@ -1273,10 +1273,19 @@ def cmd_accounts():
     if not answer or not answer[-1].startswith("ok"):
         die(f"no answer from fips-exitd on {CONTROL}" + (f": {answer[-1]}" if answer else ""))
     rows = [line.split()[1:] for line in answer[:-1] if line.startswith("account ")]
-    print(f"{'account':<32} {'granted':>15} {'from members':>15} {'to members':>15} {'left':>15}")
-    for name, granted, used_in, used_out in rows:
+    print(f"{'account':<32} {'granted':>15} {'from members':>15} {'to members':>15} {'left':>15}  until")
+    for name, granted, used_in, used_out, *more in rows:
         left = max(0, int(granted) - int(used_in) - int(used_out))
-        print(f"{name:<32} {granted:>15} {used_in:>15} {used_out:>15} {left:>15}")
+        # When it ends, whatever is left: a time of this machine's, or none.
+        # (A daemon from before accounts had an end does not say.)
+        until, end = int(more[0]) if more else 0, "-"
+        if until:
+            try:
+                end = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
+            except (OverflowError, OSError, ValueError):
+                end = str(until)
+            end += " (over)" if until <= time.time() else ""
+        print(f"{name:<32} {granted:>15} {used_in:>15} {used_out:>15} {left:>15}  {end}")
     if not rows:
         print("(none)")
 

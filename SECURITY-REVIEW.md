@@ -53,7 +53,7 @@ IPv4 address derived from the client's fips address.
 5. **Lines on the control socket**, when there is one. It is a Unix socket
    with mode 0600, so its peer is root today; it is meant for a payment
    service that is not. `parse_command` reads each line as bytes: one of
-   seven commands with exactly its arguments, a name of 1 to 64 safe
+   eight commands with exactly its arguments, a name of 1 to 64 safe
    characters, numbers of digits only up to a quarter of a u64, fips
    addresses. Anything else is answered with an error and changes nothing. A
    line is at most 4096 bytes and has five seconds to arrive, an account has
@@ -88,9 +88,10 @@ IPv4 address derived from the client's fips address.
 - **Carried and not counted, or counted wrong.** A member's packet passed on
   without being added to its account, counted twice, or counted when it was
   not passed on; a member carried after its account's count has reached the
-  grant, beyond the one packet per thread that crosses the line; any
-  arithmetic on the three numbers that could wrap. The counts only grow and
-  nothing is subtracted, for that reason.
+  grant, beyond the one packet per thread that crosses the line; a member
+  carried at or after its account's end; any arithmetic on the three numbers
+  that could wrap. The counts only grow and nothing is subtracted, for that
+  reason.
 - **The control socket reaching further than accounts.** A command that
   changes the operator's list or takes a listed client's place or inner
   address, that names a file or runs something, or a line that makes the
@@ -164,6 +165,11 @@ IPv4 address derived from the client's fips address.
   address, which is a change to the contract with fips2go.
 - **An advert is not taken back.** An exit that stops is listed until its
   last advert expires, three hours at most.
+- **An account's end is by this machine's clock.** A machine that starts
+  with its clock in the past (no battery, no time yet from the network)
+  carries the members of an account whose time is over, until the clock is
+  right. An account that has ended is not removed: it keeps its members'
+  places until whoever made it drops it.
 - **Nothing makes accounts yet.** `ACCESS=paid` serves the members of
   accounts; what makes the accounts, a payment service, is not written. Until
   it is, the mode is of use only to someone who writes to the socket by hand.
@@ -242,6 +248,10 @@ IPv4 address derived from the client's fips address.
 - A member is counted before the firewall decides, so a packet to a
   destination the exit refuses is counted and then dropped. The README says
   so.
+- An account's end is set, where its three numbers are only raised: it is a
+  time somebody sold, and may be moved either way by whoever may write to the
+  socket. The same command sent twice still changes nothing. A clock that
+  cannot be read ends every account that has an end.
 - DNS for a member is not counted. It is answered only while the account has
   bytes, and each client has a limit on queries in flight: 64, which is what
   the whole exit had before, of 256.

@@ -153,8 +153,30 @@ assert r[:2] == q[:2] and r[2] & 0x80
 print("answers=%d rcode=%d tc=%d size=%d" % (int.from_bytes(r[6:8], "big"), r[3] & 15, (r[2] >> 1) & 1, len(r)))' "$2" $E "$3"
 }
 
+# --- what a version before the daemon left behind is cleared away ---------------
+# One ip6tnl device per client, named fx…. The script lists them by type,
+# and on a host where the ip6_tunnel module is not loaded (any host that
+# never ran that version) the kernel cannot filter by a type it does not
+# know: ip filters instead and prints an empty object for each link it
+# drops. Here the module is loaded, the clients use it, so a stand-in ip
+# adds the empty objects.
+legacy() { ip link add "$1" type ip6tnl mode any local $E remote "$2" encaplimit none; }
+mkdir "$FIPS_EXIT_DIR/bin"
+cat > "$FIPS_EXIT_DIR/bin/ip" <<IP
+#!/bin/sh
+if [ "\$*" = "-j link show type ip6tnl" ]; then
+  $(command -v ip) "\$@" | sed 's/^\[/[{},/; s/\]\$/,{}]/'
+else
+  exec $(command -v ip) "\$@"
+fi
+IP
+chmod +x "$FIPS_EXIT_DIR/bin/ip"
+legacy fx11223344 $C1
+
 # --- before any client is added: nothing passes -------------------------------
-"$here/fips-exit" up >/dev/null
+PATH="$FIPS_EXIT_DIR/bin:$PATH" "$here/fips-exit" up >/dev/null || fail "up with empty objects in ip's list of links"
+ip link show fx11223344 >/dev/null 2>&1 && fail "up left an old fx tunnel device"
+ok "up removes a tunnel device of the version before the daemon"
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "traffic passed without a client entry"
 [ "$(resolve c1 $C1 example.com)" = timeout ] || fail "DNS answered without a client entry"
 ok "no client entry, no traffic and no DNS"
@@ -280,7 +302,9 @@ ok "with no upstream answering, a client gets SERVFAIL instead of silence"
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "removed client still passes"
 [ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "remaining client broke on removal"
 ok "removing a client cuts it off and leaves the others"
-"$here/fips-exit" down >/dev/null
+legacy fx55667788 $C2
+PATH="$FIPS_EXIT_DIR/bin:$PATH" "$here/fips-exit" down >/dev/null || fail "down with empty objects in ip's list of links"
+ip link show fx55667788 >/dev/null 2>&1 && fail "down left an old fx tunnel device"
 ip route show dev fipsexit0 | grep -q . && fail "routes left after down"
 ip -6 rule show | grep -q "lookup 5170" && fail "rule left after down"
 nft list table inet fips_exit >/dev/null 2>&1 && fail "table left after down"

@@ -263,11 +263,16 @@ def tun_present(config):
 
 def remove_kernel_tunnels(config):
     """Undo what versions before the daemon set up: one ip6tnl device per
-    client (fx…) and a DF-clearing tc filter on the uplink."""
-    links = json.loads(run("ip", "-j", "link", "show", "type", "ip6tnl").stdout or "[]")
+    client (fx…) and a DF-clearing tc filter on the uplink. Nothing here may
+    stop `up` or `down`: what follows it matters more than what it clears."""
+    try:
+        links = json.loads(run("ip", "-j", "link", "show", "type", "ip6tnl", check=False).stdout or "[]")
+    except ValueError:
+        links = []
     for link in links:  # ip prints {} for each link the type filter drops
-        if link.get("ifname", "").startswith("fx"):
-            run("ip", "link", "del", link["ifname"])
+        name = link.get("ifname", "")
+        if name.startswith("fx") and run("ip", "link", "del", name, check=False).returncode != 0:
+            print(f"fips-exit: could not remove the old tunnel {name}", file=sys.stderr)
     wan = config["WAN"] or None
     if wan is None:
         routes = json.loads(run("ip", "-j", "route", "show", "default").stdout or "[]")
@@ -469,7 +474,7 @@ def cmd_up():
     run("ip", "-6", "route", "flush", "table", ROUTE_TABLE, check=False)
     wanted4 = {str(inner_ipv4(a)) for a, _ in clients}
     for route in json.loads(run("ip", "-j", "route", "show", "dev", tun).stdout or "[]"):
-        if route["dst"] not in wanted4:
+        if route.get("dst") and route["dst"] not in wanted4:
             run("ip", "route", "del", route["dst"], "dev", tun)
     for address, _ in clients:
         run("ip", "route", "replace", str(inner_ipv4(address)), "dev", tun)

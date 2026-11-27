@@ -37,7 +37,8 @@ DIR = os.environ.get("FIPS_EXIT_DIR", "/etc/fips-exit")
 CLIENTS = os.path.join(DIR, "clients")
 CONFIG = os.path.join(DIR, "config")
 
-# The daemon's socket for accounts, when the config says ACCESS=paid.
+# The daemon's socket: for accounts when the config says ACCESS=paid, and
+# for the counts of the clients on the list when it says CLIENT_COUNTS=on.
 CONTROL = os.environ.get("FIPS_EXIT_CONTROL", "/run/fips-exit/control.sock")
 
 TABLE = "fips_exit"  # nftables table (inet)
@@ -264,12 +265,13 @@ def load_config():
 
 
 def config_value(text):
-    """What a line of the config sets: what is between double quotes when it
-    begins with one, and otherwise what is in front of a `#`. A `#` between
-    quotes is a `#`: a name may have one."""
+    """What a line of the config sets: what is between quotes when it begins
+    with one, double or single as systemd takes both for the daemon, and
+    otherwise what is in front of a `#`. A `#` between quotes is a `#`: a
+    name may have one."""
     text = text.strip()
-    closing = text.find('"', 1)
-    if text.startswith('"') and closing > 0:
+    closing = text.find(text[:1], 1)
+    if text[:1] in ('"', "'") and closing > 0:
         return text[1:closing]
     return text.split("#")[0].strip().strip('"')
 
@@ -625,6 +627,8 @@ def cmd_up():
     # be stopped by it.
     if config["ACCESS"] not in ("allow-list", "paid"):
         die(f"ACCESS={config['ACCESS']} in {CONFIG}: allow-list or paid")
+    if config.get("CLIENT_COUNTS", "") not in ("", "on", "off"):
+        die(f"CLIENT_COUNTS={config['CLIENT_COUNTS']} in {CONFIG}: on or off")
     clients = served(load_clients())
     wan = uplink(config)
     tun = config["TUN"]
@@ -1256,9 +1260,29 @@ def cmd_status():
     if tun_present(config):
         stats = json.loads(run("ip", "-j", "-s", "link", "show", config["TUN"]).stdout)[0]["stats64"]
         # The TUN's point of view: what it receives came from the clients.
-        print(f"{config['TUN']}: {stats['rx']['packets']} packets from clients, "
-              f"{stats['tx']['packets']} to clients")
-    print(f"clients: {len(load_clients())}")
+        # For the exit as a whole; whose they were is not in these numbers.
+        print(f"{config['TUN']}: {stats['rx']['packets']} packets ({stats['rx']['bytes']} bytes) from clients, "
+              f"{stats['tx']['packets']} ({stats['tx']['bytes']} bytes) to clients")
+    clients = load_clients()
+    print(f"clients: {len(clients)}")
+    # What each client on the list has moved, since it was put there or
+    # since the daemon started: kept by the daemon in memory, if the config
+    # asked for it when the daemon started. Whether it counts is the
+    # daemon's to say, not the config's: the two differ until a restart.
+    wanted = config.get("CLIENT_COUNTS") == "on"
+    stat = daemon_stat(wait=1 if wanted else 0)
+    counting = bool(stat) and stat.get("counts") == "1"
+    if counting:
+        names = {str(address): name for address, name in clients}
+        for line in (control("clients", wait=1) or [])[:-1]:
+            _, address, from_client, to_client = line.split()
+            print(f"  {address} {names.get(address, ''):<16} {from_client:>15} bytes from it, {to_client:>15} to it")
+    if wanted and not counting:
+        print("  CLIENT_COUNTS=on, but the daemon is not counting: it reads the config when it starts "
+              "(systemctl restart fips-exit)")
+    if counting and not wanted:
+        print("  THE DAEMON IS STILL COUNTING its clients, which the config no longer asks for: "
+              "systemctl restart fips-exit")
     if paid(config):
         stat = daemon_stat()
         print("access: paid, " + (f"{stat.get('accounts', '?')} account(s)" if stat

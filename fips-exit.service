@@ -10,7 +10,8 @@ Requires=fips.service
 # firewall for the clients in /etc/fips-exit/clients.
 # DNS_UPSTREAMS for the daemon's resolver, if the config sets it.
 # ACCESS=paid there makes the daemon open its control socket for accounts,
-# in the directory below: root's, and gone with the service.
+# and CLIENT_COUNTS=on for the counts of the clients on the list, in the
+# directory below: root's, and gone with the service.
 EnvironmentFile=-/etc/fips-exit/config
 RuntimeDirectory=fips-exit
 RuntimeDirectoryMode=0750

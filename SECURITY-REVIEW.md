@@ -15,7 +15,9 @@ root:
   use the tunnel and as whom: the clients on the operator's list, and the
   members of *accounts*, each for the bytes its account was granted. Accounts
   are made by another program over a control socket, which exists only when
-  the daemon is started with `--control`.
+  the config says `ACCESS=paid`, or `CLIENT_COUNTS=on` (then for the counts
+  of the listed clients, and it takes no accounts), or the daemon is started
+  with `--control`.
 - `fips-exit` (a Python script): everything around it. The client list, the
   TUN's routes, NAT to the uplink, an nftables table of its own, and the
   openings it makes in two firewalls it knows (fips's own, and ufw). And,
@@ -53,7 +55,7 @@ IPv4 address derived from the client's fips address.
 5. **Lines on the control socket**, when there is one. It is a Unix socket
    with mode 0600, so its peer is root today; it is meant for a payment
    service that is not. `parse_command` reads each line as bytes: one of
-   eight commands with exactly its arguments, a name of 1 to 64 safe
+   nine commands with exactly its arguments, a name of 1 to 64 safe
    characters, numbers of digits only up to a quarter of a u64, fips
    addresses. Anything else is answered with an error and changes nothing. A
    line is at most 4096 bytes and has five seconds to arrive, an account has
@@ -97,6 +99,12 @@ IPv4 address derived from the client's fips address.
   address, that names a file or runs something, or a line that makes the
   daemon panic or stop carrying. Also: the socket readable or writable by
   anyone but its owner.
+- **What a client moved, kept without being asked for or for longer than
+  said.** The clients on the list are counted only with `CLIENT_COUNTS=on`:
+  two numbers each, in memory. Counting them by default, keeping the count
+  of a client that was removed, writing counts to a file or the journal, or
+  adding times or destinations to them, would each make a record of people
+  that the README says is not kept. The socket they are read over is root's.
 - **A reload losing the accounts.** `fips-exit add` and `remove` make the
   daemon read the list again; the accounts must be as they were afterwards.
 - **Misrouted replies.** A packet from the TUN delivered to a client other
@@ -252,6 +260,18 @@ IPv4 address derived from the client's fips address.
   time somebody sold, and may be moved either way by whoever may write to the
   socket. The same command sent twice still changes nothing. A clock that
   cannot be read ends every account that has an end.
+- The bytes the exit carries, for all clients together, are what the TUN
+  device has counted since it was made: `status` reads them there. They are
+  not in the daemon's line in the journal, which has packets: with one
+  client on the list, bytes by the minute would be that client's. Per client
+  bytes are counted only when the operator turns it on, and then
+  `CLIENT_COUNTS=on` opens the control socket too, on an exit that sells
+  nothing. That socket takes no accounts: where nothing is sold nobody is
+  carried for one, and none of their lookups answered.
+- The daemon reads its client list again as soon as it is told to (SIGHUP),
+  in a thread that waits for that, and no longer when the next packet
+  comes: a removed client is cut off then, and its count is gone before it
+  can be put back.
 - DNS for a member is not counted. It is answered only while the account has
   bytes, and each client has a limit on queries in flight: 64, which is what
   the whole exit had before, of 256.

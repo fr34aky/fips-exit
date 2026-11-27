@@ -76,6 +76,25 @@ On the client, enter this node's npub as the exit node. A direct fips link
 between client and exit (add the exit as a peer) keeps latency down; it is
 not required.
 
+### Counting
+
+`sudo fips-exit status` says how many packets and bytes the exit has carried
+since it started, for all clients together. Whose they were is not kept.
+
+With `CLIENT_COUNTS=on` in the config (and a restart, since the daemon reads
+it when it starts) the daemon also counts each client on the list: the bytes
+carried from it and to it. `status` then shows a line for each.
+
+- The counts are two numbers for a client, in the daemon's memory. They are
+  not written anywhere, hold no times and no destinations, and are read over
+  the daemon's socket, which is root's.
+- A client's count starts when it is put on the list or the daemon starts,
+  and is gone when the client is removed or the daemon stops.
+- The daemon counts or not as the config said when it started. `status` asks
+  the daemon, and says so when the config has changed since.
+- It is off unless you turn it on. An operator who counts should say so to
+  the people whose devices are on the list.
+
 ### Being found
 
 An exit says nothing about itself unless it is told to. With relays named
@@ -144,8 +163,9 @@ below.
 - Accounts are kept in memory. After a restart there are none.
 
 Accounts are made over a Unix socket, `/run/fips-exit/control.sock`, which
-the daemon opens only with `ACCESS=paid` (or `--control <path>`), for root
-alone. One command a line; every answer ends in a line that begins `ok` or
+the daemon opens only with `ACCESS=paid` or `CLIENT_COUNTS=on` (or
+`--control <path>`), for root alone. Opened for the counts alone it takes
+no accounts. One command a line; every answer ends in a line that begins `ok` or
 `err`; every number is a total, so that a command sent twice changes
 nothing.
 
@@ -158,8 +178,9 @@ until <account> <unix seconds|0>                              when it ends; 0 fo
 members <account> <address,…|->                               replace its members
 drop <account>
 usage [account]                                               account <name> <granted> <used_in> <used_out> <until>
+clients                                                       client <address> <bytes from it> <bytes to it>, with CLIENT_COUNTS=on
 check <address>                                               static | member <account> v4|no4 | free v4|no4
-stat                                                          epoch=<start> accounts=<n> resolver=<0|1>
+stat                                                          epoch=<start> accounts=<n> resolver=<0|1> counts=<0|1>
 ```
 
 Whoever can write to that socket decides who uses the exit and for how much.
@@ -229,7 +250,9 @@ an optimisation, not a requirement.
   put it in `BLOCK_CIDRS`.
 
 - The exit sees its clients' internet traffic as any VPN endpoint does, and
-  the internet sees the exit's address.
+  the internet sees the exit's address. Its operator may also count the
+  bytes each client moves (`CLIENT_COUNTS=on`, under *Counting*); by default
+  that is not kept.
 - `fips-exit` adds its own nftables table and opens two firewalls it knows:
   fips's own (a drop-in `fips.d/fips-exit.nft` admitting next-header 4, 41
   and 44 from the clients' addresses; `FIPS_FIREWALL=` in the config to

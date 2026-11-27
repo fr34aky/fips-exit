@@ -84,7 +84,9 @@ Do this before reading a single diff hunk.
    passed on, by its inner length, against its own account. The three
    numbers of an account only grow; nothing is carried once the count has
    reached the grant, bar the packet that crosses, and nothing from the
-   second an account that has an end has ended.
+   second an account that has an end has ended. A client on the list is
+   counted only when the operator asked for it, in memory, and not beyond
+   its place on the list.
 8. **The firewall still isolates.** Through the tunnel a client reaches the
    uplink and nothing else on this host, and not another client; the
    internet reaches a client only as a reply. A member of an account gets no

@@ -1,0 +1,11 @@
+[Unit]
+Description=fips exit node: publish its advert every hour
+
+[Timer]
+# An advert is valid for three hours: one missed hour does not drop the exit
+# from the lists, and an exit that is gone drops out by itself.
+OnActiveSec=2min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target

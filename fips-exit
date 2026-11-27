@@ -15,15 +15,20 @@ NAT to the uplink, and the firewall.
   fips-exit down                           remove everything this script made
   fips-exit status                         what is in place right now
   fips-exit accounts                       who else is carried, and for how much (ACCESS=paid)
+  fips-exit advert [show]                  say on Nostr that this exit exists; or show what would be said
 
 Needs root, iproute2, nftables, and fips-exitd (systemctl start fips-exit).
 """
 
+import base64
 import hashlib
 import ipaddress
 import json
 import os
+import re
 import socket
+import ssl
+import struct
 import subprocess
 import sys
 import time
@@ -81,16 +86,16 @@ def bech32_polymod(values):
     return chk
 
 
-def npub_to_address(npub):
-    """The fips address of a public key: fd + the first 15 bytes of
-    sha256(x-only key), as fips derives it."""
-    npub = npub.strip().lower()
-    if not npub.startswith("npub1") or any(c not in BECH32 for c in npub[5:]):
-        raise ValueError("not an npub")
-    data = [BECH32.index(c) for c in npub[5:]]
-    expanded = [ord(c) >> 5 for c in "npub"] + [0] + [ord(c) & 31 for c in "npub"]
+def bech32_key(text, prefix):
+    """The 32-byte key in an `npub1…` or an `nsec1…`."""
+    text = text.strip().lower()
+    head = prefix + "1"
+    if not text.startswith(head) or any(c not in BECH32 for c in text[len(head):]):
+        raise ValueError(f"not an {prefix}")
+    data = [BECH32.index(c) for c in text[len(head):]]
+    expanded = [ord(c) >> 5 for c in prefix] + [0] + [ord(c) & 31 for c in prefix]
     if bech32_polymod(expanded + data) != 1:
-        raise ValueError("npub checksum mismatch (mistyped?)")
+        raise ValueError(f"{prefix} checksum mismatch (mistyped?)")
     acc = bits = 0
     key = bytearray()
     for value in data[:-6]:
@@ -100,9 +105,18 @@ def npub_to_address(npub):
             bits -= 8
             key.append((acc >> bits) & 0xFF)
     if len(key) != 32:
-        raise ValueError("npub is not a 32-byte key")
-    digest = hashlib.sha256(bytes(key)).digest()
-    return ipaddress.IPv6Address(b"\xfd" + digest[:15])
+        raise ValueError(f"{prefix} is not a 32-byte key")
+    return bytes(key)
+
+
+def key_address(key):
+    """The fips address of a public key: fd + the first 15 bytes of
+    sha256(x-only key), as fips derives it."""
+    return ipaddress.IPv6Address(b"\xfd" + hashlib.sha256(key).digest()[:15])
+
+
+def npub_to_address(npub):
+    return key_address(bech32_key(npub, "npub"))
 
 
 def parse_client(text):
@@ -239,13 +253,25 @@ def load_config():
     config = {"MESH_IF": "fips0", "WAN": "", "TUN": "fipsexit0",
               "FIPS_FIREWALL": "/etc/fips/fips.nft", "ACCESS": "allow-list"}
     try:
-        for line in open(CONFIG):
-            key, _, value = line.split("#")[0].partition("=")
-            if key.strip():
-                config[key.strip()] = value.strip().strip('"')
+        with open(CONFIG) as file:
+            for line in file:
+                key, _, value = line.partition("=")
+                if key.strip() and not key.lstrip().startswith("#"):
+                    config[key.strip()] = config_value(value)
     except FileNotFoundError:
         pass
     return config
+
+
+def config_value(text):
+    """What a line of the config sets: what is between double quotes when it
+    begins with one, and otherwise what is in front of a `#`. A `#` between
+    quotes is a `#`: a name may have one."""
+    text = text.strip()
+    closing = text.find('"', 1)
+    if text.startswith('"') and closing > 0:
+        return text[1:closing]
+    return text.split("#")[0].strip().strip('"')
 
 
 def paid(config):
@@ -679,6 +705,498 @@ def cmd_down():
     print("fips-exit: down (IP forwarding left as it is; the daemon is stopped by its service)")
 
 
+# --- the advert ----------------------------------------------------------------
+#
+# An exit that wants to be found says so with one Nostr event, signed with
+# its own fips key. A fips identity is a Nostr key, so the advert's author IS
+# the exit: a client that reads it knows the npub to route to, and nobody
+# else can advertise this exit. That is all it proves; the rest is what the
+# operator says.
+#
+#     kind     30078  (NIP-78 application data: addressable, one per author)
+#     tags     ["d", "fips-exit"], ["v", "1"], ["access", …], ["name", …],
+#              ["about", …], ["country", …], …, ["expiration", <unix seconds>]
+#     content  ""
+#
+# What the tags are and what a client makes of them is specified in
+# payd/proto (src/lib.rs), and that crate and advert_tags below are held to
+# one file, payd/proto/vectors/advert.json. fips2go's exit container speaks
+# the same (exit-node/advert.py there, which this is a port of); its phone
+# reads it (shim/src/exitfind.rs).
+#
+# Standard library only, like the rest of this script: the signature
+# (BIP-340) and the WebSocket client are written out here.
+
+KIND = 30078
+D_TAG = "fips-exit"
+VERSION = "1"
+ACCESS_WORDS = ("open", "allow-list", "paid")
+PAY_WORDS = ("bolt11", "onchain", "cashu", "channel")
+MAX_NAME, MAX_ABOUT = 40, 200
+MAX_PRICE = 10**12
+MAX_MINTS, MAX_MINT_BYTES = 4, 256
+MAX_PACKAGES = 8
+MAX_RELAYS = 8
+MAX_LIFETIME = 31 * 86400
+# The timer publishes every hour; an advert is valid for three, so one missed
+# hour does not drop the exit from the lists, and an exit that is gone drops
+# out by itself.
+ADVERT_TTL = 3 * 3600
+RELAY_TIMEOUT = 10
+# ISO 3166-1 alpha-2, as assigned. The same list as payd/proto's.
+COUNTRIES = (
+    "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI "
+    "BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN "
+    "CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK "
+    "FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM "
+    "HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN "
+    "KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK "
+    "ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP "
+    "NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW "
+    "SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF "
+    "TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI "
+    "VN VU WF WS YE YT ZA ZM ZW"
+).split()
+
+
+class AdvertError(Exception):
+    pass
+
+
+# BIP-340 Schnorr signatures over secp256k1: the reference algorithm, as in
+# the BIP. Not constant-time: it signs one public event an hour, on the
+# machine the key lives on.
+
+SECP_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+SECP_G = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+)
+
+
+def _tagged(tag, message):
+    t = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(t + t + message).digest()
+
+
+def _add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and a[1] != b[1]:
+        return None
+    if a == b:
+        slope = 3 * a[0] * a[0] * pow(2 * a[1], SECP_P - 2, SECP_P) % SECP_P
+    else:
+        slope = (b[1] - a[1]) * pow(b[0] - a[0], SECP_P - 2, SECP_P) % SECP_P
+    x = (slope * slope - a[0] - b[0]) % SECP_P
+    return x, (slope * (a[0] - x) - a[1]) % SECP_P
+
+
+def _mul(point, k):
+    out = None
+    while k:
+        if k & 1:
+            out = _add(out, point)
+        point = _add(point, point)
+        k >>= 1
+    return out
+
+
+def _lift_x(x):
+    if x >= SECP_P:
+        return None
+    c = (pow(x, 3, SECP_P) + 7) % SECP_P
+    y = pow(c, (SECP_P + 1) // 4, SECP_P)
+    if pow(y, 2, SECP_P) != c:
+        return None
+    return x, y if y % 2 == 0 else SECP_P - y
+
+
+def _b32(x):
+    return x.to_bytes(32, "big")
+
+
+def schnorr_pubkey(seckey):
+    """The 32-byte x-only public key of a 32-byte secret key."""
+    d = int.from_bytes(seckey, "big")
+    if len(seckey) != 32 or not 1 <= d < SECP_N:
+        raise AdvertError("not a secp256k1 secret key")
+    return _b32(_mul(SECP_G, d)[0])
+
+
+def schnorr_verify(message, pub, sig):
+    if len(message) != 32 or len(pub) != 32 or len(sig) != 64:
+        return False
+    point = _lift_x(int.from_bytes(pub, "big"))
+    r, s = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
+    if point is None or r >= SECP_P or s >= SECP_N:
+        return False
+    e = int.from_bytes(_tagged("BIP0340/challenge", sig[:32] + pub + message), "big") % SECP_N
+    rr = _add(_mul(SECP_G, s), _mul(point, SECP_N - e))
+    return rr is not None and rr[1] % 2 == 0 and rr[0] == r
+
+
+def schnorr_sign(message, seckey, aux):
+    """A BIP-340 signature of the 32-byte `message`."""
+    d0 = int.from_bytes(seckey, "big")
+    if len(seckey) != 32 or not 1 <= d0 < SECP_N:
+        raise AdvertError("not a secp256k1 secret key")
+    point = _mul(SECP_G, d0)
+    d = d0 if point[1] % 2 == 0 else SECP_N - d0
+    t = _b32(d ^ int.from_bytes(_tagged("BIP0340/aux", aux), "big"))
+    k0 = int.from_bytes(_tagged("BIP0340/nonce", t + _b32(point[0]) + message), "big") % SECP_N
+    if k0 == 0:
+        raise AdvertError("nonce is zero")
+    r = _mul(SECP_G, k0)
+    k = k0 if r[1] % 2 == 0 else SECP_N - k0
+    e = int.from_bytes(_tagged("BIP0340/challenge", _b32(r[0]) + _b32(point[0]) + message), "big") % SECP_N
+    sig = _b32(r[0]) + _b32((k + e * d) % SECP_N)
+    if not schnorr_verify(message, _b32(point[0]), sig):
+        raise AdvertError("the signature just made does not verify")
+    return sig
+
+
+def read_key(path):
+    """The secret key in fips's key file: an `nsec1…`, or 64 hex digits."""
+    try:
+        with open(path, "rb") as file:
+            held = file.read(4096)
+    except OSError as error:
+        raise AdvertError(f"{path}: {error.strerror} "
+                          f"(the node's key; FIPS_KEY in {CONFIG} if it is elsewhere)") from None
+    # What was read is a secret, or near one. Whatever it is, none of it is
+    # repeated: not in a message, and not in the trace of an error.
+    try:
+        text = held.decode("ascii").strip()
+        if re.fullmatch(r"[0-9a-fA-F]{64}", text):
+            return bytes.fromhex(text)
+        return bech32_key(text, "nsec")
+    except ValueError:
+        raise AdvertError(f"{path} holds neither an nsec nor 64 hex digits") from None
+
+
+# What separates words, and what is not shown or changes how what is next to
+# it is shown: the two lists of payd/proto (`is_space`, `is_hidden`), by
+# code point. A name must not be able to turn the line it is shown on
+# round, carry what cannot be seen, or be an empty row.
+SPACES = ((0x0009, 0x000D), (0x0020, 0x0020), (0x0085, 0x0085), (0x00A0, 0x00A0), (0x1680, 0x1680),
+          (0x2000, 0x200A), (0x2028, 0x2029), (0x202F, 0x202F), (0x205F, 0x205F), (0x3000, 0x3000))
+HIDDEN = ((0x0000, 0x001F), (0x007F, 0x009F), (0x00AD, 0x00AD), (0x061C, 0x061C), (0x180E, 0x180E),
+          (0x200B, 0x200B), (0x200E, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F), (0xFEFF, 0xFEFF),
+          (0xFFF9, 0xFFFB), (0xE0000, 0xE007F), (0x115F, 0x1160), (0x2800, 0x2800), (0x3164, 0x3164),
+          (0xFFA0, 0xFFA0))
+
+
+def _among(c, ranges):
+    return any(low <= ord(c) <= high for low, high in ranges)
+
+
+def tidy(text, limit):
+    """`text` as a reader of an advert shows it: one line of words with
+    single spaces between them, nothing hidden, `limit` characters at most."""
+    spaced = "".join(" " if _among(c, SPACES) else c for c in text)
+    words = "".join(c for c in spaced if not _among(c, HIDDEN)).split(" ")
+    return " ".join(word for word in words if word)[:limit].rstrip(" ")
+
+
+def text_in_order(text, limit):
+    """Is `text` what an advert may carry as a name or a note: already what
+    a reader would show? A reader cuts and tidies what it is given; the exit
+    is told here instead."""
+    return tidy(text, limit) == text
+
+
+def _whole(value, low, high):
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def _mint_in_order(url):
+    rest = url[8:] if url.startswith("https://") else url[7:] if url.startswith("http://") else ""
+    in_an_address = re.fullmatch(r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", rest) is not None
+    return len(url.encode()) <= MAX_MINT_BYTES and in_an_address
+
+
+def advert_tags(advert, now):
+    """The tags of an advert as written at `now`, in the one order every
+    publisher writes them, or AdvertError for an advert no client would
+    list. `advert` is as payd/proto/vectors/advert.json writes one: access,
+    name, about, optionally country, expires, and terms, which is None
+    unless the access is paid."""
+    access, terms = advert["access"], advert.get("terms")
+    if access not in ACCESS_WORDS:
+        raise AdvertError(f"access is one of {', '.join(ACCESS_WORDS)}")
+    if not now < advert["expires"] <= now + MAX_LIFETIME:
+        raise AdvertError("the advert is over already, or valid for more than 31 days")
+    if not text_in_order(advert["name"], MAX_NAME):
+        raise AdvertError(f"the name is one line of at most {MAX_NAME} characters")
+    if not text_in_order(advert["about"], MAX_ABOUT):
+        raise AdvertError(f"the note is one line of at most {MAX_ABOUT} characters")
+    country = advert.get("country")
+    if country is not None and country not in COUNTRIES:
+        raise AdvertError(f"{country!r} is not a country: two capital letters, ISO 3166-1 (DE, IS, US, …)")
+    if (terms is not None) != (access == "paid"):
+        raise AdvertError("terms go with access paid, and only with it")
+    tags = [["d", D_TAG], ["v", VERSION], ["access", access]]
+    if advert["name"]:
+        tags.append(["name", advert["name"]])
+    if advert["about"]:
+        tags.append(["about", advert["about"]])
+    if country is not None:
+        tags.append(["country", country])
+    if terms is not None:
+        methods, mints, packages = terms["methods"], terms["mints"], terms["packages"]
+        ids = [package["id"] for package in packages]
+        in_order = (
+            _whole(terms["price_msat_per_gb"], 1, MAX_PRICE)
+            and methods and all(m in PAY_WORDS for m in methods) and len(set(methods)) == len(methods)
+            and _whole(terms["port"], 1, 65535)
+            and len(mints) <= MAX_MINTS and all(_mint_in_order(m) for m in mints) and len(set(mints)) == len(mints)
+            and len(packages) <= MAX_PACKAGES and len(set(ids)) == len(ids)
+            and all(re.fullmatch(r"[A-Za-z0-9._-]{1,20}", package["id"])
+                    and _whole(package["bytes"], 1, 10**15) and _whole(package["sat"], 1, 10**11)
+                    and _whole(package["days"], 1, 3660) for package in packages)
+        )
+        if not in_order:
+            raise AdvertError("the terms are out of bounds (payd/proto/src/lib.rs has them)")
+        tags.append(["price", str(terms["price_msat_per_gb"])])
+        tags.append(["pay", *methods])
+        tags.append(["port", str(terms["port"])])
+        tags += [["mint", mint] for mint in mints]
+        tags += [["package", p["id"], str(p["bytes"]), str(p["sat"]), str(p["days"])] for p in packages]
+    tags.append(["expiration", str(advert["expires"])])
+    return tags
+
+
+def build_event(seckey, tags, now, aux=None):
+    """The signed event (NIP-01), as a dict ready for `["EVENT", …]`."""
+    pub = schnorr_pubkey(seckey).hex()
+    body = json.dumps([0, pub, now, KIND, tags, ""], separators=(",", ":"), ensure_ascii=False)
+    event_id = hashlib.sha256(body.encode()).digest()
+    sig = schnorr_sign(event_id, seckey, os.urandom(32) if aux is None else aux)
+    return {"id": event_id.hex(), "pubkey": pub, "created_at": now, "kind": KIND,
+            "tags": tags, "content": "", "sig": sig.hex()}
+
+
+def parse_relay(url):
+    """(tls, host, port, path) of a relay URL. A relay on the mesh is
+    `ws://<npub>.fips`: plain `ws`, since fips already encrypts."""
+    found = re.fullmatch(r"(wss?)://([A-Za-z0-9.-]{1,253})(?::(\d{1,5}))?(/[!-~]*)?", url.strip())
+    if not found:
+        raise AdvertError(f"not a relay URL (ws:// or wss://): {url!r}")
+    tls, host = found.group(1) == "wss", found.group(2).lower()
+    # A name as the resolver takes one: it must not be the resolver that
+    # says so, with an error of its own.
+    if not all(re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", label) for label in host.split(".")):
+        raise AdvertError(f"not a host name in {url!r}")
+    port = int(found.group(3) or (443 if tls else 80))
+    if not 1 <= port <= 65535:
+        raise AdvertError(f"port out of range in {url!r}")
+    if host.endswith(".fips"):
+        try:
+            bech32_key(host[: -len(".fips")], "npub")
+        except ValueError:
+            raise AdvertError(f"a relay on the mesh is ws://<npub>.fips: {url!r}") from None
+        if tls:
+            raise AdvertError(f"a relay on the mesh is ws://, not wss://: {url!r}")
+    return tls, host, port, found.group(4) or "/"
+
+
+def parse_relays(text):
+    urls = text.replace(",", " ").split()
+    if not urls:
+        raise AdvertError("ADVERT_RELAYS is empty: name at least one relay to publish to")
+    if len(urls) > MAX_RELAYS:
+        raise AdvertError(f"ADVERT_RELAYS: at most {MAX_RELAYS} relays")
+    for url in urls:
+        parse_relay(url)
+    return urls
+
+
+def _receive(sock, n, deadline):
+    """Exactly `n` bytes, all of them before `deadline`: a relay that sends
+    a byte now and then is not waited for any longer than one that sends
+    nothing."""
+    data = b""
+    while len(data) < n:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise AdvertError("the relay did not answer in time")
+        sock.settimeout(left)
+        try:
+            chunk = sock.recv(n - len(data))
+        except TimeoutError:
+            raise AdvertError("the relay did not answer in time") from None
+        if not chunk:
+            raise AdvertError("the relay closed the connection")
+        data += chunk
+    return data
+
+
+def _send_frame(sock, opcode, payload):
+    """One masked, unfragmented client frame."""
+    head = bytes([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        head += bytes([0x80 | n])
+    elif n < 65536:
+        head += bytes([0x80 | 126]) + struct.pack(">H", n)
+    else:
+        head += bytes([0x80 | 127]) + struct.pack(">Q", n)
+    mask = os.urandom(4)
+    sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+
+def _receive_message(sock, deadline):
+    """The next text message, in one frame or in several, answering pings
+    and skipping the rest. What a relay sends is a stranger's: every length
+    is bounded, and so is the time (`deadline`)."""
+    parts, size = None, 0
+    while True:
+        first, second = _receive(sock, 2, deadline)
+        n = second & 0x7F
+        if n == 126:
+            (n,) = struct.unpack(">H", _receive(sock, 2, deadline))
+        elif n == 127:
+            (n,) = struct.unpack(">Q", _receive(sock, 8, deadline))
+        size += n
+        if size > 65536:
+            raise AdvertError("the relay sent an oversized frame")
+        mask = _receive(sock, 4, deadline) if second & 0x80 else None
+        payload = _receive(sock, n, deadline)
+        if mask:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        opcode, last = first & 0x0F, first & 0x80
+        if opcode == 0x8:
+            raise AdvertError("the relay closed the connection")
+        if opcode == 0x9:
+            _send_frame(sock, 0xA, payload)
+        if opcode >= 0x8:
+            size -= n  # a control frame may come between the parts of a message
+            continue
+        if opcode == 0x1:
+            parts = [payload]
+        elif opcode == 0x0 and parts is not None:
+            parts.append(payload)
+        else:
+            parts = None  # not text, or the rest of something that was not
+        if parts is None or last:
+            if parts is not None:
+                return b"".join(parts).decode("utf-8", "replace")
+            size = 0
+
+
+def shown(text, limit):
+    """A relay's words, as they may be printed: cut, and with nothing that
+    would do something to the terminal or the journal they are printed to."""
+    return "".join(c if c.isprintable() else "?" for c in str(text)[:limit])
+
+
+def publish(event, url, timeout=RELAY_TIMEOUT):
+    """Send `event` to one relay and return what it said ("" for accepted
+    with no remark). AdvertError when it was not accepted. The relay has
+    `timeout` seconds to be reached and as long again for everything else.
+
+    A relay on the mesh is reached by its name, through the host's own
+    resolver: asking fips for `<npub>.fips` is also what tells fips whose
+    address it is, without which it could not route there."""
+    tls, host, port, path = parse_relay(url)
+    sock = socket.create_connection((host, port), timeout=timeout)
+    deadline = time.monotonic() + timeout
+    try:
+        if tls:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        key = base64.b64encode(os.urandom(16)).decode()
+        named = host if port == (443 if tls else 80) else f"{host}:{port}"
+        sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {named}\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                      "Sec-WebSocket-Version: 13\r\nUser-Agent: fips-exit\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            if len(head) > 8192:
+                raise AdvertError("the relay's answer is not a WebSocket upgrade")
+            head += _receive(sock, 1, deadline)
+        status = head.split(b"\r\n", 1)[0].decode("latin-1")
+        if " 101" not in status:
+            raise AdvertError(f"the relay refused the WebSocket: {shown(status, 80)}")
+        _send_frame(sock, 0x1, json.dumps(["EVENT", event], separators=(",", ":"), ensure_ascii=False).encode())
+        while True:  # until the deadline, which _receive keeps
+            try:
+                answer = json.loads(_receive_message(sock, deadline))
+            except (ValueError, RecursionError):
+                continue  # not JSON, or JSON nested deeper than Python will follow
+            if isinstance(answer, list) and len(answer) >= 3 and answer[0] == "OK" and answer[1] == event["id"]:
+                remark = shown(answer[3], 120) if len(answer) > 3 else ""
+                if answer[2] is True:
+                    return remark
+                raise AdvertError(f"the relay rejected the advert: {remark}")
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def cmd_advert(what="publish"):
+    """Publish this exit's advert to the relays in ADVERT_RELAYS, or with
+    `show` print the event without sending it anywhere."""
+    if what not in ("publish", "show"):
+        raise TypeError(what)
+    config = load_config()
+    relays = config.get("ADVERT_RELAYS", "")
+    if what == "publish" and not relays.strip():
+        # Not an error: the timer may run on an exit that does not advertise.
+        print(f"fips-exit: no advert: ADVERT_RELAYS is not set in {CONFIG}")
+        return
+    if what == "publish" and not tun_present(config):
+        # Before anything is read that a stopped exit may not have: its
+        # mesh interface, for one. The timer finds this every hour then.
+        print("fips-exit: no advert: the exit is not running")
+        return
+    key_path = config.get("FIPS_KEY") or "/etc/fips/fips.key"
+    try:
+        urls = parse_relays(relays) if what == "publish" else []
+        key = read_key(key_path)
+        # The advert's author is the exit. A key that is not this node's
+        # (fips was given another identity since, or keeps none on disk)
+        # would advertise somebody else, or nobody.
+        here, signer = mesh_address(config), key_address(schnorr_pubkey(key))
+        if signer != here:
+            raise AdvertError(f"the key in {key_path} is not this node's: it is {signer}'s, "
+                              f"and {config['MESH_IF']} has {here}")
+        now = int(time.time())
+        # allow-list in both modes, for now: with ACCESS=paid nothing here
+        # takes a payment yet, so who is served is still who the operator
+        # put there, on the list or in an account.
+        tags = advert_tags({
+            "access": "allow-list",
+            "name": " ".join(config.get("ADVERT_NAME", "").split()),
+            "about": " ".join(config.get("ADVERT_ABOUT", "").split()),
+            "country": config.get("COUNTRY") or None,
+            "expires": now + ADVERT_TTL,
+            "terms": None,
+        }, now)
+        event = build_event(key, tags, now)
+    except AdvertError as error:
+        die(str(error))
+    if what == "show":
+        print(json.dumps(event, ensure_ascii=False))
+        return
+    accepted = 0
+    for url in urls:
+        try:
+            remark = publish(event, url)
+            accepted += 1
+            print(f"{url}: accepted" + (f" ({remark})" if remark else ""))
+        except Exception as error:  # whatever one relay does, the next is still tried
+            print(f"{url}: {shown(error, 160)}")
+    if not accepted:
+        die("no relay took the advert")
+
+
+
 def cmd_add(who, name=""):
     address = parse_client(who)
     clients = load_clients()
@@ -765,7 +1283,7 @@ def cmd_accounts():
 
 def main(argv):
     commands = {"up": cmd_up, "down": cmd_down, "add": cmd_add, "remove": cmd_remove,
-                "list": cmd_list, "status": cmd_status, "accounts": cmd_accounts}
+                "list": cmd_list, "status": cmd_status, "accounts": cmd_accounts, "advert": cmd_advert}
     if len(argv) < 2 or argv[1] not in commands:
         sys.exit(__doc__)
     try:

@@ -18,7 +18,9 @@ root:
   the daemon is started with `--control`.
 - `fips-exit` (a Python script): everything around it. The client list, the
   TUN's routes, NAT to the uplink, an nftables table of its own, and the
-  openings it makes in two firewalls it knows (fips's own, and ufw).
+  openings it makes in two firewalls it knows (fips's own, and ufw). And,
+  when the operator names relays, the exit's advert on Nostr: for that it
+  reads the node's secret key and signs one event an hour with it.
 
 Clients are fips2go phones and other fips nodes. The wire contract is shared
 with fips2go (`shim/src/exit.rs`) and its exit container
@@ -62,6 +64,17 @@ IPv4 address derived from the client's fips address.
    arguments of `ip` and `sysctl`. Not hostile, but a typo there runs as
    root. `ACCESS` is one of two words or the script stops: a word that is
    neither must not quietly mean the open one.
+
+7. **What a relay answers** to `fips-exit advert`. The script is the client:
+   it reads an HTTP status line and WebSocket frames from whoever is at the
+   address the operator named. The header is at most 8192 bytes and a
+   message 65536, in one frame or in several. A relay has ten seconds to be
+   reached and ten for all of its answer, however it spaces it out; the unit
+   has five minutes for all relays. The only thing acted on is an `OK` for
+   the event just sent; what is not JSON, or JSON too deep to read, is
+   passed over. What a relay says in words is printed, cut and with nothing
+   but printable characters. Whatever one relay does, the next is still
+   tried. A `wss://` relay's certificate is checked as Python checks any.
 
 ## Things that would be serious in this codebase
 
@@ -116,6 +129,18 @@ IPv4 address derived from the client's fips address.
 - **An open resolver.** The daemon answering DNS for a node that is not a
   listed client, or answering something that is not a query. Either makes
   the exit a resolver, and a reflector, for the whole mesh.
+- **The node's key going anywhere.** `fips-exit advert` reads the fips
+  identity's secret key. It must never be printed, logged, put in an error
+  message or sent: only the signature leaves. That includes a key file that
+  holds something else, whose contents are not repeated either. Whoever has
+  the key is the node, on the mesh and on Nostr.
+- **An advert that is not this exit's, or says more than the exit does.**
+  Signed with a key that is not the node's own (it is compared with the
+  mesh interface's address first); naming an access the exit does not give;
+  or tags that are not what `payd/proto` specifies, which clients would
+  pass over or, worse, read differently. And an advert sent anywhere the
+  operator did not name: publishing is by `ADVERT_RELAYS` alone, and the
+  timer is not enabled by the installer.
 - **Parsing the inner packet.** Out-of-bounds reads and length arithmetic in
   the two places that look inside a packet. A panic here is a remote
   denial of service for every client.
@@ -137,6 +162,8 @@ IPv4 address derived from the client's fips address.
   can ask first (`check`), and has to drop accounts that are finished, or
   the smallest one holds an address for ever. The remedy is a wider inner
   address, which is a change to the contract with fips2go.
+- **An advert is not taken back.** An exit that stops is listed until its
+  last advert expires, three hours at most.
 - **Nothing makes accounts yet.** `ACCESS=paid` serves the members of
   accounts; what makes the accounts, a payment service, is not written. Until
   it is, the mode is of use only to someone who writes to the socket by hand.
@@ -188,6 +215,15 @@ IPv4 address derived from the client's fips address.
 - A resolver that cannot start (port 53 taken, no upstream) is logged and
   the daemon keeps running: the tunnel is still of use to a client that
   brings its own names.
+- The advert's signature is BIP-340 as the BIP writes it, in Python, and not
+  constant-time. It signs one public event an hour on the machine the key
+  lives on; there is nobody to time it.
+- The advert says `allow-list` whatever `ACCESS` is, until something here
+  takes a payment: who is served is who the operator put there. The country
+  in it is the operator's claim and is checked only for being a country.
+- The advert tells the world that this npub is an exit, and tells each
+  internet relay this host's address. That is its purpose, and it is the
+  operator's choice: nothing is published unless `ADVERT_RELAYS` names where.
 - Accounts are kept in memory and are gone after a restart, when nobody but
   the listed clients is carried until they are made again. What was used
   between the last `usage` and the restart is forgotten: the program that

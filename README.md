@@ -76,6 +76,47 @@ On the client, enter this node's npub as the exit node. A direct fips link
 between client and exit (add the exit as a peer) keeps latency down; it is
 not required.
 
+### Being found
+
+An exit says nothing about itself unless it is told to. With relays named
+in the config it publishes an advert on Nostr, signed with the node's fips
+key, which is what a fips2go phone's *Find exit nodes* reads:
+
+```sh
+ADVERT_RELAYS="wss://relay.example.org ws://npub1….fips"   # where to say it
+ADVERT_NAME="An exit"                    # optional, up to 40 characters
+ADVERT_ABOUT="In a rack in Frankfurt"    # optional, up to 200
+COUNTRY=DE                               # optional: where the exit is, ISO 3166-1 alpha-2
+```
+
+A value in double quotes is taken as it is, a `#` included; outside quotes
+a `#` begins a comment.
+
+```sh
+sudo fips-exit advert show                           # the event, sent nowhere
+sudo fips-exit advert                                # publish it now
+sudo systemctl enable --now fips-exit-advert.timer   # and every hour
+```
+
+- The advert says that this npub is an exit, the name and the note, the
+  country, and `allow-list`: that it serves whom its operator put on its
+  list. It says that with `ACCESS=paid` as well, for as long as nothing here
+  takes a payment. Anyone can read it. The country is your claim; nobody
+  checks it.
+- It is valid for three hours and published again every hour. An exit that
+  stops drops out of the lists within three hours; nothing takes the advert
+  back sooner.
+- A relay on the internet (`wss://`) also learns this host's address, as
+  with any connection. A relay on the mesh is `ws://<npub>.fips`. fips2go
+  looks on `wss://relay.damus.io`, `wss://nos.lol` and `wss://offchain.pub`
+  unless its user changed that, and on the mesh relays its user named.
+- The key is read from `/etc/fips/fips.key` (`FIPS_KEY=` in the config if it
+  is elsewhere), so this runs as root, like the rest. A node that keeps no
+  identity on disk cannot advertise: its npub is another one after every
+  start.
+- What the tags are is specified in `payd/proto`; the script and that crate
+  are held to the same file of cases.
+
 ### Accounts
 
 With `ACCESS=paid` in the config the exit also carries addresses that are
@@ -207,8 +248,9 @@ an optimisation, not a requirement.
 
 Optional paid public exits (an advert with price and country, prepaid data
 packages, pay-as-you-go) are designed in
-[`docs/paid-exit.md`](docs/paid-exit.md). Its first phase is here: accounts
-and `ACCESS=paid`, above. Nothing yet announces an exit or takes a payment.
+[`docs/paid-exit.md`](docs/paid-exit.md). Its first two phases are here:
+accounts and `ACCESS=paid`, and the advert, both above. Nothing yet takes a
+payment, so no exit says that it is a paid one.
 
 ## Test
 
@@ -216,6 +258,7 @@ and `ACCESS=paid`, above. Nothing yet announces an exit or takes a payment.
 cargo test                      # the daemon's admission and routing rules
 cargo build --release && unshare -Urnm test/netns.sh
 cargo test --manifest-path payd/Cargo.toml   # the advert's tags and the price
+python3 -I -m unittest discover -s test      # the script's advert
 ```
 
 The second runs the daemon and the script against the real kernel, without
@@ -233,9 +276,13 @@ The third is `payd/proto`, a crate with no dependencies that the exit and
 its clients share: what an exit's advert on Nostr says (who it serves, where
 it is, and for a paid exit what it costs) and what a number of bytes costs
 at a price. It is checked against `payd/proto/vectors/advert.json`, and so
-is every other implementation of the same: nothing publishes an advert yet.
-`payd/` has a lockfile of its own, so that the daemon keeps its one
-dependency.
+is every other implementation of the same. `payd/` has a lockfile of its
+own, so that the daemon keeps its one dependency.
+
+The fourth is the script's side of the advert: the signature against the
+vectors of BIP-340, the tags against the same file of cases, and the
+publishing against a relay that runs inside the test. Nothing in the tests
+talks to a relay on the internet.
 
 ## Contributing
 

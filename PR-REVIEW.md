@@ -19,8 +19,10 @@ Skip and say so briefly:
   moves `actions/checkout`, which runs with the repository's contents in
   hand and is pinned for that reason.
 
-Everything touching `src/`, `fips-exit`, `fips-exit.service`, `install.sh`,
-`test/` or `.github/workflows/` gets a real review.
+Everything touching `src/`, `payd/`, `fips-exit`, `fips-exit.service`,
+`install.sh`, `test/` or `.github/workflows/` gets a real review.
+`payd/proto` and its vectors are a contract with every client: a change
+there is a change for all of them.
 
 ## Step 2 — Gather context
 
@@ -29,7 +31,8 @@ Do this before reading a single diff hunk.
 1. **PR metadata.** `gh pr view <n>` and `gh pr diff <n>`. Does the body say
    what the change does and why, or only what it touches?
 2. **CI state.** `gh pr checks <n>`. The `checks` job runs the daemon's unit
-   tests and `test/netns.sh`, the whole exit in network namespaces. Read why
+   tests, `test/netns.sh`, the whole exit in network namespaces, and the
+   tests of `payd/proto` against its vectors. Read why
    a check is red before believing it. There is no automated security scan:
    that review is section B below, done by a person with
    `SECURITY-REVIEW.md` open.
@@ -58,7 +61,10 @@ Do this before reading a single diff hunk.
    `src/main.rs`, in `fips-exit`, and in fips2go; the MSS values (1200 for
    IPv4, 1180 for IPv6) live here and in fips2go. A PR that changes one
    place changes all of them or explains why not. CI holds the daemon and
-   the script to the same test vectors.
+   the script to the same test vectors. The tags of an exit's advert and the
+   price of a byte live in `payd/proto` and in every client that reads an
+   advert: `payd/proto/vectors/advert.json` is what they are all held to,
+   and a change to the tags is a change to that file first.
 5. **Untrusted input is treated as hostile.** Anything that reads a packet
    (`Clients::admits`, `Clients::route`) handles bytes a stranger chose, and
    `parse_command` handles bytes a peer on the control socket chose. Check

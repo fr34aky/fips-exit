@@ -215,6 +215,7 @@ and `ACCESS=paid`, above. Nothing yet announces an exit or takes a payment.
 ```sh
 cargo test                      # the daemon's admission and routing rules
 cargo build --release && unshare -Urnm test/netns.sh
+cargo test --manifest-path payd/Cargo.toml   # the advert's tags and the price
 ```
 
 The second runs the daemon and the script against the real kernel, without
@@ -227,6 +228,14 @@ node without an account is carried, two members share an account counted to
 the byte and are cut off at the grant, a member reaches the internet and
 neither the uplink's LAN nor port 25, and leaving the mode removes what it
 made.
+
+The third is `payd/proto`, a crate with no dependencies that the exit and
+its clients share: what an exit's advert on Nostr says (who it serves, where
+it is, and for a paid exit what it costs) and what a number of bytes costs
+at a price. It is checked against `payd/proto/vectors/advert.json`, and so
+is every other implementation of the same: nothing publishes an advert yet.
+`payd/` has a lockfile of its own, so that the daemon keeps its one
+dependency.
 
 ## Contributing
 

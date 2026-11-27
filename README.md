@@ -138,6 +138,12 @@ an optimisation, not a requirement.
   commands are in `test/netns.sh`). A kernel client cannot send a non-TCP
   IPv6 packet over 1240 bytes, for the reason above.
 
+## Planned
+
+Optional paid public exits (an advert with price and country, prepaid data
+packages, pay-as-you-go) are designed in
+[`docs/paid-exit.md`](docs/paid-exit.md). None of it is implemented yet.
+
 ## Test
 
 ```sh

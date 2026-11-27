@@ -9,7 +9,11 @@ Requires=fips.service
 # fips's interface by itself); fips-exit then applies routes, NAT and the
 # firewall for the clients in /etc/fips-exit/clients.
 # DNS_UPSTREAMS for the daemon's resolver, if the config sets it.
+# ACCESS=paid there makes the daemon open its control socket for accounts,
+# in the directory below: root's, and gone with the service.
 EnvironmentFile=-/etc/fips-exit/config
+RuntimeDirectory=fips-exit
+RuntimeDirectoryMode=0750
 ExecStart=/usr/local/sbin/fips-exitd
 ExecStartPost=/bin/sh -c 'for i in $(seq 80); do ip link show fipsexit0 >/dev/null 2>&1 && exec /usr/local/sbin/fips-exit up; sleep 0.5; done; exit 1'
 ExecStopPost=/usr/local/sbin/fips-exit down

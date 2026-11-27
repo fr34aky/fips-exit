@@ -78,7 +78,11 @@ Do this before reading a single diff hunk.
    reached the grant, bar the packet that crosses.
 8. **The firewall still isolates.** Through the tunnel a client reaches the
    uplink and nothing else on this host, and not another client; the
-   internet reaches a client only as a reply. `SECURITY-REVIEW.md` lists
+   internet reaches a client only as a reply. A member of an account gets no
+   more than a listed client, and not TCP port 25. With `ACCESS=paid` the
+   openings in fips's firewall and ufw are for the whole mesh, so they must
+   be exactly the tunnel and the resolver, to this node's own address; in
+   the default mode they stay per listed client. `SECURITY-REVIEW.md` lists
    what is known to be missing here; a PR must not add to it silently.
 9. **Root's commands are built from parsed values.** Addresses go through
    `ipaddress`, interface names are checked, commands are argument lists,

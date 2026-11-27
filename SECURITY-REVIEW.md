@@ -32,7 +32,9 @@ IPv4 address derived from the client's fips address.
    daemon then reads the inner packet's version, length and source address
    (`Clients::admits`) before anything is written to the TUN. What fips
    guarantees is the outer source: it is the session's authenticated peer.
-   Everything inside is the sender's.
+   Everything inside is the sender's. With `ACCESS=paid` the firewalls in
+   front of the daemon admit these packets from every node, so the daemon
+   sees all of them, and the kernel reassembles fragments from anyone.
 2. **Packets from the internet**, arriving on the TUN after NAT, routed back
    to a client by their destination (`Clients::route`).
 3. **DNS queries from clients, and answers from the upstream resolvers.**
@@ -58,7 +60,8 @@ IPv4 address derived from the client's fips address.
    command line, and `WAN`, `MESH_IF`, `TUN` and `FIPS_FIREWALL` in
    `/etc/fips-exit/config`. These end up in nftables scripts and in
    arguments of `ip` and `sysctl`. Not hostile, but a typo there runs as
-   root.
+   root. `ACCESS` is one of two words or the script stops: a word that is
+   neither must not quietly mean the open one.
 
 ## Things that would be serious in this codebase
 
@@ -89,6 +92,15 @@ IPv4 address derived from the client's fips address.
   the script, and in fips2go. If they disagree the exit silently refuses
   every client, or routes replies to nobody. CI checks the daemon and the
   script against the same vectors fips2go tests.
+- **Paid mode opening more than the tunnel.** With `ACCESS=paid` the
+  script's openings in fips's firewall and in ufw are no longer for listed
+  addresses but for every node of the mesh. They must stay what they are:
+  next header 4, 41 and 44, and UDP port 53 only while the daemon's resolver
+  runs, to this node's own fips address, and nothing else. In that mode the
+  daemon is the only lock; a member must get no more through the tunnel than
+  a listed client does, and not TCP port 25. And the mode must be the
+  operator's choice: nothing but `ACCESS=paid` may turn it on, and leaving it
+  must close what it opened.
 - **Firewall leaks.** A client reaching this host, another client, or
   anything that is not the public internet — the uplink interface is usually
   the LAN too, so the destination lists (`BLOCKED_V4`, `BLOCKED_V6` in the
@@ -125,10 +137,18 @@ IPv4 address derived from the client's fips address.
   can ask first (`check`), and has to drop accounts that are finished, or
   the smallest one holds an address for ever. The remedy is a wider inner
   address, which is a change to the contract with fips2go.
-- **Nothing makes accounts yet, and the script does not serve them.** Routes
-  and firewall entries are made for the clients on the list. Until the script
-  has a mode for members, an account's member is carried by the daemon and
-  dropped by the firewall.
+- **Nothing makes accounts yet.** `ACCESS=paid` serves the members of
+  accounts; what makes the accounts, a payment service, is not written. Until
+  it is, the mode is of use only to someone who writes to the socket by hand.
+- **Paid mode's check of the host looks at the main routing table only.**
+  `up` refuses a host with an address, a route or a resolver in
+  `100.64.0.0/10`. A route there that sits in another table, behind a policy
+  rule, is not seen (an address on an interface is, which is how Tailscale is
+  caught).
+- **This host can send to a member's inner address, and it is counted.** The
+  route to the tunnel is the host's too, as it is for a listed client. A
+  process on the exit that sends there is carried to the member on the
+  member's bytes.
 - **The config's interface names are not checked.** `WAN`, `MESH_IF` and
   `TUN` from `/etc/fips-exit/config` are placed in the nftables script as
   written. The file is root's, so this is a typo running as root rather than
@@ -145,6 +165,21 @@ IPv4 address derived from the client's fips address.
   README.
 - The script's own nftables chains have policy accept. They only see traffic
   to and from the TUN, and each ends in an explicit verdict.
+- With `ACCESS=paid` the firewall is not a second lock in front of the
+  daemon: it cannot know the members, so it admits the tunnel from the whole
+  mesh and `Clients::admits` decides alone. The clients' whole ranges are
+  routed to the TUN for the same reason, and the daemon drops what it finds
+  no client for. The README says what the mode opens.
+- In paid mode the IPv6 route to the tunnel is for all of `fd00::/8`, and is
+  looked at only for packets of connections that came out of the tunnel:
+  those are marked there, with one bit of the connection mark. Looked at
+  for everything forwarded, as the per-client routes of the default mode
+  are, it would take every forwarded packet to a unique-local address; for
+  everything from the uplink, a fips gateway's LAN traffic too. Something
+  else on the host that sets or clears that bit breaks IPv6 for the members,
+  or sends its own traffic to the tunnel, where it is dropped as nobody's.
+- TCP port 25 is closed to members and open to listed clients, who are the
+  operator's own.
 - The exit's operator sees its clients' traffic, as any VPN endpoint does.
 - The resolver forwards and nothing more: no cache, no DNSSEC validation,
   no filtering of private addresses in answers (a client could not reach

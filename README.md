@@ -74,6 +74,43 @@ On the client, enter this node's npub as the exit node. A direct fips link
 between client and exit (add the exit as a peer) keeps latency down; it is
 not required.
 
+### Accounts
+
+The daemon can also carry addresses that are not on the list, for a number
+of bytes: the *members of an account*. This is the base for selling access,
+not the selling. Nothing in this repository makes an account yet, the unit
+does not turn it on, and the script's routes and firewall are still made for
+the clients on the list only.
+
+- An account has bytes granted and bytes used. Its members share them.
+- A member's packet is counted once it has been passed on: the length of the
+  inner packet, in both directions. That is before the firewall decides, so
+  a packet to a destination the exit refuses is counted and then dropped.
+- When the count reaches the grant, the members are not carried any
+  further. The packet that crosses the line still is.
+- DNS is answered for a member while its account has bytes, and not counted.
+- A client on the list is never counted, and wins over a member with the
+  same address or the same derived IPv4 address. A member whose derived IPv4
+  address is another client's is carried for IPv6 only.
+- Accounts are kept in memory. After a restart there are none.
+
+Accounts are made over a Unix socket, which the daemon opens only when it is
+started with `--control <path>`, for root alone. One command a line; every
+answer ends in a line that begins `ok` or `err`; every number is a total, so
+that a command sent twice changes nothing.
+
+```text
+put <account> <granted> <used_in> <used_out> <address,…|->   make it, or raise its numbers; replace its members
+grant <account> <granted>                                     raise what it may use, in all
+members <account> <address,…|->                               replace its members
+drop <account>
+usage [account]                                               account <name> <granted> <used_in> <used_out>
+check <address>                                               static | member <account> v4|no4 | free v4|no4
+stat                                                          epoch=<start> accounts=<n> resolver=<0|1>
+```
+
+Whoever can write to that socket decides who uses the exit and for how much.
+
 ## Packet sizes
 
 A mesh packet is at most 1280 bytes at fips's default transport MTU, so 1240
@@ -102,7 +139,9 @@ an optimisation, not a requirement.
   clients are answered, so it is not an open resolver for the mesh. It caches
   nothing and validates nothing: it is as good as the resolver behind it,
   which also sees the names (from the exit, not from the client). An answer
-  too large for one mesh packet is returned truncated; UDP only.
+  too large for one mesh packet is returned truncated; UDP only. At most 16
+  of one client's queries are being forwarded at a time, of 64 in all; one
+  more is dropped, and the client's resolver asks again.
 
 - **A client reaches the public internet and nothing else.** Not this host,
   not another client, and not the uplink's own network: private and
@@ -149,7 +188,8 @@ The second runs the daemon and the script against the real kernel, without
 root and without fips: network namespaces stand in for two clients, the
 exit and the internet, and a 1280-byte link stands in for the mesh. It
 checks both families, NAT, full-size packets in both directions, TCP, the
-binding of a client to its addresses, isolation, removal and teardown.
+binding of a client to its addresses, isolation, removal and teardown, and
+an account: its member counted to the byte and cut off at the grant.
 
 ## Contributing
 

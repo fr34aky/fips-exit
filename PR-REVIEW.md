@@ -60,39 +60,47 @@ Do this before reading a single diff hunk.
    place changes all of them or explains why not. CI holds the daemon and
    the script to the same test vectors.
 5. **Untrusted input is treated as hostile.** Anything that reads a packet
-   (`Clients::admits`, `Clients::route`) handles bytes a stranger chose.
-   Check bounds and length arithmetic, and what a truncated packet does. A
+   (`Clients::admits`, `Clients::route`) handles bytes a stranger chose, and
+   `parse_command` handles bytes a peer on the control socket chose. Check
+   bounds and length arithmetic, and what a truncated packet or line does. A
    panic is a denial of service for every client.
 6. **Admission is still exact.** A packet enters the tunnel only from a
-   listed client and only with that client's own inner source address. A
-   reply goes only to the client its destination belongs to. Two clients may
-   never share an inner address, in `add` or in a list edited by hand. The
-   resolver answers listed clients only, and only queries.
-7. **The firewall still isolates.** Through the tunnel a client reaches the
+   listed client, or from a member of an account that has bytes left, and
+   only with that client's own inner source address, which it must also
+   hold. A reply goes only to the client its destination belongs to. Two
+   clients may never share an inner address, in `add`, in a list edited by
+   hand, or as members. The resolver answers those clients only, and only
+   queries. A listed client is never displaced by a member, and a reload of
+   the list leaves the accounts as they were.
+7. **What a member is carried is counted, once.** After the packet was
+   passed on, by its inner length, against its own account. The three
+   numbers of an account only grow; nothing is carried once the count has
+   reached the grant, bar the packet that crosses.
+8. **The firewall still isolates.** Through the tunnel a client reaches the
    uplink and nothing else on this host, and not another client; the
    internet reaches a client only as a reply. `SECURITY-REVIEW.md` lists
    what is known to be missing here; a PR must not add to it silently.
-8. **Root's commands are built from parsed values.** Addresses go through
+9. **Root's commands are built from parsed values.** Addresses go through
    `ipaddress`, interface names are checked, commands are argument lists,
    never a shell string. Nothing from the client list, the config or the
    command line is pasted into an nftables script as it came.
-9. **`down` removes what `up` made**, and only that: this script's table,
-   its routes, its tagged rules in fips's firewall and in ufw. Other
-   people's rules are not touched.
-10. **What it does to the machine is said in the README.** Forwarding,
+10. **`down` removes what `up` made**, and only that: this script's table,
+    its routes, its tagged rules in fips's firewall and in ufw. Other
+    people's rules are not touched.
+11. **What it does to the machine is said in the README.** Forwarding,
     `accept_ra`, the firewalls it opens. An operator must be able to read
     what running this changes before running it.
-11. **The PR states how it was verified.** `cargo test` and
+12. **The PR states how it was verified.** `cargo test` and
     `unshare -Urnm test/netns.sh` at least, and for anything the namespaces
     cannot show (a real uplink, ufw, fips's firewall, a phone as the
     client), what was run on a real node — or that it was not.
 
 ### C. Consequences
 
-12. **Existing clients and installs.** Does an upgrade change a client's
+13. **Existing clients and installs.** Does an upgrade change a client's
     address, need a step from the operator, or leave old state behind? Say
     so in the commit message and the README.
-13. **The install path still works.** `install.sh`, the unit file's start
+14. **The install path still works.** `install.sh`, the unit file's start
     and stop commands, and the paths they name stay in step.
 
 ## Step 4 — Compose the review

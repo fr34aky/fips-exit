@@ -1,2 +1,4 @@
 [toolchain]
 channel = "1.94.1"
+# CI lints and checks the formatting of the payment service.
+components = ["clippy", "rustfmt"]

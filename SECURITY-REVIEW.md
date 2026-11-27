@@ -23,6 +23,11 @@ root:
   openings it makes in two firewalls it knows (fips's own, and ufw). And,
   when the operator names relays, the exit's advert on Nostr: for that it
   reads the node's secret key and signs one event an hour with it.
+- `fips-exit-payd` (`payd/payd`, Rust with tokio and hyper): the payment
+  service, for `ACCESS=paid`. Not root: a user made for it by systemd, with
+  no capability and little of the machine. It answers HTTP on the node's
+  fips address. So far it reads the config and says what the exit costs; it
+  takes no payment, holds no money, and has no way to make an account.
 
 Clients are fips2go phones and other fips nodes. The wire contract is shared
 with fips2go (`shim/src/exit.rs`) and its exit container
@@ -77,6 +82,17 @@ IPv4 address derived from the client's fips address.
    passed over. What a relay says in words is printed, cut and with nothing
    but printable characters. Whatever one relay does, the next is still
    tried. A `wss://` relay's certificate is checked as Python checks any.
+8. **Requests to the payment service.** Anyone on the mesh may connect to
+   `PAY_PORT` in paid mode; the firewalls are opened for that. A peer whose
+   address is not a fips address is closed at once. A request must name
+   this exit in `Host` (its `[address]:port` or `<npub>.fips:port`), or it is
+   answered 421: a page elsewhere must not be able to read what this one
+   says to a browser on the mesh. Only `GET` and `HEAD`, three paths. A
+   header has 5 seconds and 16 KiB, a connection a minute; there are 64
+   connections at once and 8 from one address. What the service says back
+   is the operator's config and the caller's own address, and the
+   operator's text is escaped on the page, which has no script and loads
+   nothing from elsewhere.
 
 ## Things that would be serious in this codebase
 
@@ -138,6 +154,16 @@ IPv4 address derived from the client's fips address.
 - **An open resolver.** The daemon answering DNS for a node that is not a
   listed client, or answering something that is not a query. Either makes
   the exit a resolver, and a reflector, for the whole mesh.
+- **The payment service reaching further than its port.** It runs without
+  privilege and must stay so: a change that gives it a capability, a
+  writable path outside its own, the control socket (before that is meant,
+  with accounts), or the node's key. And its port must be opened in paid
+  mode only, to this node's address only, and only while the service
+  itself listens there (`up` asks the kernel which process does): leaving
+  paid mode, or the service stopping, closes it.
+- **The payment service naming another node.** It shows an npub, and
+  answers to `<npub>.fips`, only when that npub's fips address is the one
+  it answers on; a stale key file is not believed.
 - **The node's key going anywhere.** `fips-exit advert` reads the fips
   identity's secret key. It must never be printed, logged, put in an error
   message or sent: only the signature leaves. That includes a key file that

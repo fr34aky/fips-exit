@@ -92,6 +92,8 @@ client c2 $C2 $C2V4
 client c3 $C3 $C3V4
 printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n" > "$FIPS_EXIT_DIR/config"
 daemon="$here/target/release/fips-exitd"
+payd="$here/payd/target/release/fips-exit-payd"
+[ -x "$payd" ] || fail "build the payment service first: cargo build --release --manifest-path payd/Cargo.toml"
 [ -x "$daemon" ] || fail "build the daemon first: cargo build --release"
 
 # --- without the daemon, the script says so and applies nothing ----------------
@@ -468,6 +470,58 @@ ok "paid mode starts where the clients' range is free, and not where the host us
 [ "$(ctl "check $C3")" = "ok free v4" ] || fail "after drop: $(ctl "check $C3")"
 ok "paid mode carries the clients on the list, and no node that has no account or no grant"
 
+# --- the payment service: what the exit costs, for anyone on the mesh -----------
+# It reads the same config, finds the exit's fips address itself, and answers
+# there; the script has opened its port in fips's firewall, to that address.
+# A node that is no client at all asks, and is told who it is.
+http_get() { # netns path [Host header] -> status, then the body
+  ip netns exec "$1" python3 -c '
+import http.client, sys
+c = http.client.HTTPConnection(sys.argv[1], 5170, timeout=4)
+try:
+    c.request("GET", sys.argv[2], headers={"Host": sys.argv[3]})
+    r = c.getresponse(); print(r.status); sys.stdout.write(r.read().decode())
+except OSError: print("unreachable")' $E "$2" "${3:-[$E]:5170}"
+}
+conf "ACCESS=nonsense\n"
+"$payd" --config "$FIPS_EXIT_DIR/config" 2>&1 | grep -q "nothing to sell" || fail "the payment service on an exit that sells nothing"
+conf "ACCESS=paid\nPRICE_MSAT_PER_GB=2000000\nPACKAGES=\"1gb:1GB:1500:30 5gb:5GB:6000:90\"\nCOUNTRY=CH\nADVERT_NAME=\"An exit\"\n"
+# Nothing listens on the port yet, so it is not opened: whatever else might
+# listen there is not for the mesh.
+grep -q "dport 5170" "$fw/fips.d/fips-exit.nft" && fail "THE PAYMENT PORT WAS OPENED WITH NO SERVICE BEHIND IT"
+nc_listener() { python3 -c 'import socket,time; s=socket.socket(socket.AF_INET6); s.bind(("::",5170)); s.listen(1); time.sleep(30)' & }
+nc_listener; other=$!
+sleep 0.3
+"$here/fips-exit" up >/dev/null
+grep -q "dport 5170" "$fw/fips.d/fips-exit.nft" && fail "THE PAYMENT PORT WAS OPENED FOR SOMETHING THAT IS NOT THE SERVICE"
+kill $other; wait $other 2>/dev/null || true
+"$payd" --config "$FIPS_EXIT_DIR/config" --pub "$FIPS_EXIT_DIR/none.pub" 2>>"$FIPS_EXIT_DIR/payd.log" &
+payd_pid=$!
+# As the service's unit does when it has started: `up`, which waits for it to listen.
+"$here/fips-exit" up >/dev/null
+grep -qx "ip6 daddr $E tcp dport 5170 accept" "$fw/fips.d/fips-exit.nft" || fail "the payment port in fips's firewall: $(cat "$fw/fips.d/fips-exit.nft")"
+"$here/fips-exit" status | grep -q "payment service fips-exit-payd: answering on port 5170" || fail "status: $("$here/fips-exit" status)"
+r=$(http_get c3 /v1/terms)
+[ "${r%%
+*}" = 200 ] || fail "the terms from the mesh: $r $(cat "$FIPS_EXIT_DIR/payd.log")"
+printf '%s' "${r#*
+}" | python3 -c '
+import json, sys
+t = json.load(sys.stdin)
+assert t["version"] == 1, t
+assert t["you"] == {"address": sys.argv[1]}, t["you"]
+assert t["exit"] == {"npub": None, "address": sys.argv[2], "name": "An exit", "about": "", "country": "CH"}, t["exit"]
+assert t["price_msat_per_gb"] == 2000000 and t["methods"] == [] and t["mints"] == [], t
+assert [p["id"] for p in t["packages"]] == ["1gb", "5gb"] and t["packages"][1]["bytes"] == 5000000000, t' $C3 $E \
+  || fail "the terms said: ${r#*
+}"
+r=$(http_get c3 /)
+case "$r" in "200
+"*"<title>An exit</title>"*"5 GB"*"You are <code>$C3</code>"*) ;; *) fail "the page: $r" ;; esac
+[ "$(http_get c3 /v1/terms "evil.example")" = "421
+not this exit's name" ] || fail "a request for another name: $(http_get c3 /v1/terms evil.example)"
+ok "the payment service tells any node on the mesh what the exit costs, and who it is"
+
 # --- a removed client is cut off, even when `up` then stops -------------------------
 # `remove` saves the list and applies it. If applying stops at something (here:
 # the host has moved into the clients' range), the client must still be gone
@@ -569,6 +623,18 @@ ip route show dev fipsexit0 | grep -q "100.64.0.0/10" && fail "the clients' whol
 ip -6 rule show | grep "lookup 5170" | grep -q fwmark && fail "paid mode's rule is still there"
 nft list chain inet fips_exit replies >/dev/null 2>&1 && fail "paid mode's marking of connections is still there"
 grep -q "daddr" "$fw/fips.d/fips-exit.nft" && fail "fips's firewall is still open to the mesh: $(cat "$fw/fips.d/fips-exit.nft")"
+# The payment service still runs, and the mesh no longer reaches it.
+[ "$(http_get c3 /v1/terms)" = unreachable ] || fail "THE PAYMENT SERVICE WAS REACHABLE WITHOUT PAID MODE"
+# In paid mode again, and the service stops: as its unit does then, `up`, and
+# the port is closed.
+conf "ACCESS=paid\n"
+"$here/fips-exit" up >/dev/null
+grep -q "dport 5170" "$fw/fips.d/fips-exit.nft" || fail "the payment port after paid mode came back"
+kill $payd_pid; wait $payd_pid 2>/dev/null || true
+"$here/fips-exit" up >/dev/null
+grep -q "dport 5170" "$fw/fips.d/fips-exit.nft" && fail "THE PAYMENT PORT STAYED OPEN AFTER THE SERVICE STOPPED"
+conf ""
+"$here/fips-exit" up >/dev/null
 [ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "a member was served without paid mode"
 # The daemon would still answer this member, whose account has bytes: here it
 # is fips's firewall alone that keeps its query out.

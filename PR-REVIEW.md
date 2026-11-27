@@ -19,8 +19,10 @@ Skip and say so briefly:
   moves `actions/checkout`, which runs with the repository's contents in
   hand and is pinned for that reason.
 
-Everything touching `src/`, `payd/`, `fips-exit`, `fips-exit.service`,
-`install.sh`, `test/` or `.github/workflows/` gets a real review.
+Everything touching `src/`, `payd/`, `fips-exit`, the units (`*.service`,
+`*.timer`), `install.sh`, `test/` or `.github/workflows/` gets a real review.
+`payd/payd` faces the whole mesh: its limits, its `Host` check and the
+unit's sandbox are what a review of it starts with.
 `payd/proto` and its vectors are a contract with every client: a change
 there is a change for all of them.
 
@@ -92,7 +94,8 @@ Do this before reading a single diff hunk.
    internet reaches a client only as a reply. A member of an account gets no
    more than a listed client, and not TCP port 25. With `ACCESS=paid` the
    openings in fips's firewall and ufw are for the whole mesh, so they must
-   be exactly the tunnel and the resolver, to this node's own address; in
+   be exactly the tunnel, the resolver and the payment service's port, to
+   this node's own address; in
    the default mode they stay per listed client. `SECURITY-REVIEW.md` lists
    what is known to be missing here; a PR must not add to it silently.
 9. **Root's commands are built from parsed values.** Addresses go through

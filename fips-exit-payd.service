@@ -1,0 +1,49 @@
+[Unit]
+Description=fips exit node: its payment service (what it costs, over the mesh)
+After=fips.service fips-exit.service network-online.target
+Wants=network-online.target
+
+[Service]
+# Reads /etc/fips-exit/config (ACCESS=paid, PRICE_MSAT_PER_GB, PACKAGES,
+# MINTS, PAY_PORT) and answers on this node's fips address. Does nothing,
+# and succeeds, when ACCESS is not paid.
+ExecStart=/usr/local/sbin/fips-exit-payd
+# The exit opens the service's port to the mesh while it listens there, and
+# closes it when it stops: `up` looks, as root ("+"), and its failure (the
+# exit not running) is not the service's ("-").
+ExecStartPost=-+/usr/local/sbin/fips-exit up
+ExecStopPost=-+/usr/local/sbin/fips-exit up
+Restart=on-failure
+RestartSec=5
+
+# A user of its own, made for it and gone with it; nothing to keep yet.
+DynamicUser=yes
+# No privilege at all, and as little as possible of the machine.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# IPv6 to listen, IPv4 for nothing yet, a Unix socket for the journal.
+RestrictAddressFamilies=AF_INET6 AF_INET AF_UNIX
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -172,9 +172,9 @@ because its reply was lost changes nothing.
 
 | Command | Does |
 |---|---|
-| `put <account> <granted> <used_in> <used_out> <address,…>` | Makes the account or brings it up to these values: each number is raised to the given one, never lowered; the members are replaced. |
+| `put <account> <granted> <used_in> <used_out> <address,…> [until]` | Makes the account or brings it up to these values: each number is raised to the given one, never lowered; the members are replaced. The last word is its end, set when the account is made and afterwards only moved later. |
 | `grant <account> <granted>` | Raises the grant to this total. |
-| `until <account> <unix seconds>` | Sets when the account ends, whatever is left of its bytes; 0 for no end. `put` takes it as a last word too. |
+| `until <account> <unix seconds>` | Sets when the account ends, whatever is left of its bytes, later or earlier; 0 for no end. |
 | `members <account> <address,…>` | Replaces the members. |
 | `drop <account>` | Removes the account and its members. |
 | `usage [account]` | One line per account: granted, used in, used out, and its end. |
@@ -182,7 +182,9 @@ because its reply was lost changes nothing.
 | `stat` | The daemon's start time as an epoch, the number of accounts, whether the resolver runs. |
 
 - The epoch is how the payment service notices a restart: a new epoch means
-  an empty table, and it pushes everything again. A restart is routine, since
+  an empty table, and it pushes everything again, each account's end with
+  its `put`: an account put without one has none, and one sold as time
+  would be carried again until an `until` followed. A restart is routine, since
   the unit requires `fips.service` and restarts with it.
 - Bytes used between the payment service's last `usage` and a restart of the
   daemon are forgiven. That is a few seconds of traffic, in the client's

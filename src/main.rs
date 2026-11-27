@@ -113,8 +113,9 @@ struct Account {
     /// Bytes carried towards its members.
     used_out: AtomicU64,
     /// When the account ends, whatever is left of its bytes: Unix seconds,
-    /// or 0 for no end. Unlike the other three this one is set, not raised:
-    /// it is a time somebody sold, and may be put later or earlier.
+    /// or 0 for no end. Unlike the other three this one can be set, by the
+    /// one command that is for it (`until`): it is a time somebody sold,
+    /// and may be put later or earlier. `put` only ever moves it later.
     until: AtomicU64,
 }
 
@@ -152,7 +153,8 @@ impl Account {
 enum Client {
     /// On the operator's list: carried, and not counted.
     Static,
-    /// A member of an account: carried while the account has bytes left.
+    /// A member of an account: carried while the account has bytes left,
+    /// and until its end if it has one.
     Member(Arc<Account>),
 }
 
@@ -162,7 +164,7 @@ enum Client {
 enum Verdict<T> {
     /// Not a client's packet, or not a packet.
     Refused,
-    /// A member's, whose account has no bytes left.
+    /// A member's, whose account has no bytes left, or whose time is over.
     Exhausted,
     Carry(T, Option<Arc<Account>>),
 }
@@ -422,7 +424,8 @@ impl Clients {
         now: Instant,
     ) -> Result<Seats, String> {
         self.may_join(name, &members)?;
-        if !self.accounts.contains_key(name) {
+        let made = !self.accounts.contains_key(name);
+        if made {
             if self.accounts.len() >= MAX_ACCOUNTS {
                 return Err("too-many-accounts".into());
             }
@@ -430,11 +433,25 @@ impl Clients {
         }
         if let Some(entry) = self.accounts.get(name) {
             entry.account.raise(numbers[0], numbers[1], numbers[2]);
-            // With the numbers, and before a member is seated: an account
-            // that is put again after its time must not be carried for the
-            // moment until a second command says so.
-            if let Some(until) = until {
-                entry.account.until.store(until, Ordering::Relaxed);
+            // The end comes with the numbers, and before a member is
+            // seated: an account that is put again after its time must not
+            // be carried for the moment until a second command says so. On
+            // an account that was there already, a put is like its numbers
+            // and takes nothing back: it moves an end later, and neither
+            // earlier nor away. A put that arrives late, after the end was
+            // extended, must not cut the extension off. Anything else about
+            // the end is `until`'s to say.
+            match until {
+                Some(until) if made => entry.account.until.store(until, Ordering::Relaxed),
+                // (Nothing else writes the end meanwhile: this holds the
+                // table for writing, and `until` holds it for reading.)
+                Some(until) if until != 0 => {
+                    let end = entry.account.until.load(Ordering::Relaxed);
+                    if end != 0 && until > end {
+                        entry.account.until.store(until, Ordering::Relaxed);
+                    }
+                }
+                _ => {}
             }
         }
         self.set_members(name, members, now)
@@ -701,7 +718,8 @@ struct Counters {
     to_internet: AtomicU64,
     to_clients: AtomicU64,
     refused: AtomicU64,
-    /// Packets of members whose account had no bytes left, either way.
+    /// Packets of members whose account had no bytes left or was over,
+    /// either way.
     exhausted: AtomicU64,
     unrouted: AtomicU64,
     send_failed: AtomicU64,
@@ -1145,6 +1163,16 @@ fn account_name(word: &str) -> Result<String, String> {
     if fits { Ok(word.to_string()) } else { Err("name".into()) }
 }
 
+/// The latest end an account may have: the last second of the year 9999.
+/// Far beyond any time that is sold, and well below a time written in
+/// milliseconds or nanoseconds by mistake, which is refused for it.
+const MAX_UNTIL: u64 = 253_402_300_799;
+
+/// An account's end: Unix seconds up to [`MAX_UNTIL`], or 0 for none.
+fn end(word: &str) -> Result<u64, String> {
+    number(word).ok().filter(|until| *until <= MAX_UNTIL).ok_or_else(|| "number".into())
+}
+
 /// A count of bytes: digits only, at most [`MAX_NUMBER`].
 fn number(word: &str) -> Result<u64, String> {
     if word.is_empty() || word.len() > 20 || !word.bytes().all(|b| b.is_ascii_digit()) {
@@ -1199,10 +1227,10 @@ fn parse_command(line: &[u8]) -> Result<Command, String> {
             name: account_name(name)?,
             numbers: [number(granted)?, number(used_in)?, number(used_out)?],
             members: member_list(members)?,
-            until: until.first().map(|until| number(until)).transpose()?,
+            until: until.first().map(|until| end(until)).transpose()?,
         }),
         ["grant", name, granted] => Ok(Command::Grant { name: account_name(name)?, granted: number(granted)? }),
-        ["until", name, until] => Ok(Command::Until { name: account_name(name)?, until: number(until)? }),
+        ["until", name, until] => Ok(Command::Until { name: account_name(name)?, until: end(until)? }),
         ["members", name, members] => {
             Ok(Command::Members { name: account_name(name)?, members: member_list(members)? })
         }
@@ -1556,7 +1584,7 @@ fn run() -> Result<(), String> {
                 );
                 if now != last {
                     eprintln!(
-                        "fips-exitd: packets to internet {}, to clients {}, refused {}, out of bytes {}, \
+                        "fips-exitd: packets to internet {}, to clients {}, refused {}, out of bytes or time {}, \
                          unrouted {}; DNS answered {}, refused {}, failed {}",
                         now.0, now.1, now.2, now.3, now.4, now.5, now.6, now.7
                     );
@@ -1848,6 +1876,25 @@ mod tests {
         assert!(!send(&c, m, 100));
         assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} {future}")), format!("ok {C}=v4\n"));
         assert!(send(&c, m, 100));
+        // On an account that is there, a put takes nothing back: the one
+        // that made it, arriving again after the end was extended, does not
+        // cut the extension off; nor does it take an end away, or give one
+        // to an account that has none.
+        let end_of = |c: &mut Clients| {
+            let usage = ctl(c, "usage pkg");
+            usage.lines().next().unwrap().rsplit(' ').next().unwrap().to_string()
+        };
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} {past}")), format!("ok {C}=v4\n"));
+        assert_eq!(end_of(&mut c), future.to_string(), "an earlier end in a put");
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} 0")), format!("ok {C}=v4\n"));
+        assert_eq!(end_of(&mut c), future.to_string(), "no end in a put");
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} {}", future + 60)), format!("ok {C}=v4\n"));
+        assert_eq!(end_of(&mut c), (future + 60).to_string(), "a later end in a put");
+        assert_eq!(ctl(&mut c, "until pkg 0"), "ok\n");
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {C} {past}")), format!("ok {C}=v4\n"));
+        assert_eq!(end_of(&mut c), "0", "an end in a put for an account that has none");
+        assert!(send(&c, m, 100));
+        assert_eq!(ctl(&mut c, &format!("until pkg {future}")), "ok\n");
         // A member on the operator's list is not the account's concern.
         c.set_list(vec![m], Instant::now());
         assert_eq!(ctl(&mut c, &format!("until pkg {past}")), "ok\n");
@@ -2016,6 +2063,11 @@ mod tests {
         bad(b"until pkg", "arguments");
         bad(b"until pkg tomorrow", "number");
         bad(b"until pkg -1", "number");
+        // A time in milliseconds or nanoseconds is not a time in seconds.
+        bad(b"until pkg 1800000000000", "number");
+        bad(b"put pkg 10 2 3 - 1800000000000000000", "number");
+        assert!(parse_command(format!("until pkg {MAX_UNTIL}").as_bytes()).is_ok());
+        bad(format!("until pkg {}", MAX_UNTIL + 1).as_bytes(), "number");
         bad(b"grant pkg", "arguments");
         bad(b"grant a/b 1", "name");
         bad(b"grant ../../etc/passwd 1", "name");

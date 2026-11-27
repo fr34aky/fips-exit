@@ -480,9 +480,10 @@ ok "a member reaches the internet in both families and nothing else, and not por
 # --- an account may have an end ------------------------------------------------------
 # Whatever is left of its bytes: from that second on its members are not
 # carried. A later end, or none, carries them again.
-[ "$(ctl "until pkg $(($(date +%s) + 3))")" = ok ] || fail "until"
+end=$(($(date +%s) + 8))
+[ "$(ctl "until pkg $end")" = ok ] || fail "until"
 [ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "a member before its account's end"
-sleep 3
+while [ "$(date +%s)" -lt "$end" ]; do sleep 0.5; done
 [ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A MEMBER WAS CARRIED AFTER ITS ACCOUNT'S END"
 [ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a member got DNS after its account's end"
 "$here/fips-exit" accounts | grep -Eq "^pkg .* \(over\)$" || fail "accounts after the end: $("$here/fips-exit" accounts)"

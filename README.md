@@ -134,7 +134,8 @@ below.
 - An account may have an end as well: a time from which its members are not
   carried, whatever is left of its bytes. That is how time is sold: a grant
   too large to use up, and an end. The time is this machine's clock.
-- DNS is answered for a member while its account has bytes, and not counted.
+- DNS is answered for a member while its account has bytes and is not over,
+  and not counted.
 - A client on the list is never counted, and wins over a member with the
   same address or the same derived IPv4 address, at once. A member whose
   derived IPv4 address is another client's is carried for IPv6 only, and
@@ -153,6 +154,7 @@ put <account> <granted> <used_in> <used_out> <address,…|-> [until]
                                                               make it, or raise its numbers; replace its members
 grant <account> <granted>                                     raise what it may use, in all
 until <account> <unix seconds|0>                              when it ends; 0 for no end
+                                                              (put moves an end later only; this sets it)
 members <account> <address,…|->                               replace its members
 drop <account>
 usage [account]                                               account <name> <granted> <used_in> <used_out> <until>

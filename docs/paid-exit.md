@@ -1,8 +1,9 @@
 # Paid public exits: design
 
-**Status: phase 1 of ten is implemented** (accounts in the daemon and
-`ACCESS=paid` in the script; the README's *Accounts* section is what it does
-now). Everything from the advert on is design. This document says what is to
+**Status: phases 1 and 2 of ten are implemented** (accounts in the daemon
+and `ACCESS=paid` in the script; the advert, with a country. The README's
+*Accounts* and *Being found* sections are what they do now). Everything from
+the payment service on is design. This document says what is to
 be built, in which order, and what was decided against. Each phase arrives
 as its own pull request and moves the parts it implements from here into the
 README and `SECURITY-REVIEW.md`; where building a phase changed the design,
@@ -289,10 +290,15 @@ by its bytes, so one mint written in two ways is two.
 `fips-exit advert` publishes it on a timer. It is a port of fips2go's
 `advert.py`: root reads `/etc/fips/fips.key`, so the node's key never comes
 near the payment service. Building and checking the tags is a small Rust
-crate in this repository, `fips-exit-proto`, with test vectors as JSON files.
-The Python publisher, the payment service and fips2go's shim are all tested
-against the same vectors, as the three implementations of `inner_ipv4` are
-today.
+crate in this repository, `fips-exit-proto` (`payd/proto`), with its cases
+in one JSON file. The Python publisher is tested against that file, and the
+payment service and fips2go's shim are to be, as the three implementations
+of `inner_ipv4` are held to one set of vectors today.
+
+What is published so far is the advert of an exit that sells nothing: the
+name, the note, the country, and `allow-list`, also with `ACCESS=paid`. The
+tags of a paid exit are specified and tested on both sides, and the script
+writes them once there is a payment service whose port it can name.
 
 The country is what the operator says. A client can compare it with where
 the exit's address is seen from once it is connected; nothing here does that
@@ -485,7 +491,7 @@ and `SECURITY-REVIEW.md`.
 | # | What |
 |---|---|
 | 1 | **Done.** The daemon's accounts and the control socket. Then paid mode in the script. |
-| 2 | `fips-exit-proto` and its vectors; `fips-exit advert` and its timer. Free exits gain an advert and a country by this alone. |
+| 2 | **Done.** `fips-exit-proto` and its vectors; `fips-exit advert` and its timer. Free exits gain an advert and a country by this alone. |
 | 3 | The payment service's frame: configuration, schema, terms, the page, the unit, a CI job. |
 | 4 | Accounts without money: the service on the socket, a grant by hand, members, usage, pushing again after a restart. |
 | 5 | The wallet, and payment by token. |

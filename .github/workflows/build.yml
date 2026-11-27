@@ -58,6 +58,9 @@ jobs:
       - name: the advert's tags and the price, against the shared vectors (payd/proto)
         run: cargo test --locked --manifest-path payd/Cargo.toml
 
+      - name: the script's advert, against the same vectors and a stand-in relay
+        run: python3 -I -m unittest discover -s test
+
       - name: the exit in network namespaces (test/netns.sh)
         run: |
           set -euo pipefail

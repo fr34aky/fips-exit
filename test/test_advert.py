@@ -19,6 +19,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -113,6 +114,17 @@ class Keys(unittest.TestCase):
                 self.read(bad)
             if bad:
                 self.assertNotIn(bad, str(refused.exception), "what the file held is not printed")
+        # A key as 32 raw bytes, or any file that is not text: the same answer,
+        # and no error of Python's own that would quote a byte of it.
+        for held in (KEY, bytes(range(200, 232)), b"\xff\xfe" + nsec.encode()):
+            with tempfile.NamedTemporaryFile("wb", suffix=".key") as f:
+                f.write(held)
+                f.flush()
+                with self.assertRaises(x.AdvertError) as refused:
+                    x.read_key(f.name)
+            self.assertIn("holds neither an nsec nor 64 hex digits", str(refused.exception))
+            self.assertIsNone(refused.exception.__cause__)
+            self.assertTrue(refused.exception.__suppress_context__, "nothing of the first error is shown")
         with self.assertRaises(x.AdvertError) as missing:
             x.read_key("/nonexistent/fips.key")
         self.assertIn("/nonexistent/fips.key", str(missing.exception))
@@ -132,30 +144,42 @@ class Tags(unittest.TestCase):
     """What an exit writes, against the cases the Rust crate is held to."""
 
     def test_an_exit_writes_the_tags_the_vectors_say(self):
-        self.assertGreaterEqual(len(VECTORS["write"]), 30)
+        self.assertGreaterEqual(len(VECTORS["write"]), 45)
         for case in VECTORS["write"]:
             with self.subTest(case["case"]):
                 if "tags" in case:
-                    self.assertEqual(x.advert_tags(case["advert"]), case["tags"])
+                    self.assertEqual(x.advert_tags(case["advert"], case["now"]), case["tags"])
                 else:
                     with self.assertRaises(x.AdvertError):
-                        x.advert_tags(case["advert"])
+                        x.advert_tags(case["advert"], case["now"])
 
     def test_the_countries_are_the_vectors(self):
         self.assertEqual(x.COUNTRIES, VECTORS["countries"].split())
         self.assertEqual(len(x.COUNTRIES), 249)
 
     def test_an_access_word_nobody_knows_is_refused(self):
-        advert = {"access": "invite", "name": "", "about": "", "expires": 1, "terms": None}
+        advert = {"access": "invite", "name": "", "about": "", "expires": 10, "terms": None}
         with self.assertRaises(x.AdvertError):
-            x.advert_tags(advert)
+            x.advert_tags(advert, 1)
 
-    def test_text_is_in_order_or_not(self):
-        self.assertTrue(x.text_in_order("Zürich ☕ exit", 40))
-        self.assertTrue(x.text_in_order("", 40))
-        for bad in (" lead", "trail ", "two  spaces", "tab\there", "bell\x07", "nel\x85", "zero​width",
-                    "turned‮round", "x" * 41):
-            self.assertFalse(x.text_in_order(bad, 40), repr(bad))
+    def test_text_is_tidied_as_the_vectors_say(self):
+        self.assertGreaterEqual(len(VECTORS["tidy"]), 70)
+        for case in VECTORS["tidy"]:
+            with self.subTest(repr(case["text"])):
+                self.assertEqual(x.tidy(case["text"], case["limit"]), case["tidy"])
+                # An exit writes only what a reader would show as it is.
+                self.assertEqual(x.text_in_order(case["text"], case["limit"]), case["text"] == case["tidy"])
+
+    def test_no_character_that_cannot_be_seen_is_written_in_these_files(self):
+        """The script, this test and the vectors name such characters by
+        number or as escapes. As themselves they could not be reviewed, and
+        an editor that drops them would change what the code does."""
+        files = ("../fips-exit", "test_advert.py", "../payd/proto/vectors/advert.json", "../payd/proto/src/lib.rs")
+        for name in files:
+            with open(os.path.join(HERE, name), encoding="utf-8") as file:
+                for number, line in enumerate(file, 1):
+                    unseen = [hex(ord(c)) for c in line.rstrip("\n") if x._among(c, x.HIDDEN)]
+                    self.assertEqual(unseen, [], f"{name}:{number}")
 
 
 class Event(unittest.TestCase):
@@ -191,7 +215,10 @@ class Relays(unittest.TestCase):
     def test_bad_urls_are_refused(self):
         for bad in ("relay.example.org", "http://relay.example.org", "wss://relay.example.org:99999",
                     "wss://relay.example.org:0", "ws://home.fips", f"wss://{self.NPUB}.fips", "wss://exa mple.org",
-                    "wss://x/ y", "ws://[fd00::1]:80", ""):
+                    "wss://x/ y", "ws://[fd00::1]:80", "",
+                    # Names the resolver would refuse with an error of its own.
+                    "wss://relay..example.org", "wss://.example.org", "wss://example.org.", "wss://-a.example",
+                    "wss://a-.example", "wss://" + "a" * 64 + ".example", "wss://" + "a." * 127 + "example"):
             with self.assertRaises(x.AdvertError, msg=bad):
                 x.parse_relay(bad)
 
@@ -200,6 +227,19 @@ class Relays(unittest.TestCase):
         for bad in ("", " , ", " ".join(f"wss://r{i}.example" for i in range(9)), "wss://a.example nonsense"):
             with self.assertRaises(x.AdvertError, msg=bad):
                 x.parse_relays(bad)
+
+
+def frame(opcode, payload, last=True):
+    """One frame as a server sends it: not masked."""
+    head = bytes([(0x80 if last else 0) | opcode])
+    n = len(payload)
+    if n < 126:
+        head += bytes([n])
+    elif n < 65536:
+        head += bytes([126]) + struct.pack(">H", n)
+    else:
+        head += bytes([127]) + struct.pack(">Q", n)
+    return head + payload
 
 
 class Relay:
@@ -235,14 +275,15 @@ class Relay:
         accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
         peer.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                      b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
-        message = json.loads(x._receive_message(peer))  # a client's frames are masked, which this reads
+        # A client's frames are masked, which the script's own reader takes too.
+        message = json.loads(x._receive_message(peer, time.monotonic() + 5))
         self.seen.append(message)
         for reply in self.answer(message[1]):
+            if callable(reply):
+                reply(peer)  # whatever it does with the connection
+                continue
             payload = reply if isinstance(reply, bytes) else json.dumps(reply).encode()
-            opcode = 0x9 if reply == b"ping" else 0x1
-            head = bytes([0x80 | opcode]) + (bytes([len(payload)]) if len(payload) < 126
-                                             else bytes([126]) + struct.pack(">H", len(payload)))
-            peer.sendall(head + payload)
+            peer.sendall(frame(0x9 if reply == b"ping" else 0x1, payload))
         peer.recv(64)  # until the client hangs up
 
     def close(self):
@@ -286,20 +327,56 @@ class Publish(unittest.TestCase):
             x.publish(self.event(), relay.url, timeout=0.5)
 
     def test_an_oversized_frame_ends_it(self):
-        relay = self.relay(lambda e: [])
-
-        def talk(peer):  # the handshake, and then a frame that claims a terabyte
-            peer.settimeout(5)
-            head = b""
-            while b"\r\n\r\n" not in head:
-                head += peer.recv(1)
-            peer.sendall(b"HTTP/1.1 101 Switching Protocols\r\n\r\n"
-                         + bytes([0x81, 127]) + struct.pack(">Q", 1 << 40))
-            peer.recv(64)
-        relay.talk = talk
+        relay = self.relay(lambda e: [lambda peer: peer.sendall(bytes([0x81, 127]) + struct.pack(">Q", 1 << 40))])
         with self.assertRaises(x.AdvertError) as refused:
             x.publish(self.event(), relay.url, timeout=2)
         self.assertIn("oversized", str(refused.exception))
+        # And one that is within the limit frame by frame, and not as a whole.
+        def three_parts(peer):
+            for part in range(3):
+                peer.sendall(frame(0x1 if part == 0 else 0x0, b"x" * 60000, last=False))
+        relay = self.relay(lambda e: [three_parts])
+        with self.assertRaises(x.AdvertError) as refused:
+            x.publish(self.event(), relay.url, timeout=2)
+        self.assertIn("oversized", str(refused.exception))
+
+    def test_an_answer_in_several_frames_is_one_answer(self):
+        def in_parts(e):
+            answer = json.dumps(["OK", e["id"], True, "stored"]).encode()
+            return [lambda peer: peer.sendall(frame(0x1, answer[:10], last=False) + frame(0x9, b"still there?")
+                                              + frame(0x0, answer[10:30], last=False) + frame(0x0, answer[30:]))]
+        self.assertEqual(x.publish(self.event(), self.relay(in_parts).url), "stored")
+        # A binary message, whole or in parts, is not an answer; the text after it is.
+        def binary_first(e):
+            return [lambda peer: peer.sendall(frame(0x2, b"\x00\x01", last=False) + frame(0x0, b"\x02")),
+                    ["OK", e["id"], True, ""]]
+        self.assertEqual(x.publish(self.event(), self.relay(binary_first).url), "")
+
+    def test_a_relay_that_keeps_sending_is_not_waited_for_any_longer(self):
+        """The time is for the whole answer: a ping now and then, or a byte
+        now and then, does not buy more of it."""
+        def pings(peer):
+            for _ in range(40):
+                peer.sendall(frame(0x9, b"ping"))
+                time.sleep(0.2)
+
+        def drips(peer):
+            peer.sendall(bytes([0x81, 126]) + struct.pack(">H", 65535))
+            for _ in range(20):
+                peer.sendall(b"x")
+                time.sleep(0.4)
+
+        for behaviour in (pings, drips):
+            relay = self.relay(lambda e, behaviour=behaviour: [behaviour])
+            started = time.monotonic()
+            with self.assertRaises(x.AdvertError) as refused:
+                x.publish(self.event(), relay.url, timeout=1)
+            self.assertIn("in time", str(refused.exception))
+            self.assertLess(time.monotonic() - started, 3, behaviour.__name__)
+
+    def test_an_answer_nested_deeper_than_python_follows_is_not_an_answer(self):
+        relay = self.relay(lambda e: [b"[" * 60000, ["OK", e["id"], True, "after it"]])
+        self.assertEqual(x.publish(self.event(), relay.url), "after it")
 
     def test_what_is_not_a_relay_is_said(self):
         listener = socket.create_server(("127.0.0.1", 0))
@@ -394,6 +471,19 @@ class Command(unittest.TestCase):
         self.configure(ADVERT_RELAYS=gone)
         self.assertNotEqual(self.run_advert()[0], 0, "no relay took it: that is a failure")
 
+    def test_a_hash_in_a_quoted_name_is_part_of_the_name(self):
+        self.configure(COUNTRY="DE", ADVERT_NAME='"Exit #2"', ADVERT_ABOUT='"a # b"  # a comment',
+                       WAN="eth0 # the uplink", TUN='"tun9"', MESH_IF="fips0#x")
+        with open(self.config, "a") as f:
+            f.write("#ACCESS=paid\n  # WAN=other\nnothing here\n")
+        config = x.load_config()
+        self.assertEqual((config["ADVERT_NAME"], config["ADVERT_ABOUT"]), ("Exit #2", "a # b"))
+        self.assertEqual((config["WAN"], config["TUN"], config["MESH_IF"], config["ACCESS"]),
+                         ("eth0", "tun9", "fips0", "allow-list"))
+        status, out = self.run_advert("show")
+        self.assertEqual(status, 0)
+        self.assertIn(["name", "Exit #2"], json.loads(out)["tags"])
+
     def test_what_is_wrong_stops_it_before_anything_is_sent(self):
         relay = Relay(lambda e: [["OK", e["id"], True, ""]])
         self.addCleanup(relay.close)
@@ -417,10 +507,31 @@ class Command(unittest.TestCase):
     def test_nothing_is_said_for_an_exit_that_is_not_running(self):
         relay = Relay(lambda e: [["OK", e["id"], True, ""]])
         self.addCleanup(relay.close)
-        self.configure(ADVERT_RELAYS=relay.url)
+        # With fips itself stopped there is no mesh interface to ask, and
+        # perhaps no key: none of that is looked at, and the timer's unit
+        # does not fail every hour.
+        self.configure(ADVERT_RELAYS=relay.url, FIPS_KEY="/nonexistent/fips.key")
         x.tun_present = lambda config: False
+        x.mesh_address = lambda config: x.die("no interface fips0: is fips running?")
         self.assertEqual(self.run_advert(), (0, "fips-exit: no advert: the exit is not running\n"))
         self.assertEqual(relay.seen, [])
+
+    def test_one_relay_that_breaks_the_client_does_not_stop_the_next(self):
+        relay = Relay(lambda e: [["OK", e["id"], True, ""]])
+        self.addCleanup(relay.close)
+        self.configure(ADVERT_RELAYS=f"ws://first.example {relay.url}")
+        real = x.publish
+
+        def publish(event, url):
+            if "first" in url:
+                raise RuntimeError("something nobody expected\x1b[2J")
+            return real(event, url)
+        x.publish = publish
+        self.addCleanup(setattr, x, "publish", real)
+        status, out = self.run_advert()
+        self.assertEqual(status, 0)
+        self.assertIn("ws://first.example: something nobody expected?[2J\n", out)
+        self.assertIn(f"{relay.url}: accepted", out)
 
 
 if __name__ == "__main__":

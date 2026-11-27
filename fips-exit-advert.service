@@ -9,3 +9,7 @@ Wants=network-online.target
 # no relay is named there or the exit is not running.
 Type=oneshot
 ExecStart=/usr/local/sbin/fips-exit advert
+# Eight relays at most, each with ten seconds to be reached and ten more to
+# answer: a run that is still going after this is stuck, and the next hour
+# must not wait for it.
+TimeoutStartSec=5min

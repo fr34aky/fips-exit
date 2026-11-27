@@ -67,11 +67,14 @@ IPv4 address derived from the client's fips address.
 
 7. **What a relay answers** to `fips-exit advert`. The script is the client:
    it reads an HTTP status line and WebSocket frames from whoever is at the
-   address the operator named. The header is at most 8192 bytes and a frame
-   65536, everything has ten seconds, and the only thing acted on is an
-   `OK` for the event just sent. What a relay says in words is printed, cut
-   and with nothing but printable characters. A `wss://` relay's certificate
-   is checked as Python checks any.
+   address the operator named. The header is at most 8192 bytes and a
+   message 65536, in one frame or in several. A relay has ten seconds to be
+   reached and ten for all of its answer, however it spaces it out; the unit
+   has five minutes for all relays. The only thing acted on is an `OK` for
+   the event just sent; what is not JSON, or JSON too deep to read, is
+   passed over. What a relay says in words is printed, cut and with nothing
+   but printable characters. Whatever one relay does, the next is still
+   tried. A `wss://` relay's certificate is checked as Python checks any.
 
 ## Things that would be serious in this codebase
 

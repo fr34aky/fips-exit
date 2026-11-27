@@ -89,6 +89,9 @@ ADVERT_ABOUT="In a rack in Frankfurt"    # optional, up to 200
 COUNTRY=DE                               # optional: where the exit is, ISO 3166-1 alpha-2
 ```
 
+A value in double quotes is taken as it is, a `#` included; outside quotes
+a `#` begins a comment.
+
 ```sh
 sudo fips-exit advert show                           # the event, sent nowhere
 sudo fips-exit advert                                # publish it now

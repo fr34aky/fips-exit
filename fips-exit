@@ -32,7 +32,6 @@ import struct
 import subprocess
 import sys
 import time
-import unicodedata
 
 DIR = os.environ.get("FIPS_EXIT_DIR", "/etc/fips-exit")
 CLIENTS = os.path.join(DIR, "clients")
@@ -254,13 +253,25 @@ def load_config():
     config = {"MESH_IF": "fips0", "WAN": "", "TUN": "fipsexit0",
               "FIPS_FIREWALL": "/etc/fips/fips.nft", "ACCESS": "allow-list"}
     try:
-        for line in open(CONFIG):
-            key, _, value = line.split("#")[0].partition("=")
-            if key.strip():
-                config[key.strip()] = value.strip().strip('"')
+        with open(CONFIG) as file:
+            for line in file:
+                key, _, value = line.partition("=")
+                if key.strip() and not key.lstrip().startswith("#"):
+                    config[key.strip()] = config_value(value)
     except FileNotFoundError:
         pass
     return config
+
+
+def config_value(text):
+    """What a line of the config sets: what is between double quotes when it
+    begins with one, and otherwise what is in front of a `#`. A `#` between
+    quotes is a `#`: a name may have one."""
+    text = text.strip()
+    closing = text.find('"', 1)
+    if text.startswith('"') and closing > 0:
+        return text[1:closing]
+    return text.split("#")[0].strip().strip('"')
 
 
 def paid(config):
@@ -726,6 +737,7 @@ MAX_PRICE = 10**12
 MAX_MINTS, MAX_MINT_BYTES = 4, 256
 MAX_PACKAGES = 8
 MAX_RELAYS = 8
+MAX_LIFETIME = 31 * 86400
 # The timer publishes every hour; an advert is valid for three, so one missed
 # hour does not drop the exit from the lists, and an exit that is gone drops
 # out by itself.
@@ -850,28 +862,51 @@ def schnorr_sign(message, seckey, aux):
 def read_key(path):
     """The secret key in fips's key file: an `nsec1…`, or 64 hex digits."""
     try:
-        with open(path) as file:
-            text = file.read().strip()
+        with open(path, "rb") as file:
+            held = file.read(4096)
     except OSError as error:
         raise AdvertError(f"{path}: {error.strerror} "
                           f"(the node's key; FIPS_KEY in {CONFIG} if it is elsewhere)") from None
-    if re.fullmatch(r"[0-9a-fA-F]{64}", text):
-        return bytes.fromhex(text)
+    # What was read is a secret, or near one. Whatever it is, none of it is
+    # repeated: not in a message, and not in the trace of an error.
     try:
+        text = held.decode("ascii").strip()
+        if re.fullmatch(r"[0-9a-fA-F]{64}", text):
+            return bytes.fromhex(text)
         return bech32_key(text, "nsec")
     except ValueError:
-        # What was read is a secret, or near one: it is not repeated.
         raise AdvertError(f"{path} holds neither an nsec nor 64 hex digits") from None
 
 
+# What separates words, and what is not shown or changes how what is next to
+# it is shown: the two lists of payd/proto (`is_space`, `is_hidden`), by
+# code point. A name must not be able to turn the line it is shown on
+# round, carry what cannot be seen, or be an empty row.
+SPACES = ((0x0009, 0x000D), (0x0020, 0x0020), (0x0085, 0x0085), (0x00A0, 0x00A0), (0x1680, 0x1680),
+          (0x2000, 0x200A), (0x2028, 0x2029), (0x202F, 0x202F), (0x205F, 0x205F), (0x3000, 0x3000))
+HIDDEN = ((0x0000, 0x001F), (0x007F, 0x009F), (0x00AD, 0x00AD), (0x061C, 0x061C), (0x180E, 0x180E),
+          (0x200B, 0x200B), (0x200E, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F), (0xFEFF, 0xFEFF),
+          (0xFFF9, 0xFFFB), (0xE0000, 0xE007F), (0x115F, 0x1160), (0x2800, 0x2800), (0x3164, 0x3164),
+          (0xFFA0, 0xFFA0))
+
+
+def _among(c, ranges):
+    return any(low <= ord(c) <= high for low, high in ranges)
+
+
+def tidy(text, limit):
+    """`text` as a reader of an advert shows it: one line of words with
+    single spaces between them, nothing hidden, `limit` characters at most."""
+    spaced = "".join(" " if _among(c, SPACES) else c for c in text)
+    words = "".join(c for c in spaced if not _among(c, HIDDEN)).split(" ")
+    return " ".join(word for word in words if word)[:limit].rstrip(" ")
+
+
 def text_in_order(text, limit):
-    """Is `text` what an advert may carry as a name or a note: one line of
-    at most `limit` characters, single spaces, nothing that is not shown and
-    nothing that turns the line round? A reader cuts and tidies what it is
-    given (payd/proto, `tidy`); the exit is told here instead."""
-    hidden = any(unicodedata.category(c) == "Cc" or "​" <= c <= "‏" or "‪" <= c <= "‮"
-                 or "⁠" <= c <= "⁩" or c == "﻿" for c in text)
-    return len(text) <= limit and not hidden and text == " ".join(text.split())
+    """Is `text` what an advert may carry as a name or a note: already what
+    a reader would show? A reader cuts and tidies what it is given; the exit
+    is told here instead."""
+    return tidy(text, limit) == text
 
 
 def _whole(value, low, high):
@@ -880,18 +915,21 @@ def _whole(value, low, high):
 
 def _mint_in_order(url):
     rest = url[8:] if url.startswith("https://") else url[7:] if url.startswith("http://") else ""
-    return len(url.encode()) <= MAX_MINT_BYTES and rest != "" and all("!" <= c <= "~" for c in rest)
+    in_an_address = re.fullmatch(r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", rest) is not None
+    return len(url.encode()) <= MAX_MINT_BYTES and in_an_address
 
 
-def advert_tags(advert):
-    """The tags of an advert, in the one order every publisher writes them,
-    or AdvertError for an advert that is out of bounds. `advert` is as
-    payd/proto/vectors/advert.json writes one: access, name, about,
-    optionally country, expires, and terms, which is None unless the access
-    is paid."""
+def advert_tags(advert, now):
+    """The tags of an advert as written at `now`, in the one order every
+    publisher writes them, or AdvertError for an advert no client would
+    list. `advert` is as payd/proto/vectors/advert.json writes one: access,
+    name, about, optionally country, expires, and terms, which is None
+    unless the access is paid."""
     access, terms = advert["access"], advert.get("terms")
     if access not in ACCESS_WORDS:
         raise AdvertError(f"access is one of {', '.join(ACCESS_WORDS)}")
+    if not now < advert["expires"] <= now + MAX_LIFETIME:
+        raise AdvertError("the advert is over already, or valid for more than 31 days")
     if not text_in_order(advert["name"], MAX_NAME):
         raise AdvertError(f"the name is one line of at most {MAX_NAME} characters")
     if not text_in_order(advert["about"], MAX_ABOUT):
@@ -945,10 +983,14 @@ def build_event(seckey, tags, now, aux=None):
 def parse_relay(url):
     """(tls, host, port, path) of a relay URL. A relay on the mesh is
     `ws://<npub>.fips`: plain `ws`, since fips already encrypts."""
-    found = re.fullmatch(r"(wss?)://([A-Za-z0-9.-]+)(?::(\d{1,5}))?(/[!-~]*)?", url.strip())
+    found = re.fullmatch(r"(wss?)://([A-Za-z0-9.-]{1,253})(?::(\d{1,5}))?(/[!-~]*)?", url.strip())
     if not found:
         raise AdvertError(f"not a relay URL (ws:// or wss://): {url!r}")
     tls, host = found.group(1) == "wss", found.group(2).lower()
+    # A name as the resolver takes one: it must not be the resolver that
+    # says so, with an error of its own.
+    if not all(re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", label) for label in host.split(".")):
+        raise AdvertError(f"not a host name in {url!r}")
     port = int(found.group(3) or (443 if tls else 80))
     if not 1 <= port <= 65535:
         raise AdvertError(f"port out of range in {url!r}")
@@ -973,10 +1015,20 @@ def parse_relays(text):
     return urls
 
 
-def _receive(sock, n):
+def _receive(sock, n, deadline):
+    """Exactly `n` bytes, all of them before `deadline`: a relay that sends
+    a byte now and then is not waited for any longer than one that sends
+    nothing."""
     data = b""
     while len(data) < n:
-        chunk = sock.recv(n - len(data))
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise AdvertError("the relay did not answer in time")
+        sock.settimeout(left)
+        try:
+            chunk = sock.recv(n - len(data))
+        except TimeoutError:
+            raise AdvertError("the relay did not answer in time") from None
         if not chunk:
             raise AdvertError("the relay closed the connection")
         data += chunk
@@ -997,29 +1049,43 @@ def _send_frame(sock, opcode, payload):
     sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
 
-def _receive_message(sock):
-    """The next text message, answering pings and skipping the rest. What a
-    relay sends is a stranger's: every length is bounded."""
+def _receive_message(sock, deadline):
+    """The next text message, in one frame or in several, answering pings
+    and skipping the rest. What a relay sends is a stranger's: every length
+    is bounded, and so is the time (`deadline`)."""
+    parts, size = None, 0
     while True:
-        first, second = _receive(sock, 2)
+        first, second = _receive(sock, 2, deadline)
         n = second & 0x7F
         if n == 126:
-            (n,) = struct.unpack(">H", _receive(sock, 2))
+            (n,) = struct.unpack(">H", _receive(sock, 2, deadline))
         elif n == 127:
-            (n,) = struct.unpack(">Q", _receive(sock, 8))
-        if n > 65536:
+            (n,) = struct.unpack(">Q", _receive(sock, 8, deadline))
+        size += n
+        if size > 65536:
             raise AdvertError("the relay sent an oversized frame")
-        mask = _receive(sock, 4) if second & 0x80 else None
-        payload = _receive(sock, n)
+        mask = _receive(sock, 4, deadline) if second & 0x80 else None
+        payload = _receive(sock, n, deadline)
         if mask:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        opcode = first & 0x0F
+        opcode, last = first & 0x0F, first & 0x80
+        if opcode == 0x8:
+            raise AdvertError("the relay closed the connection")
         if opcode == 0x9:
             _send_frame(sock, 0xA, payload)
-        elif opcode == 0x8:
-            raise AdvertError("the relay closed the connection")
-        elif opcode == 0x1 and first & 0x80:
-            return payload.decode("utf-8", "replace")
+        if opcode >= 0x8:
+            size -= n  # a control frame may come between the parts of a message
+            continue
+        if opcode == 0x1:
+            parts = [payload]
+        elif opcode == 0x0 and parts is not None:
+            parts.append(payload)
+        else:
+            parts = None  # not text, or the rest of something that was not
+        if parts is None or last:
+            if parts is not None:
+                return b"".join(parts).decode("utf-8", "replace")
+            size = 0
 
 
 def shown(text, limit):
@@ -1030,17 +1096,18 @@ def shown(text, limit):
 
 def publish(event, url, timeout=RELAY_TIMEOUT):
     """Send `event` to one relay and return what it said ("" for accepted
-    with no remark). AdvertError when it was not accepted.
+    with no remark). AdvertError when it was not accepted. The relay has
+    `timeout` seconds to be reached and as long again for everything else.
 
     A relay on the mesh is reached by its name, through the host's own
     resolver: asking fips for `<npub>.fips` is also what tells fips whose
     address it is, without which it could not route there."""
     tls, host, port, path = parse_relay(url)
     sock = socket.create_connection((host, port), timeout=timeout)
+    deadline = time.monotonic() + timeout
     try:
         if tls:
             sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
-        sock.settimeout(timeout)
         key = base64.b64encode(os.urandom(16)).decode()
         named = host if port == (443 if tls else 80) else f"{host}:{port}"
         sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {named}\r\nUpgrade: websocket\r\n"
@@ -1050,23 +1117,21 @@ def publish(event, url, timeout=RELAY_TIMEOUT):
         while b"\r\n\r\n" not in head:
             if len(head) > 8192:
                 raise AdvertError("the relay's answer is not a WebSocket upgrade")
-            head += _receive(sock, 1)
+            head += _receive(sock, 1, deadline)
         status = head.split(b"\r\n", 1)[0].decode("latin-1")
         if " 101" not in status:
             raise AdvertError(f"the relay refused the WebSocket: {shown(status, 80)}")
         _send_frame(sock, 0x1, json.dumps(["EVENT", event], separators=(",", ":"), ensure_ascii=False).encode())
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while True:  # until the deadline, which _receive keeps
             try:
-                answer = json.loads(_receive_message(sock))
-            except ValueError:
-                continue
+                answer = json.loads(_receive_message(sock, deadline))
+            except (ValueError, RecursionError):
+                continue  # not JSON, or JSON nested deeper than Python will follow
             if isinstance(answer, list) and len(answer) >= 3 and answer[0] == "OK" and answer[1] == event["id"]:
                 remark = shown(answer[3], 120) if len(answer) > 3 else ""
                 if answer[2] is True:
                     return remark
                 raise AdvertError(f"the relay rejected the advert: {remark}")
-        raise AdvertError("the relay did not answer in time")
     finally:
         try:
             sock.close()
@@ -1085,6 +1150,11 @@ def cmd_advert(what="publish"):
         # Not an error: the timer may run on an exit that does not advertise.
         print(f"fips-exit: no advert: ADVERT_RELAYS is not set in {CONFIG}")
         return
+    if what == "publish" and not tun_present(config):
+        # Before anything is read that a stopped exit may not have: its
+        # mesh interface, for one. The timer finds this every hour then.
+        print("fips-exit: no advert: the exit is not running")
+        return
     key_path = config.get("FIPS_KEY") or "/etc/fips/fips.key"
     try:
         urls = parse_relays(relays) if what == "publish" else []
@@ -1096,9 +1166,6 @@ def cmd_advert(what="publish"):
         if signer != here:
             raise AdvertError(f"the key in {key_path} is not this node's: it is {signer}'s, "
                               f"and {config['MESH_IF']} has {here}")
-        if what == "publish" and not tun_present(config):
-            print("fips-exit: no advert: the exit is not running")
-            return
         now = int(time.time())
         # allow-list in both modes, for now: with ACCESS=paid nothing here
         # takes a payment yet, so who is served is still who the operator
@@ -1110,7 +1177,7 @@ def cmd_advert(what="publish"):
             "country": config.get("COUNTRY") or None,
             "expires": now + ADVERT_TTL,
             "terms": None,
-        })
+        }, now)
         event = build_event(key, tags, now)
     except AdvertError as error:
         die(str(error))
@@ -1123,8 +1190,8 @@ def cmd_advert(what="publish"):
             remark = publish(event, url)
             accepted += 1
             print(f"{url}: accepted" + (f" ({remark})" if remark else ""))
-        except (AdvertError, OSError) as error:
-            print(f"{url}: {error}")
+        except Exception as error:  # whatever one relay does, the next is still tried
+            print(f"{url}: {shown(error, 160)}")
     if not accepted:
         die("no relay took the advert")
 

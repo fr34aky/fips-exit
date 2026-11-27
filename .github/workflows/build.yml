@@ -59,6 +59,10 @@ jobs:
         run: |
           set -euo pipefail
           # The payments are tested against a real mint, started in the tests.
+          # The mint's side of the wallet library wants protoc to be built;
+          # the service itself does not, nor does installing it.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
           cargo test --locked --manifest-path payd/Cargo.toml
           cargo clippy --locked --manifest-path payd/Cargo.toml --all-targets -- -D warnings
           cargo fmt --manifest-path payd/Cargo.toml -p fips-exit-payd -p fips-exit-test-mint --check

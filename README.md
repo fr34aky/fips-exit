@@ -460,6 +460,10 @@ needs both built:
 `cargo build --release --manifest-path payd/Cargo.toml -p fips-exit-payd` and
 `cargo build --manifest-path payd/Cargo.toml -p fips-exit-test-mint`.
 
+The tests in `payd/` and that mint need `protoc` to be built (the package
+`protobuf-compiler`, or `protobuf`): the wallet library's mint side wants
+it. The payment service itself does not, and neither does `install.sh`.
+
 The second runs the daemon and the script against the real kernel, without
 root and without fips: network namespaces stand in for two clients, the
 exit and the internet, and a 1280-byte link stands in for the mesh. It

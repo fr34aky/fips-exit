@@ -3,9 +3,12 @@
 //! Every peer is a stranger, so everything a peer can make this service do
 //! has a bound: how many connections at once in all and from one address,
 //! how long its header may take and how large it may be, how long a
-//! connection may last. A request names this exit in its `Host` header or
-//! is refused: a page on some other site must not be able to read what
-//! this one says to a browser on the mesh.
+//! connection may last, how large its body may be. A request names this
+//! exit in its `Host` header or is refused: a page on some other site must
+//! not be able to read what this one says to a browser on the mesh. A
+//! request that changes something comes from this exit's own page (its
+//! `Origin`), or is JSON, which a page elsewhere cannot send here without
+//! asking first, and is not let.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -14,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::server::conn::http1;
@@ -22,7 +25,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::config::Config;
 use crate::store::Store;
@@ -39,8 +42,9 @@ pub struct Limits {
     /// life.
     pub header_time: Duration,
     pub lifetime: Duration,
-    /// The most a request's header may be, in bytes.
+    /// The most a request's header may be, in bytes, and its body.
     pub header_bytes: usize,
+    pub body_bytes: usize,
 }
 
 impl Default for Limits {
@@ -51,6 +55,7 @@ impl Default for Limits {
             header_time: Duration::from_secs(5),
             lifetime: Duration::from_secs(60),
             header_bytes: 16 * 1024,
+            body_bytes: 8 * 1024,
         }
     }
 }
@@ -61,16 +66,21 @@ pub struct Site {
     pub exit: Exit,
     /// The `Host` headers this exit answers to, in small letters.
     pub hosts: Vec<String>,
+    /// The one `Origin` a form may come from: this exit's page.
+    pub origin: String,
     pub store: Arc<Store>,
     pub seats: Seats,
+    /// Told when a package changed, so that the daemon is told at once.
+    pub changed: Arc<Notify>,
 }
 
 impl Site {
-    pub fn new(config: Config, exit: Exit, store: Arc<Store>, seats: Seats) -> Site {
+    pub fn new(config: Config, exit: Exit, store: Arc<Store>, seats: Seats, changed: Arc<Notify>) -> Site {
         // The exit's name, and nothing else: its fips address is reached
         // only by way of that name, which a browser then sends.
-        let hosts = vec![format!("{}.fips:{}", exit.npub, config.port).to_ascii_lowercase()];
-        Site { config, exit, hosts, store, seats }
+        let name = format!("{}.fips:{}", exit.npub, config.port).to_ascii_lowercase();
+        let origin = format!("http://{name}");
+        Site { config, exit, hosts: vec![name], origin, store, seats, changed }
     }
 
     /// The package `caller` is in, as the caller may see it.
@@ -95,7 +105,7 @@ pub fn on_the_mesh(peer: IpAddr) -> bool {
     matches!(peer, IpAddr::V6(addr) if addr.octets()[0] == 0xfd)
 }
 
-fn answer(status: StatusCode, kind: &'static str, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
+pub fn answer(status: StatusCode, kind: &'static str, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(body.into()));
     *response.status_mut() = status;
     let headers = response.headers_mut();
@@ -116,29 +126,87 @@ fn plain(status: StatusCode, text: &str) -> Response<Full<Bytes>> {
     answer(status, "text/plain; charset=utf-8", format!("{text}\n"))
 }
 
-/// One request, from `peer`.
-pub fn respond<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>) -> Response<Full<Bytes>> {
+/// The media type of a request's body, without its parameters, in small
+/// letters.
+fn media_type<B>(request: &Request<B>) -> String {
+    let named = request.headers().get(header::CONTENT_TYPE).and_then(|kind| kind.to_str().ok()).unwrap_or("");
+    named.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+}
+
+/// Did the request come from this exit's own page? A browser says where a
+/// request it sends comes from (`Origin`, and `Sec-Fetch-Site`); one that
+/// says nothing is not believed to come from here.
+fn from_this_page<B>(site: &Site, request: &Request<B>) -> bool {
+    let said = |name: &str| request.headers().get(name).and_then(|value| value.to_str().ok());
+    let origin_ours = said("origin").is_some_and(|origin| origin.eq_ignore_ascii_case(&site.origin));
+    origin_ours && said("sec-fetch-site").is_none_or(|site| site == "same-origin")
+}
+
+/// Not from another site: a JSON request may come from a program, which
+/// says no origin, or from this page; not from a page elsewhere.
+fn not_from_elsewhere<B>(site: &Site, request: &Request<B>) -> bool {
+    let said = |name: &str| request.headers().get(name).and_then(|value| value.to_str().ok());
+    said("origin").is_none_or(|origin| origin.eq_ignore_ascii_case(&site.origin))
+        && said("sec-fetch-site").is_none_or(|site| site == "same-origin" || site == "none")
+}
+
+/// One request, from `peer`, with its body.
+pub fn respond<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>, body: &[u8]) -> Response<Full<Bytes>> {
     let host = request.headers().get(header::HOST).and_then(|host| host.to_str().ok()).map(str::to_ascii_lowercase);
     match host {
         Some(host) if site.hosts.contains(&host) => {}
         _ => return plain(StatusCode::MISDIRECTED_REQUEST, "not this exit's name"),
     }
-    if request.method() != Method::GET && request.method() != Method::HEAD {
-        let mut refused = plain(StatusCode::METHOD_NOT_ALLOWED, "only GET, for now");
-        refused.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
-        return refused;
-    }
+    let path = request.uri().path();
+    let method = request.method();
+    let reading = method == Method::GET || method == Method::HEAD;
     let terms = || terms::terms(&site.config, &site.exit, peer, site.package_of(peer));
+    let refused = |allow: &'static str| {
+        let mut refused = plain(StatusCode::METHOD_NOT_ALLOWED, &format!("only {allow} here"));
+        refused.headers_mut().insert(header::ALLOW, HeaderValue::from_static(allow));
+        refused
+    };
     // A HEAD is answered as a GET; hyper sends the head of it and not the body.
-    match request.uri().path() {
+    match path {
+        "/v1/terms" | "/" | "/style.css" if !reading => refused("GET, HEAD"),
         "/v1/terms" => match serde_json::to_vec(&terms()) {
             Ok(json) => answer(StatusCode::OK, "application/json", json),
             Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, "the terms could not be written"),
         },
         "/" => answer(StatusCode::OK, "text/html; charset=utf-8", terms::page(&terms())),
         "/style.css" => answer(StatusCode::OK, "text/css; charset=utf-8", terms::STYLE),
+        "/v1/package" | "/v1/package/members" | "/v1/leave" | "/package" | "/package/members" | "/leave"
+            if method != Method::POST =>
+        {
+            refused("POST")
+        }
+        "/v1/package" | "/v1/package/members" | "/v1/leave" => {
+            if media_type(request) != "application/json" {
+                plain(StatusCode::UNSUPPORTED_MEDIA_TYPE, "JSON, as application/json")
+            } else if !not_from_elsewhere(site, request) {
+                plain(StatusCode::FORBIDDEN, "not from another site")
+            } else {
+                crate::manage::as_json(site, peer, path, body)
+            }
+        }
+        "/package" | "/package/members" | "/leave" => {
+            if media_type(request) != "application/x-www-form-urlencoded" {
+                plain(StatusCode::UNSUPPORTED_MEDIA_TYPE, "a form")
+            } else if !from_this_page(site, request) {
+                plain(StatusCode::FORBIDDEN, "only from this exit's page")
+            } else {
+                crate::manage::as_form(site, peer, path, body)
+            }
+        }
         _ => plain(StatusCode::NOT_FOUND, "nothing here"),
     }
+}
+
+/// A request's body: at most `most` bytes, within `time`. None for one that
+/// is larger or slower.
+async fn body_of(body: Incoming, most: usize, time: Duration) -> Option<Bytes> {
+    let collected = tokio::time::timeout(time, Limited::new(body, most).collect()).await.ok()?.ok()?;
+    Some(collected.to_bytes())
 }
 
 /// A place among the connections of one peer, given back when it is dropped.
@@ -201,8 +269,15 @@ pub async fn serve(listener: TcpListener, site: Arc<Site>, limits: Limits, admit
         tokio::spawn(async move {
             let _places = (place, peer_place);
             let service = service_fn(move |request: Request<Incoming>| {
-                let response = respond(&site, mesh_peer, &request);
-                async move { Ok::<_, Infallible>(response) }
+                let site = site.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let response = match body_of(body, limits.body_bytes, limits.header_time).await {
+                        Some(body) => respond(&site, mesh_peer, &Request::from_parts(parts, ()), &body),
+                        None => plain(StatusCode::PAYLOAD_TOO_LARGE, "a body too large, or too slow"),
+                    };
+                    Ok::<_, Infallible>(response)
+                }
             });
             let connection = http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -233,7 +308,7 @@ mod tests {
             about: String::new(),
             country: None,
         };
-        Arc::new(Site::new(config, exit, Arc::new(Store::in_memory()), Seats::default()))
+        Arc::new(Site::new(config, exit, Arc::new(Store::in_memory()), Seats::default(), Arc::default()))
     }
 
     fn get(path: &str, host: &str) -> Request<()> {
@@ -245,7 +320,7 @@ mod tests {
         let site = site();
         let peer = "fd99::2".parse().unwrap();
         for host in ["npub1example.fips:5170", "NPUB1EXAMPLE.FIPS:5170"] {
-            assert_eq!(respond(&site, peer, &get("/v1/terms", host)).status(), StatusCode::OK, "{host}");
+            assert_eq!(respond(&site, peer, &get("/v1/terms", host), b"").status(), StatusCode::OK, "{host}");
         }
         // Not the bare address either: it is reached only by way of the name.
         for host in [
@@ -259,35 +334,107 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                respond(&site, peer, &get("/v1/terms", host)).status(),
+                respond(&site, peer, &get("/v1/terms", host), b"").status(),
                 StatusCode::MISDIRECTED_REQUEST,
                 "{host}"
             );
         }
         let no_host = Request::builder().uri("/v1/terms").body(()).unwrap();
-        assert_eq!(respond(&site, peer, &no_host).status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(respond(&site, peer, &no_host, b"").status(), StatusCode::MISDIRECTED_REQUEST);
     }
 
     #[test]
     fn what_there_is_and_what_there_is_not() {
         let (site, peer, host) = (site(), "fd99::2".parse().unwrap(), "npub1example.fips:5170");
-        let terms = respond(&site, peer, &get("/v1/terms", host));
+        let terms = respond(&site, peer, &get("/v1/terms", host), b"");
         assert_eq!(terms.headers()[header::CONTENT_TYPE], "application/json");
         assert_eq!(terms.headers()[header::CACHE_CONTROL], "no-store");
-        let page = respond(&site, peer, &get("/", host));
+        let page = respond(&site, peer, &get("/", host), b"");
         assert_eq!(page.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
         assert!(page.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().starts_with("default-src 'none'"));
-        assert_eq!(respond(&site, peer, &get("/style.css", host)).status(), StatusCode::OK);
+        assert_eq!(respond(&site, peer, &get("/style.css", host), b"").status(), StatusCode::OK);
         for path in ["/v1/terms/", "/v2/terms", "/index.html", "/../etc/passwd", "/v1/orders"] {
-            assert_eq!(respond(&site, peer, &get(path, host)).status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(respond(&site, peer, &get(path, host), b"").status(), StatusCode::NOT_FOUND, "{path}");
         }
         for method in [Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS] {
             let request =
                 Request::builder().method(method.clone()).uri("/v1/terms").header(header::HOST, host).body(()).unwrap();
-            let response = respond(&site, peer, &request);
+            let response = respond(&site, peer, &request, b"");
             assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
             assert_eq!(response.headers()[header::ALLOW], "GET, HEAD");
         }
+    }
+
+    fn post(path: &str, kind: &str, headers: &[(&str, &str)]) -> Request<()> {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::HOST, "npub1example.fips:5170")
+            .header(header::CONTENT_TYPE, kind);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.body(()).unwrap()
+    }
+
+    /// What changes something is not to be sent from a page elsewhere: JSON
+    /// that no other page may send, or a form from this exit's own page.
+    #[test]
+    fn a_change_comes_from_here_or_from_a_program() {
+        let (site, peer) = (site(), "fd99::2".parse().unwrap());
+        let ours = "http://npub1example.fips:5170";
+        let json = b"{}";
+        let status = |request: Request<()>, body: &[u8]| respond(&site, peer, &request, body).status();
+        // JSON: from a program (no origin), or from this page.
+        assert_eq!(status(post("/v1/leave", "application/json", &[]), json), StatusCode::OK);
+        assert_eq!(
+            status(post("/v1/leave", "application/json; charset=utf-8", &[("origin", ours)]), json),
+            StatusCode::OK
+        );
+        assert_eq!(status(post("/v1/leave", "Application/JSON", &[("sec-fetch-site", "none")]), json), StatusCode::OK);
+        assert_eq!(status(post("/v1/leave", "text/plain", &[]), json), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            status(post("/v1/leave", "application/x-www-form-urlencoded", &[]), json),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            status(post("/v1/leave", "application/json", &[("origin", "http://evil.example")]), json),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(post("/v1/leave", "application/json", &[("sec-fetch-site", "cross-site")]), json),
+            StatusCode::FORBIDDEN
+        );
+        // A form: from this page, and from nowhere else, nor from nowhere.
+        let form = "application/x-www-form-urlencoded";
+        assert_eq!(status(post("/leave", form, &[("origin", ours)]), b""), StatusCode::OK);
+        assert_eq!(
+            status(post("/leave", form, &[("origin", ours), ("sec-fetch-site", "same-origin")]), b""),
+            StatusCode::OK
+        );
+        assert_eq!(status(post("/leave", form, &[]), b""), StatusCode::FORBIDDEN);
+        assert_eq!(status(post("/leave", form, &[("origin", "null")]), b""), StatusCode::FORBIDDEN);
+        assert_eq!(status(post("/leave", form, &[("origin", "http://evil.example")]), b""), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(post("/leave", form, &[("origin", ours), ("sec-fetch-site", "cross-site")]), b""),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(status(post("/leave", "text/plain", &[("origin", ours)]), b""), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        // The ways in are POST only; the terms are GET only.
+        assert_eq!(status(get("/leave", "npub1example.fips:5170"), b""), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(status(get("/v1/package", "npub1example.fips:5170"), b""), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn a_body_too_large_is_refused() {
+        let at = server(Limits::default(), |_| true).await;
+        let mut request =
+            b"POST /v1/package HTTP/1.1\r\nHost: npub1example.fips:5170\r\nContent-Type: application/json\r\n\
+            Content-Length: 20000\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        request.extend(std::iter::repeat_n(b' ', 20_000));
+        let answer = exchange(at, &request).await;
+        assert!(answer.starts_with("HTTP/1.1 413"), "{answer:.60}");
     }
 
     #[test]

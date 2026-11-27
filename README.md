@@ -189,8 +189,23 @@ sudo fips-exit revoke <package>                       # taken back
 - A package is an account in the daemon, kept as the service says: its
   members are carried until its bytes are used up or its time is over, and
   carried again when it is topped up. A device is in one package at a time.
-- `grant` prints the package's key once. The service keeps only its hash.
-  (What the key is for, a buyer managing its own package, comes next.)
+- `grant` prints the package's key once, and the service keeps only its
+  hash. Whoever has the key manages the package: on the exit's page
+  (*A package of yours*), or as JSON:
+
+  ```text
+  POST /v1/package          {"key": "…"}                                  the package, and who is in it
+  POST /v1/package/members  {"key": "…", "add": ["npub1…"], "remove": []}   the same, changed
+  POST /v1/leave            {}                                            this device out of its package
+  ```
+
+  A device belongs to itself: one in a live package is not put in another
+  by that package's key holder, but it can move itself there with the key,
+  and it can always take itself out, with no key at all. Members are shown
+  by the npub they were named by.
+- A request that changes something is JSON, or a form from the exit's own
+  page (its `Origin`): a page on another site cannot make a device leave
+  its package.
 - The service keeps its packages in `/var/lib/fips-exit-payd`, and what the
   daemon counts is written there every two seconds: a restart of the daemon
   or of the service loses at most those seconds, in the members' favour.

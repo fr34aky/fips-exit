@@ -34,11 +34,20 @@ const LINE_TIME: Duration = Duration::from_secs(10);
 /// The longest label, in characters.
 const MAX_LABEL: usize = 64;
 
-fn members(word: &str) -> Result<Vec<Ipv6Addr>, String> {
+/// Members as the operator names them; an npub is remembered for its
+/// address, so that it is shown by it.
+fn members(store: &Store, word: &str) -> Result<Vec<Ipv6Addr>, String> {
     if word == "-" {
         return Ok(Vec::new());
     }
-    word.split(',').map(|who| client(who).ok_or_else(|| format!("err who {who}"))).collect()
+    let named: Vec<(Ipv6Addr, Option<String>)> =
+        word.split(',').map(|who| client(who).ok_or_else(|| format!("err who {who}"))).collect::<Result<_, _>>()?;
+    for (address, npub) in &named {
+        if let Some(npub) = npub {
+            store.remember(*address, npub).map_err(|e| format!("err {e}"))?;
+        }
+    }
+    Ok(named.into_iter().map(|(address, _)| address).collect())
 }
 
 fn days(word: &str) -> Result<u32, String> {
@@ -66,7 +75,7 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
         let store_said = |e: crate::store::Refused| format!("err {e}");
         match words[..] {
             ["grant", size, d, who, ref rest @ ..] => {
-                let (bytes, days, members, label) = (bytes(size)?, days(d)?, members(who)?, label(rest)?);
+                let (bytes, days, members, label) = (bytes(size)?, days(d)?, members(store, who)?, label(rest)?);
                 if members.is_empty() {
                     return Err("err who (a package is for someone)".into());
                 }
@@ -78,7 +87,7 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
                 Ok("ok\n".into())
             }
             ["members", id, who] => {
-                store.set_members(id, &members(who)?, now).map_err(store_said)?;
+                store.set_members(id, &members(store, who)?, now).map_err(store_said)?;
                 Ok("ok\n".into())
             }
             ["revoke", id] => {
@@ -92,7 +101,7 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
                     let members = if p.members.is_empty() {
                         "-".to_string()
                     } else {
-                        p.members.iter().map(Ipv6Addr::to_string).collect::<Vec<_>>().join(",")
+                        p.members.iter().map(|m| store.name_of(*m)).collect::<Vec<_>>().join(",")
                     };
                     out.push_str(&format!(
                         "package {} {} {} {} {} {} {members} {}\n",
@@ -180,7 +189,6 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
     const NPUB: &str = "npub19gvc005p4zwlf6qldnd8yvpumyqcn4xkhedjwrfqs43udk27gkmqu9p3yl";
-    const ITS_ADDRESS: &str = "fd14:af5b:b52d:a042:618:847d:f4e1:32dc";
 
     #[test]
     fn the_operator_grants_tops_up_and_revokes() {
@@ -192,10 +200,7 @@ mod tests {
         let listed = answer(&store, "packages", NOW);
         assert_eq!(
             listed,
-            format!(
-                "package {id} live 1000000000 0 0 {} {ITS_ADDRESS},fd99::2 a friend's phone\nok 1\n",
-                NOW + 30 * 86_400
-            )
+            format!("package {id} live 1000000000 0 0 {} {NPUB},fd99::2 a friend's phone\nok 1\n", NOW + 30 * 86_400)
         );
         assert_eq!(answer(&store, &format!("top-up {id} 500MB 0"), NOW), "ok\n");
         assert_eq!(answer(&store, &format!("members {id} fd99::3"), NOW), "ok\n");

@@ -1,12 +1,11 @@
 # Paid public exits: design
 
-**Status: phases 1 to 3 of ten are implemented, and the first half of
-phase 4** (accounts in the daemon and `ACCESS=paid` in the script; the
-advert, with a country; the payment service, which tells what the exit
-costs and keeps the packages the operator gives away. The README's
+**Status: phases 1 to 4 of ten are implemented** (accounts in the daemon
+and `ACCESS=paid` in the script; the advert, with a country; the payment
+service, which tells what the exit costs, keeps the packages the operator
+gives away, and lets whoever holds a package's key manage it. The README's
 *Accounts*, *Being found* and *The payment service* sections are what they
-do now). A buyer managing its own package with its key, and everything from
-taking a payment on, is design. This document says what is to
+do now). Everything from taking a payment on is design. This document says what is to
 be built, in which order, and what was decided against. Each phase arrives
 as its own pull request and moves the parts it implements from here into the
 README and `SECURITY-REVIEW.md`; where building a phase changed the design,
@@ -501,7 +500,7 @@ and `SECURITY-REVIEW.md`.
 | 1 | **Done.** The daemon's accounts and the control socket. Then paid mode in the script. |
 | 2 | **Done.** `fips-exit-proto` and its vectors; `fips-exit advert` and its timer. Free exits gain an advert and a country by this alone. |
 | 3 | **Done.** The payment service's frame: configuration, terms, the page, the unit, a CI job. The schema waits for phase 4, which is the first to keep anything. |
-| 4 | **Half done.** Accounts without money: the service on the socket, a grant by hand, members, usage, pushing again after a restart. To come: a buyer managing its package's members with its key, over the mesh. |
+| 4 | **Done.** Accounts without money: the service on the socket, a grant by hand, members, usage, pushing again after a restart, and a package's members managed with its key over the mesh. |
 | 5 | The wallet, and payment by token. |
 | 6 | Lightning. |
 | 7 | Paying out and sweeping. Before on-chain: a wallet with no way out is the larger risk. |

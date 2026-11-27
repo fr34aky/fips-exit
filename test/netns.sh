@@ -617,6 +617,50 @@ wait_for '"$here/fips-exit" packages 2>/dev/null | grep -q "^$package  *live .*a
   || fail "the package after the service started again: $("$here/fips-exit" packages 2>&1)"
 ok "nothing is lost when the daemon or the payment service starts again"
 
+# --- a package managed with its key, over the mesh --------------------------------
+# Whoever holds the key says who is in the package; a device can always take
+# itself out, or move itself into a package whose key it has.
+http_post() { # netns path json -> status, then the body
+  ip netns exec "$1" python3 -c '
+import http.client, sys
+c = http.client.HTTPConnection(sys.argv[1], 5170, timeout=4)
+try:
+    c.request("POST", sys.argv[2], body=sys.argv[3], headers={"Host": sys.argv[4], "Content-Type": "application/json"})
+    r = c.getresponse(); print(r.status); sys.stdout.write(r.read().decode())
+except OSError: print("unreachable")' $E "$2" "$3" "$NPUB.fips:5170"
+}
+status_of() { printf '%s\n' "$1" | head -1; }
+r=$(http_post c1 /v1/package "{\"key\": \"$key\"}")
+[ "$(status_of "$r")" = 200 ] || fail "the package by its key: $r"
+printf '%s' "$r" | tail -n +2 | grep -q "\"name\":\"$C3\"" || fail "the package's members: $r"
+[ "$(status_of "$(http_post c1 /v1/package "{\"key\": \"$(printf '0%.0s' $(seq 64))\"}")")" = 403 ] || fail "a wrong key was not refused"
+# c1, which is nobody's, puts itself in with the key: carried.
+r=$(http_post c1 /v1/package/members "{\"key\": \"$key\", \"add\": [\"$C1\"]}")
+[ "$(status_of "$r")" = 200 ] || fail "c1 adding itself: $r"
+wait_for '[ "$(ask c1 4 8.8.8.2 100)" = 100 ]' || fail "a member added with the key is not carried"
+# Another package, whose holder would take c1: refused, since c1 is in a live
+# package; c1 itself, with that key, moves.
+out=$("$here/fips-exit" grant 1MB 0 $C2 another) || fail "grant: $out"
+other_key=$(printf '%s\n' "$out" | awk '$1 == "key" { print $2 }')
+other_package=$(printf '%s\n' "$out" | awk '$1 == "package" { print $2 }')
+r=$(http_post c2 /v1/package/members "{\"key\": \"$other_key\", \"add\": [\"$C1\"]}")
+[ "$(status_of "$r")" = 409 ] || fail "A DEVICE WAS TAKEN OUT OF ITS LIVE PACKAGE BY ANOTHER KEY HOLDER: $r"
+r=$(http_post c1 /v1/package/members "{\"key\": \"$other_key\", \"add\": [\"$C1\"]}")
+[ "$(status_of "$r")" = 200 ] || fail "c1 moving itself: $r"
+# And out, with no key at all: not carried.
+r=$(http_post c1 /v1/leave "{}")
+[ "$(status_of "$r")" = 200 ] && printf '%s' "$r" | grep -q '"left":"p' || fail "leave: $r"
+wait_for '[ "$(ctl "check $C1")" = "ok free v4" ]' || fail "after leave: $(ctl "check $C1")"
+[ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "A DEVICE THAT LEFT ITS PACKAGE WAS CARRIED"
+# What another site's page would send: refused.
+ip netns exec c1 python3 -c '
+import http.client, sys
+c = http.client.HTTPConnection(sys.argv[1], 5170, timeout=4)
+c.request("POST", "/leave", body="", headers={"Host": sys.argv[2], "Content-Type": "application/x-www-form-urlencoded", "Origin": "http://evil.example"})
+print(c.getresponse().status)' $E "$NPUB.fips:5170" | grep -qx 403 || fail "a form from another site was taken"
+"$here/fips-exit" revoke $other_package >/dev/null || fail "revoke the other package"
+ok "a package's key says who is in it; a device moves itself, or leaves, and nobody else moves it"
+
 "$here/fips-exit" revoke $package >/dev/null || fail "revoke"
 wait_for '[ -z "$(account_of $package)" ]' || fail "a revoked package was not dropped"
 [ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A REVOKED PACKAGE'S MEMBER WAS CARRIED"

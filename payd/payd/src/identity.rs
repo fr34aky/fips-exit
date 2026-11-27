@@ -55,10 +55,12 @@ pub fn key_address(key: &[u8; 32]) -> Ipv6Addr {
     Ipv6Addr::from(octets)
 }
 
-/// A client as the operator names it: its npub, or its fips address.
-pub fn client(text: &str) -> Option<Ipv6Addr> {
-    if text.starts_with("npub1") {
-        return npub_key(&text.to_ascii_lowercase()).map(|key| key_address(&key));
+/// A client as a person names it: its npub, or its fips address. Its
+/// address, and the npub if that is what it was named by.
+pub fn client(text: &str) -> Option<(Ipv6Addr, Option<String>)> {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.starts_with("npub1") {
+        return npub_key(&lower).map(|key| (key_address(&key), Some(lower)));
     }
-    text.parse::<Ipv6Addr>().ok().filter(|address| address.octets()[0] == 0xfd)
+    lower.parse::<Ipv6Addr>().ok().filter(|address| address.octets()[0] == 0xfd).map(|address| (address, None))
 }

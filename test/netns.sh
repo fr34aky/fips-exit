@@ -669,6 +669,98 @@ wait_for '[ -z "$(account_of $package)" ]' || fail "a revoked package was not dr
 "$here/fips-exit" grant 1GB 0 2001:db8::1 >/dev/null 2>&1 && fail "a package for an address that is not a fips address"
 ok "a revoked package's member is not carried"
 
+# --- a package bought with a token, over the mesh -----------------------------------
+# A real Cashu mint in the exit's namespace, with a Lightning backend that
+# pays itself. The exit names it, and tokens of it arrive in the service's
+# wallet: a node that is nobody's pays, and is carried.
+mint="$here/payd/target/debug/fips-exit-test-mint"
+[ -x "$mint" ] || fail "build the test mint first: cargo build --manifest-path payd/Cargo.toml -p fips-exit-test-mint"
+MINT=http://127.0.0.1:3338
+"$mint" serve 127.0.0.1:3338 > "$FIPS_EXIT_DIR/mint.out" 2>"$FIPS_EXIT_DIR/mint.log" &
+mint_pid=$!
+wait_for 'grep -qx "$MINT" "$FIPS_EXIT_DIR/mint.out"' || fail "the test mint did not start: $(cat "$FIPS_EXIT_DIR/mint.log")"
+token() { "$mint" token $MINT "$1" || fail "no token of $1 sat from the test mint"; }
+sells() { conf "ACCESS=paid\nPRICE_MSAT_PER_GB=2000000\nPACKAGES=\"$1\"\nCOUNTRY=CH\nADVERT_NAME=\"An exit\"\n$2"; }
+# What the advert would say of the exit's terms: what the script is told by
+# the service, written as the advert's tags. (The advert itself is signed
+# with the node's key, which this exit of a test has none of.)
+advert_terms() {
+  python3 -I -c '
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("fips_exit", sys.argv[1])
+x = importlib.util.module_from_spec(importlib.util.spec_from_loader("fips_exit", loader))
+loader.exec_module(x)
+terms = x.offered()
+advert = {"access": "paid" if terms else "allow-list", "name": "", "about": "", "expires": 1003600, "terms": terms}
+print(json.dumps(x.advert_tags(advert, 1000000)))' "$here/fips-exit"
+}
+restart_payd() { kill $payd_pid; wait $payd_pid 2>/dev/null || true; start_payd; "$here/fips-exit" up >/dev/null; }
+# Without a mint named, nothing is sold, and the advert does not say paid.
+advert_terms | grep -q '\["access", "allow-list"\]' || fail "the advert of an exit that sells nothing: $(advert_terms)"
+r=$(http_post c1 /v1/orders '{"package": "1gb", "token": "cashuBabc"}')
+[ "$(status_of "$r")" = 503 ] || fail "an order on an exit that names no mint: $r"
+sells "tiny:30000:8:1 1gb:1GB:1500:30" "MINTS=$MINT\n"
+restart_payd
+wait_for 'http_get c1 /v1/terms | grep -q "\"methods\":\[\"cashu\"\]"' \
+  || fail "the service does not take tokens: $(http_get c1 /v1/terms) $(tail -5 "$FIPS_EXIT_DIR/payd.log")"
+http_get c1 / | grep -q '<form method="post" action="/buy">' || fail "the page does not sell"
+[ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "c1 was carried before it paid"
+t=$(token 8)
+r=$(http_post c1 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")
+[ "$(status_of "$r")" = 200 ] || fail "buying with a token: $r $(tail -5 "$FIPS_EXIT_DIR/payd.log")"
+bought=$(printf '%s' "$r" | tail -n +2 | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["paid_sat"] == 8 and d["again"] is False and d["added"] is False, d
+assert d["package"]["you"] is True and d["package"]["bytes_left"] == 30000 and len(d["key"]) == 64, d
+print(d["package"]["id"], d["key"])') || fail "what was bought: $r"
+bought_key=${bought#* }; bought=${bought% *}
+wait_for '[ "$(ask c1 4 8.8.8.2 100)" = 100 ]' || fail "A NODE THAT PAID IS NOT CARRIED: $(ctl usage) $(tail -5 "$FIPS_EXIT_DIR/payd.log")"
+# The token is one purchase: not a second for someone else, and for its buyer
+# the same again, with a new key for the package.
+[ "$(status_of "$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")")" = 409 ] || fail "A TOKEN WAS TAKEN TWICE"
+r=$(http_post c1 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")
+[ "$(status_of "$r")" = 200 ] && printf '%s' "$r" | grep -q '"again":true' || fail "the same token from its buyer: $r"
+[ "$(status_of "$(http_post c1 /v1/package "{\"key\": \"$bought_key\"}")")" = 403 ] || fail "the key before the new one still opened the package"
+# A token worth less than the price is not taken, and buys nothing.
+[ "$(status_of "$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$(token 7)\"}")")" = 402 ] || fail "a token of 7 sat for 8"
+[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A NODE THAT DID NOT PAY WAS CARRIED"
+# A client on the operator's list is carried as it is, and is sold nothing:
+# the daemon says who it is. Its token is not touched, and buys for another.
+t=$(token 8)
+r=$(http_post c2 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")
+[ "$(status_of "$r")" = 409 ] && printf '%s' "$r" | grep -q '"code":"listed"' || fail "a client on the list was sold a package: $r"
+r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")
+[ "$(status_of "$r")" = 200 ] || fail "a token that was refused untouched did not buy afterwards: $r"
+also=$(printf '%s' "$r" | tail -n +2 | python3 -c 'import json, sys; print(json.load(sys.stdin)["package"]["id"])')
+wait_for '[ "$(ask c3 4 8.8.8.2 100)" = 100 ]' || fail "the second node that paid is not carried"
+# What the operator sees of it, and what the advert says now.
+"$here/fips-exit" wallet | grep -Eq "^ +16 sat +0 sat +16 sat +reached +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
+"$here/fips-exit" orders | grep -Eq "^o[0-9a-f]{16} +paid .* 8 sat +8 sat +0 +tiny +$bought +$C1\$" || fail "orders: $("$here/fips-exit" orders)"
+[ "$("$here/fips-exit" orders | grep -c " paid ")" = 2 ] || fail "orders: $("$here/fips-exit" orders)"
+"$here/fips-exit" packages | grep -q "^$bought  *live .*bought: tiny" || fail "packages: $("$here/fips-exit" packages)"
+"$here/fips-exit" status | grep -q "tokens of $MINT: reached, holds 16 sat" || fail "status: $("$here/fips-exit" status)"
+advert_terms | python3 -c '
+import json, sys
+tags = json.load(sys.stdin)
+for tag in (["access", "paid"], ["price", "2000000"], ["pay", "cashu"], ["port", "5170"], ["mint", sys.argv[1]],
+            ["package", "tiny", "30000", "8", "1"], ["package", "1gb", "1000000000", "1500", "30"]):
+    assert tag in tags, (tag, tags)' $MINT || fail "the advert of an exit that sells: $(advert_terms)"
+# The wallet and what was sold are kept when the service starts again, with
+# its mint away: nothing is sold then, and who paid is carried all the same.
+kill $mint_pid; wait $mint_pid 2>/dev/null || true
+restart_payd
+wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +16 sat +0 sat +16 sat +away +$MINT\$"' \
+  || fail "the wallet after the service started again: $("$here/fips-exit" wallet 2>&1)"
+[ "$(status_of "$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")")" = 503 ] || fail "an order while the mint is away"
+wait_for '[ "$(ask c1 4 8.8.8.2 100)" = 100 ]' || fail "who paid is not carried after the service started again"
+[ "$(stat -c %a "$FIPS_EXIT_DIR/state/seed")" = 600 ] && [ "$(wc -w < "$FIPS_EXIT_DIR/state/seed")" = 24 ] || fail "the wallet's seed"
+"$here/fips-exit" revoke $bought >/dev/null && "$here/fips-exit" revoke $also >/dev/null || fail "revoke what was bought"
+wait_for '[ "$(ctl "check $C1") $(ctl "check $C3")" = "ok free v4 ok free v4" ]' || fail "after revoking what was bought: $(ctl "check $C1") $(ctl "check $C3")"
+sells "1gb:1GB:1500:30 5gb:5GB:6000:90" ""
+restart_payd
+ok "a token of the exit's mint buys a package over the mesh: once, for its price, and its buyer is carried"
+
 # --- a removed client is cut off, even when `up` then stops -------------------------
 # `remove` saves the list and applies it. If applying stops at something (here:
 # the host has moved into the clients' range), the client must still be gone

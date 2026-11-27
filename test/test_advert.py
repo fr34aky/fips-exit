@@ -417,14 +417,35 @@ class Command(unittest.TestCase):
         with open(self.key, "w") as f:
             f.write(bech32("nsec", KEY) + "\n")
         self.config = os.path.join(self.dir.name, "config")
-        self.saved = (x.CONFIG, x.mesh_address, x.tun_present)
+        self.saved = (x.CONFIG, x.mesh_address, x.tun_present, x.PAYD_ADMIN)
         x.CONFIG = self.config
+        # No payment service, unless a test stands one in.
+        x.PAYD_ADMIN = os.path.join(self.dir.name, "admin.sock")
         x.mesh_address = lambda config: x.key_address(x.schnorr_pubkey(KEY))
         x.tun_present = lambda config: True
         self.addCleanup(self.restore)
 
     def restore(self):
-        x.CONFIG, x.mesh_address, x.tun_present = self.saved
+        x.CONFIG, x.mesh_address, x.tun_present, x.PAYD_ADMIN = self.saved
+
+    def service(self, answers):
+        """A payment service's socket for the operator: `answers` by command."""
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(x.PAYD_ADMIN)
+        server.listen(4)
+        self.addCleanup(server.close)
+
+        def serve():
+            while True:
+                try:
+                    peer, _ = server.accept()
+                except OSError:
+                    return
+                with peer:
+                    asked = peer.makefile().readline().strip()
+                    peer.sendall(answers.get(asked, "err command\n").encode())
+
+        threading.Thread(target=serve, daemon=True).start()
 
     def configure(self, **settings):
         settings.setdefault("FIPS_KEY", self.key)
@@ -457,10 +478,106 @@ class Command(unittest.TestCase):
         self.assertTrue(x.schnorr_verify(bytes.fromhex(event["id"]), bytes.fromhex(event["pubkey"]),
                                          bytes.fromhex(event["sig"])))
         expires = event["created_at"] + 3 * 3600
-        # Nothing takes a payment yet, so even an exit with ACCESS=paid says allow-list.
+        # Its payment service does not run, so nothing is sold: an exit with ACCESS=paid says allow-list.
         self.assertEqual(event["tags"], [["d", "fips-exit"], ["v", "1"], ["access", "allow-list"],
                                          ["name", "An exit"], ["about", "In a rack"], ["country", "DE"],
                                          ["expiration", str(expires)]])
+
+    TERMS = {"price_msat_per_gb": 2000000, "methods": ["cashu"], "port": 5170, "mints": ["https://mint.example.org"],
+             "packages": [{"id": "1gb", "bytes": 10**9, "sat": 1500, "days": 30}]}
+
+    def test_an_exit_that_sells_says_paid_and_what_its_service_says_it_costs(self):
+        self.configure(COUNTRY="DE", ACCESS="paid")
+        self.service({"terms": f"terms {json.dumps(self.TERMS)}\nok\n"})
+        status, out = self.run_advert("show")
+        self.assertEqual(status, 0, out)
+        event = json.loads(out)
+        expires = event["created_at"] + 3 * 3600
+        self.assertEqual(event["tags"], [["d", "fips-exit"], ["v", "1"], ["access", "paid"], ["country", "DE"],
+                                         ["price", "2000000"], ["pay", "cashu"], ["port", "5170"],
+                                         ["mint", "https://mint.example.org"],
+                                         ["package", "1gb", "1000000000", "1500", "30"],
+                                         ["expiration", str(expires)]])
+        # Not for sale without ACCESS=paid, whatever a service says.
+        self.configure(COUNTRY="DE")
+        self.assertIn(["access", "allow-list"], json.loads(self.run_advert("show")[1])["tags"])
+
+    def test_a_service_that_sells_nothing_is_not_a_paid_exit(self):
+        self.configure(ACCESS="paid")
+        not_selling = dict(self.TERMS, methods=[])
+        for said in (f"terms {json.dumps(not_selling)}\nok\n", "err command\n", "ok\n", "terms {\nok\n",
+                     "terms [1, 2]\nok\n", f"terms {json.dumps(dict(self.TERMS, mints='x'))}\nok\n",
+                     f"terms {json.dumps(dict(self.TERMS, packages=[['1gb']]))}\nok\n",
+                     f"terms {json.dumps(dict(self.TERMS, methods=[1]))}\nok\n",
+                     "terms " + "[" * 100000 + "\nok\n"):
+            os.path.exists(x.PAYD_ADMIN) and os.unlink(x.PAYD_ADMIN)
+            self.service({"terms": said})
+            status, out = self.run_advert("show")
+            self.assertEqual(status, 0, said[:60])
+            self.assertIn(["access", "allow-list"], json.loads(out)["tags"], said[:60])
+
+    def test_what_a_service_says_is_held_to_the_adverts_bounds(self):
+        self.configure(ACCESS="paid")
+        for wrong in (dict(self.TERMS, price_msat_per_gb=0), dict(self.TERMS, price_msat_per_gb="2000000"),
+                      dict(self.TERMS, port=70000), dict(self.TERMS, methods=["cashu", "barter"]),
+                      dict(self.TERMS, mints=["ftp://mint.example.org"]),
+                      dict(self.TERMS, mints=["https://mint.example.org/\x1b[2J"]),
+                      dict(self.TERMS, packages=[{"id": "1 gb", "bytes": 1, "sat": 1, "days": 1}]),
+                      dict(self.TERMS, packages=[{"id": "1gb", "bytes": True, "sat": 1, "days": 1}]),
+                      dict(self.TERMS, packages=[{"id": "1gb", "bytes": 1, "sat": 1.5, "days": 1}])):
+            os.path.exists(x.PAYD_ADMIN) and os.unlink(x.PAYD_ADMIN)
+            self.service({"terms": f"terms {json.dumps(wrong)}\nok\n"})
+            status, out = self.run_advert("show")
+            self.assertNotEqual(status, 0, wrong)
+            self.assertEqual(out, "", "nothing is written that is not in order")
+
+    def run_command(self, command):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try:
+                command()
+                status = 0
+            except SystemExit as stopped:
+                status = stopped.code
+        return status, out.getvalue()
+
+    def test_the_wallet_and_the_orders_are_shown_as_the_service_says_them(self):
+        self.service({
+            "wallet": "mint https://mint.example.org reached 1564 0 1564\nmint https://b.example away 0 64 0\nok 2\n",
+            "orders": "order o0123456789abcdef paid 1800000000 fd77::7 1gb 1500 1500 1 p0123456789abcdef "
+                      "https://mint.example.org\norder o1123456789abcdef open 1800000060 npub1abc small 64 0 0 - "
+                      "https://mint.example.org\nok 2\n"})
+        status, out = self.run_command(x.cmd_wallet)
+        self.assertEqual(status, 0)
+        rows = out.splitlines()
+        self.assertEqual(rows[1].split(), ["1564", "sat", "0", "sat", "1564", "sat", "reached", "https://mint.example.org"])
+        self.assertEqual(rows[2].split(), ["0", "sat", "64", "sat", "0", "sat", "away", "https://b.example"])
+        self.assertIn("its seed", out)
+        status, out = self.run_command(x.cmd_orders)
+        self.assertEqual(status, 0)
+        rows = out.splitlines()
+        self.assertEqual(rows[1].split()[:2] + rows[1].split()[4:],
+                         ["o0123456789abcdef", "paid", "1500", "sat", "1500", "sat", "1", "1gb", "p0123456789abcdef",
+                          "fd77::7"])
+        self.assertEqual(rows[2].split()[:2] + rows[2].split()[-3:], ["o1123456789abcdef", "open", "small", "-", "npub1abc"])
+
+    def test_what_is_not_a_mint_or_an_order_is_said_and_does_nothing_to_the_terminal(self):
+        self.service({"wallet": "mint https://m.example reached lots 0 0\nok 1\n",
+                      "orders": "order o1 paid when\x1b[2J fd77::7 1gb 1 1 0 p1 https://m.example\nok 1\n"})
+        for command in (x.cmd_wallet, x.cmd_orders):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                status, _ = self.run_command(command)
+            self.assertNotEqual(status, 0)
+            self.assertNotIn("\x1b", str(status) + err.getvalue())
+
+    def test_no_service_is_said(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            status, _ = self.run_command(x.cmd_wallet)
+        self.assertIn("is it running?", str(status) + err.getvalue())
+        self.assertIsNone(x.payd("terms", fatal=False))
+        self.assertIsNone(x.offered())
 
     def test_show_prints_the_event_and_sends_nothing(self):
         self.configure(COUNTRY="IS")

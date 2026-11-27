@@ -2,6 +2,8 @@
 //! runtime directory, which only the service's user and root can open, and
 //! which `fips-exit grant`, `packages`, `top-up`, `members` and `revoke`
 //! speak to. Packages made here are given away: nothing is paid for them.
+//! `wallet` and `orders` say what was paid, and `terms` what the advert is
+//! to say of this exit.
 //!
 //! One command a line, words with spaces between them; every answer ends in
 //! a line that begins `ok` or `err`.
@@ -12,6 +14,9 @@
 //! members <id> <npub|address,…|->                 ok
 //! revoke <id>                                     ok
 //! packages                                        package <id> <standing> <granted> <used_in> <used_out> <until> <members|-> [label], … ok <n>
+//! orders                                          order <id> <paid|open> <created> <buyer> <offer> <sat> <paid sat> <fee sat> <package|-> <mint>, … ok <n>
+//! wallet                                          mint <url> <reached|away> <holds sat> <under way sat> <sold sat>, … ok <n>
+//! terms                                           terms <JSON: price_msat_per_gb, methods, port, mints, packages>, ok
 //! ```
 
 use std::net::Ipv6Addr;
@@ -24,6 +29,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 use crate::config::size;
+use crate::http::Site;
 use crate::identity::client;
 use crate::store::Store;
 use crate::sync::unix_now;
@@ -33,6 +39,8 @@ const MAX_LINE: usize = 4096;
 const LINE_TIME: Duration = Duration::from_secs(10);
 /// The longest label, in characters.
 const MAX_LABEL: usize = 64;
+/// The most orders listed: the newest.
+const MAX_ORDERS: usize = 200;
 
 /// Members as the operator names them: npubs or fips addresses.
 fn members(word: &str) -> Result<Vec<(Ipv6Addr, Option<String>)>, String> {
@@ -127,8 +135,31 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
                 out.push_str(&format!("ok {}\n", packages.len()));
                 Ok(out)
             }
+            ["orders"] => {
+                let orders = store.orders(MAX_ORDERS).map_err(store_said)?;
+                let mut out = String::new();
+                for o in &orders {
+                    out.push_str(&format!(
+                        "order {} {} {} {} {} {} {} {} {} {}\n",
+                        o.id,
+                        if o.paid { "paid" } else { "open" },
+                        o.created,
+                        store.name_of(o.buyer),
+                        o.offer,
+                        o.sat,
+                        o.paid_sat,
+                        o.fee_sat,
+                        o.package.as_deref().unwrap_or("-"),
+                        o.mint
+                    ));
+                }
+                out.push_str(&format!("ok {}\n", orders.len()));
+                Ok(out)
+            }
             [] => Err("err syntax".into()),
-            ["grant" | "top-up" | "members" | "revoke" | "packages", ..] => Err("err arguments".into()),
+            ["grant" | "top-up" | "members" | "revoke" | "packages" | "orders" | "wallet" | "terms", ..] => {
+                Err("err arguments".into())
+            }
             _ => Err("err command".into()),
         }
     })();
@@ -154,7 +185,53 @@ pub fn listen(path: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
-async fn session(store: Arc<Store>, changed: Arc<Notify>, stream: UnixStream) {
+/// What is asked of the service as it runs, and not of its store alone:
+/// the wallet, and the terms. None for any other line.
+async fn of_the_site(site: &Site, line: &str) -> Option<String> {
+    match line.split_whitespace().collect::<Vec<_>>()[..] {
+        ["wallet"] => {
+            let mut out = String::new();
+            let mints = site.desk.as_ref().map(|desk| desk.wallets.mints.as_slice()).unwrap_or_default();
+            for mint in mints {
+                let (holds, pending) = match mint.balance().await {
+                    Ok(balance) => balance,
+                    Err(e) => return Some(format!("err wallet {e}\n")),
+                };
+                let sold = match site.store.sold(&mint.name) {
+                    Ok(sold) => sold,
+                    Err(e) => return Some(format!("err {e}\n")),
+                };
+                let state = if mint.ready() { "reached" } else { "away" };
+                out.push_str(&format!("mint {} {state} {holds} {pending} {sold}\n", mint.name));
+            }
+            out.push_str(&format!("ok {}\n", mints.len()));
+            Some(out)
+        }
+        // What the advert says of this exit's terms: what is configured,
+        // whether or not its mints answer at this moment.
+        ["terms"] => {
+            let methods: &[&str] = if site.desk.is_some() { &["cashu"] } else { &[] };
+            let packages: Vec<serde_json::Value> = site
+                .config
+                .packages
+                .iter()
+                .map(|p| serde_json::json!({ "id": p.id, "bytes": p.bytes, "sat": p.sat, "days": p.days }))
+                .collect();
+            let terms = serde_json::json!({
+                "price_msat_per_gb": site.config.price_msat_per_gb,
+                "methods": methods,
+                "port": site.config.port,
+                "mints": site.config.mints,
+                "packages": packages,
+            });
+            Some(format!("terms {terms}\nok\n"))
+        }
+        _ => None,
+    }
+}
+
+async fn session(site: Arc<Site>, stream: UnixStream) {
+    let (store, changed): (&Store, &Notify) = (&site.store, &site.changed);
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).take(MAX_LINE as u64 * 64);
     loop {
@@ -166,10 +243,15 @@ async fn session(store: Arc<Store>, changed: Arc<Notify>, stream: UnixStream) {
         if read == 0 {
             return;
         }
-        let reply =
-            if line.len() > MAX_LINE { "err line\n".to_string() } else { answer(&store, line.trim_end(), unix_now()) };
-        if reply.lines().last().is_some_and(|last| last.starts_with("ok")) && !line.trim_start().starts_with("packages")
-        {
+        let reply = if line.len() > MAX_LINE {
+            "err line\n".to_string()
+        } else if let Some(reply) = of_the_site(&site, line.trim_end()).await {
+            reply
+        } else {
+            answer(store, line.trim_end(), unix_now())
+        };
+        let changes = ["grant", "top-up", "members", "revoke"].iter().any(|word| line.trim_start().starts_with(word));
+        if changes && reply.lines().last().is_some_and(|last| last.starts_with("ok")) {
             // Something changed: the daemon is told now, not in a while.
             changed.notify_one();
         }
@@ -179,11 +261,11 @@ async fn session(store: Arc<Store>, changed: Arc<Notify>, stream: UnixStream) {
     }
 }
 
-pub async fn serve(listener: UnixListener, store: Arc<Store>, changed: Arc<Notify>) {
+pub async fn serve(listener: UnixListener, site: Arc<Site>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(session(store.clone(), changed.clone(), stream));
+                tokio::spawn(session(site.clone(), stream));
             }
             Err(e) => {
                 eprintln!("fips-exit-payd: the operator's socket: {e}");
@@ -219,6 +301,46 @@ mod tests {
         assert!(listed.contains(" fd99::3 "), "{listed}");
         assert_eq!(answer(&store, &format!("revoke {id}"), NOW), "ok\n");
         assert!(answer(&store, "packages", NOW).starts_with(&format!("package {id} revoked ")));
+    }
+
+    /// What was paid, as the operator is told it: the wallet at each mint
+    /// against what was sold there, the orders, and the terms the advert is
+    /// to carry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_operator_sees_what_was_paid() {
+        let w = crate::orders::testing::world(0, Duration::from_secs(600)).await;
+        assert_eq!(of_the_site(&w.site, "wallet").await.unwrap(), format!("mint {} reached 0 0 0\nok 1\n", w.mint));
+        assert_eq!(answer(&w.site.store, "orders", NOW), "ok 0\n");
+        let bought = w.buy("fd77::7", "small", &w.token(64).await, None).await.unwrap();
+        assert_eq!(of_the_site(&w.site, "wallet").await.unwrap(), format!("mint {} reached 64 0 64\nok 1\n", w.mint));
+        let orders = answer(&w.site.store, "orders", NOW);
+        let [order, id, state, _created, buyer, offer, sat, paid, fee, package, mint, ok, n] =
+            orders.split_whitespace().collect::<Vec<_>>()[..]
+        else {
+            panic!("{orders}")
+        };
+        assert_eq!((order, id, state, buyer, offer), ("order", bought.order.as_str(), "paid", "fd77::7", "small"));
+        assert_eq!(
+            (sat, paid, fee, package, mint),
+            ("64", "64", "0", bought.settled.package.id.as_str(), w.mint.as_str())
+        );
+        assert_eq!((ok, n), ("ok", "1"));
+        // The package it made is among the packages, said to be bought.
+        assert!(answer(&w.site.store, "packages", NOW).contains(" fd77::7 bought: small\n"));
+        let terms = of_the_site(&w.site, "terms").await.unwrap();
+        let (line, ok) = terms.trim_end().split_once('\n').unwrap();
+        let said: serde_json::Value = serde_json::from_str(line.strip_prefix("terms ").unwrap()).unwrap();
+        assert_eq!(
+            said,
+            serde_json::json!({
+                "price_msat_per_gb": 2000000, "methods": ["cashu"], "port": 5170, "mints": [w.mint],
+                "packages": [{"id": "small", "bytes": 10000000, "sat": 64, "days": 1},
+                             {"id": "big", "bytes": 1000000000, "sat": 1500, "days": 30}],
+            })
+        );
+        assert_eq!(ok, "ok");
+        assert_eq!(of_the_site(&w.site, "packages").await, None, "the store's commands are the store's");
+        assert_eq!(answer(&w.site.store, "wallet now", NOW), "err arguments\n");
     }
 
     #[test]

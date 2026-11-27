@@ -68,13 +68,20 @@ pub struct Terms {
     pub packages: Vec<PackageTerms>,
     /// Mints accepted.
     pub mints: Vec<String>,
-    /// The ways of paying that work now. None yet: nothing here takes a
-    /// payment, and a client buys nothing while this is empty.
+    /// The ways of paying that work now: `cashu`, a token of an accepted
+    /// mint, while one of them is reached. A client buys nothing while this
+    /// is empty.
     pub methods: Vec<String>,
     pub you: You,
 }
 
-pub fn terms(config: &Config, exit: &Exit, caller: Ipv6Addr, package: Option<YourPackage>) -> Terms {
+pub fn terms(
+    config: &Config,
+    exit: &Exit,
+    caller: Ipv6Addr,
+    package: Option<YourPackage>,
+    methods: Vec<String>,
+) -> Terms {
     let offered = |p: &Package| PackageTerms { id: p.id.clone(), bytes: p.bytes, sat: p.sat, days: p.days };
     Terms {
         version: VERSION,
@@ -82,7 +89,7 @@ pub fn terms(config: &Config, exit: &Exit, caller: Ipv6Addr, package: Option<You
         price_msat_per_gb: config.price_msat_per_gb,
         packages: config.packages.iter().map(offered).collect(),
         mints: config.mints.clone(),
-        methods: Vec::new(),
+        methods,
         you: You { address: caller, package },
     }
 }
@@ -136,6 +143,67 @@ pub fn date(unix: u64) -> String {
 /// Satoshi for a person: millisatoshi rounded up to whole satoshi.
 fn sat_shown(msat: u64) -> String {
     format!("{} sat", msat.div_ceil(1000))
+}
+
+/// A page of this exit's: `body` under `title`, with the one stylesheet.
+/// Both are markup already: what goes into them is escaped by whoever
+/// writes them.
+pub fn shell(title: &str, body: &str) -> String {
+    format!(
+        "<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>{title}</title>
+<link rel=\"stylesheet\" href=\"/style.css\">
+</head>
+<body>
+<main>
+<h1>{title}</h1>
+{body}</main>
+</body>
+</html>
+"
+    )
+}
+
+/// The form that buys one of `offers` with a token. With `key`, what is
+/// bought is added to the package that key opens.
+pub fn buy_form(offers: &[Package], key: Option<&str>) -> String {
+    if offers.is_empty() {
+        return String::new();
+    }
+    let options: String = offers
+        .iter()
+        .map(|p| {
+            format!(
+                "<option value=\"{id}\">{id}: {}, {} days, {} sat</option>",
+                bytes_shown(p.bytes),
+                p.days,
+                p.sat,
+                id = escape(&p.id)
+            )
+        })
+        .collect();
+    let (heading, hidden, button) = match key {
+        Some(key) => (
+            "<h2>Add to this package</h2>\n",
+            format!("<input type=\"hidden\" name=\"key\" value=\"{}\">", escape(key)),
+            "Add it, paid with this token",
+        ),
+        None => ("<h2>Buy a package</h2>\n", String::new(), "Pay with this token"),
+    };
+    format!(
+        "{heading}<form method=\"post\" action=\"/buy\">{hidden}
+<p><label>Package <select name=\"package\">{options}</select></label></p>
+<p><label>A Cashu token for its price, of a mint this exit accepts<br>
+<textarea name=\"token\" rows=\"5\" required autocomplete=\"off\" autocapitalize=\"off\" spellcheck=\"false\"></textarea></label></p>
+<button>{button}</button>
+</form>
+<p class=\"you\">The token must be worth the price after the fee its mint takes for redeeming it. One worth less, or over a tenth more, is not touched. What is paid is not given back.</p>
+"
+    )
 }
 
 /// The page: the same terms, for a browser. No script, no font or file from
@@ -212,8 +280,7 @@ pub fn page(terms: &Terms) -> String {
 {packages}
 <h2>Mints accepted</h2>
 {mints}
-<p class=\"note\">Nothing can be bought here yet: this exit takes no payment so far.</p>
-<h2>A package of yours</h2>
+{buy}<h2>A package of yours</h2>
 <form method=\"post\" action=\"/package\"><label>Its key: <input name=\"key\" size=\"40\" autocomplete=\"off\" required></label>
 <button>Manage it</button></form>
 <p class=\"you\">You are <code>{you}</code> on the mesh. That address is how this exit knows you; nothing else is asked.</p>
@@ -223,6 +290,17 @@ pub fn page(terms: &Terms) -> String {
 ",
         per_gb = sat_shown(terms.price_msat_per_gb),
         you = terms.you.address,
+        buy = if terms.methods.iter().any(|method| method == "cashu") {
+            let offers: Vec<Package> = terms
+                .packages
+                .iter()
+                .map(|p| Package { id: p.id.clone(), bytes: p.bytes, sat: p.sat, days: p.days })
+                .collect();
+            buy_form(&offers, None)
+        } else {
+            "<p class=\"note\">Nothing can be bought here right now: this exit takes no payment at the moment.</p>\n"
+                .to_string()
+        },
     )
 }
 
@@ -242,7 +320,8 @@ td:nth-child(n+2), th:nth-child(n+2) { text-align: right; }
 .you { opacity: .75; font-size: .9rem; }
 form { margin: .5rem 0; }
 td form { margin: 0; }
-input, button { font: inherit; }
+input, button, select, textarea { font: inherit; }
+textarea { width: 100%; box-sizing: border-box; font-family: monospace; font-size: .85rem; }
 ";
 
 #[cfg(test)]
@@ -278,7 +357,7 @@ mod tests {
     #[test]
     fn the_terms_are_the_config_and_the_caller() {
         let caller: Ipv6Addr = "fd99::2".parse().unwrap();
-        let json = serde_json::to_value(terms(&config(), &exit(), caller, None)).unwrap();
+        let json = serde_json::to_value(terms(&config(), &exit(), caller, None, Vec::new())).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
@@ -297,7 +376,7 @@ mod tests {
 
     #[test]
     fn the_page_shows_the_terms_and_nothing_as_markup() {
-        let page = page(&terms(&config(), &exit(), "fd99::2".parse().unwrap(), None));
+        let page = page(&terms(&config(), &exit(), "fd99::2".parse().unwrap(), None, Vec::new()));
         assert!(page.contains("<title>An &lt;b&gt;exit&lt;/b&gt; &amp; &quot;more&quot;</title>"));
         assert!(!page.contains("<b>exit</b>"), "the operator's text is not markup");
         assert!(page.contains("<code>https://mint.example.org/&lt;x&gt;</code>"));
@@ -306,12 +385,37 @@ mod tests {
         assert!(page.contains("<td>500mb</td><td>500 MB</td><td>900 sat</td><td>7 days</td><td>1800 sat</td>"));
         assert!(page.contains("<code>fd99::2</code> on the mesh"));
         assert!(page.contains("&middot; CH"));
-        assert!(page.contains("Nothing can be bought here yet"));
+        assert!(page.contains("Nothing can be bought here right now") && !page.contains("<textarea"));
         assert!(!page.contains("<script") && !page.contains("http://") && !page.contains("//fonts"));
-        let none =
-            Terms { packages: vec![], mints: vec![], ..terms(&config(), &exit(), "fd99::2".parse().unwrap(), None) };
+        let none = Terms {
+            packages: vec![],
+            mints: vec![],
+            ..terms(&config(), &exit(), "fd99::2".parse().unwrap(), None, Vec::new())
+        };
         let none = super::page(&none);
         assert!(none.contains("No packages are offered.") && none.contains("No mint is named."));
+    }
+
+    /// While a token is taken, the page has the form that buys with one.
+    #[test]
+    fn the_page_sells_while_something_can_be_paid_with() {
+        let selling = terms(&config(), &exit(), "fd99::2".parse().unwrap(), None, vec!["cashu".into()]);
+        assert_eq!(serde_json::to_value(&selling).unwrap()["methods"], serde_json::json!(["cashu"]));
+        let page = page(&selling);
+        assert!(page.contains("<form method=\"post\" action=\"/buy\">"), "{page}");
+        assert!(page.contains("<option value=\"1gb\">1gb: 1 GB, 30 days, 1500 sat</option>"));
+        assert!(page.contains("<option value=\"500mb\">500mb: 500 MB, 7 days, 900 sat</option>"));
+        assert!(page.contains("<textarea name=\"token\"") && !page.contains("Nothing can be bought"));
+        assert!(!page.contains("name=\"key\" value="), "a package of its own: no key goes with it");
+        // Added to a package: the key goes with the form, and is not markup.
+        let add = buy_form(&config().packages, Some("ab\"><x"));
+        assert!(add.contains("<h2>Add to this package</h2>"));
+        assert!(add.contains("name=\"key\" value=\"ab&quot;&gt;&lt;x\""));
+        assert_eq!(buy_form(&[], None), "", "nothing offered, nothing to buy");
+        let shell = shell("A title", "<p>the body</p>\n");
+        assert!(
+            shell.contains("<title>A title</title>") && shell.contains("<h1>A title</h1>\n<p>the body</p>\n</main>")
+        );
     }
 
     #[test]
@@ -324,7 +428,7 @@ mod tests {
             members: 2,
             ipv4: false,
         };
-        let t = terms(&config(), &exit(), "fd99::2".parse().unwrap(), Some(package.clone()));
+        let t = terms(&config(), &exit(), "fd99::2".parse().unwrap(), Some(package.clone()), Vec::new());
         let json = serde_json::to_value(&t).unwrap();
         assert_eq!(
             json["you"]["package"],
@@ -335,7 +439,7 @@ mod tests {
         assert!(shown.contains("<strong>750 MB</strong> left, until 2027-01-15 08:00 UTC."), "{shown}");
         assert!(shown.contains("over IPv6 only"));
         let over = YourPackage { standing: "over".into(), ipv4: true, ..package };
-        let shown = page(&terms(&config(), &exit(), "fd99::2".parse().unwrap(), Some(over)));
+        let shown = page(&terms(&config(), &exit(), "fd99::2".parse().unwrap(), Some(over), Vec::new()));
         assert!(shown.contains("Its time is over.") && !shown.contains("IPv6 only"));
     }
 

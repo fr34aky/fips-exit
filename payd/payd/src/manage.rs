@@ -86,7 +86,7 @@ impl From<Refused> for Fault {
 
 /// A key as `grant` gives it: 64 hex digits, in either case. Anything else
 /// is no key, and is not looked for.
-fn key_of(key: &str) -> Option<String> {
+pub fn key_of(key: &str) -> Option<String> {
     let key = key.trim().to_ascii_lowercase();
     (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())).then_some(key)
 }
@@ -137,7 +137,7 @@ fn leave(site: &Site, caller: Ipv6Addr) -> Result<Option<String>, Fault> {
 
 /// A package as its key holder sees it.
 #[derive(Debug, Serialize)]
-struct View {
+pub struct View {
     id: String,
     standing: String,
     bytes_left: u64,
@@ -154,7 +154,7 @@ struct Member {
     name: String,
 }
 
-fn view(site: &Site, package: &Package, caller: Ipv6Addr) -> View {
+pub fn view(site: &Site, package: &Package, caller: Ipv6Addr) -> View {
     View {
         id: package.id.clone(),
         standing: package.standing(unix_now()).word().to_string(),
@@ -267,8 +267,14 @@ fn field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// The page for a package's key holder: who is in it, and forms to change
 /// that. `notice` says what was done, or what went wrong.
-fn page(site: &Site, package: &Package, key: &str, caller: Ipv6Addr, notice: &str) -> String {
+pub fn page(site: &Site, package: &Package, key: &str, caller: Ipv6Addr, notice: &str) -> String {
     let v = view(site, package, caller);
+    // What is bought here is added to this package, while anything is sold.
+    let add = if site.methods().is_empty() || v.standing == "revoked" {
+        String::new()
+    } else {
+        crate::terms::buy_form(&site.config.packages, Some(key))
+    };
     let key = escape(key);
     let mut rows = String::new();
     for m in &v.members {
@@ -317,7 +323,7 @@ fn page(site: &Site, package: &Package, key: &str, caller: Ipv6Addr, notice: &st
 {notice}<p>{now}</p>
 <h2>Who is in it</h2>
 {members}
-{join}<p class=\"you\">Another device is added by itself: give it this package's key, open this exit's page on it, and add it there. Whoever has the key sees who is in the package and can take them out: keep it to those it is for. A device can always take itself out of a package, from the exit's page.</p>
+{join}{add}<p class=\"you\">Another device is added by itself: give it this package's key, open this exit's page on it, and add it there. Whoever has the key sees who is in the package and can take them out: keep it to those it is for. A device can always take itself out of a package, from the exit's page.</p>
 <p><a href=\"/\">Back</a></p>
 </main>
 </body>

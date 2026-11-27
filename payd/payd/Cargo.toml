@@ -31,6 +31,17 @@ sha2 = "0.10"
 # because the Cashu wallet library's own store pins that (one SQLite in a
 # build); RUSTSEC-2026-0459 is on it: see SECURITY-REVIEW.md.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# The Cashu wallet, and its store: the one wallet library, so that nothing
+# of minting or of blind signatures is written here. Pinned exactly, as the
+# family of crates is.
+cdk = { version = "=0.18.3", default-features = false, features = ["wallet"] }
+cdk-sqlite = { version = "=0.18.3", default-features = false, features = ["wallet"] }
+# The wallet's seed as words (BIP-39), so that it can be written down, and
+# what the wallet holds found again from it, here or in another wallet.
+bip39 = { version = "2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util"] }
+# A real mint, started inside a test, with a Lightning backend that pays
+# itself; and a wallet that makes tokens there.
+fips-exit-test-mint = { path = "../test-mint" }

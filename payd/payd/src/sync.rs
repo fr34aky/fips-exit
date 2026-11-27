@@ -74,6 +74,16 @@ impl Daemon {
     }
 }
 
+/// What the daemon says `address` is to it, asked before anything is sold
+/// to it: `static` (on the operator's list), `member <account> v4|no4`, or
+/// `free v4|no4`, where `no4` is an address another client's inner IPv4
+/// address clashes with.
+pub async fn seat_of(control: &PathBuf, address: Ipv6Addr) -> Result<String, String> {
+    let mut daemon = Daemon::connect(control).await?;
+    let answer = daemon.tell(&format!("check {address}")).await?;
+    Ok(answer.strip_prefix("ok").unwrap_or("").trim().to_string())
+}
+
 /// What was last put for a package: when it is the same, it is not put
 /// again. Counts are not in it: they come from the daemon.
 #[derive(Debug, Clone, PartialEq)]

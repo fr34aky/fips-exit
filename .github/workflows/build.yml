@@ -55,6 +55,9 @@ jobs:
       - name: release build
         run: cargo build --release --locked
 
+      - name: the advert's tags and the price, against the shared vectors (payd/proto)
+        run: cargo test --locked --manifest-path payd/Cargo.toml
+
       - name: the exit in network namespaces (test/netns.sh)
         run: |
           set -euo pipefail

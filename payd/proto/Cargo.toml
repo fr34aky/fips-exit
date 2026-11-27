@@ -1,0 +1,15 @@
+[package]
+name = "fips-exit-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "What a fips exit says about itself on Nostr, and what a byte costs there: shared by the exit and its clients"
+
+# None, on purpose: this is built into the exit's programs and into a phone's
+# app, and is what they have to agree on.
+[dependencies]
+
+[dev-dependencies]
+# The vectors are JSON, so that the exit's Python publisher reads the same file.
+serde_json = "1"

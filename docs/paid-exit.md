@@ -1,9 +1,10 @@
 # Paid public exits: design
 
-**Status: phases 1 and 2 of ten are implemented** (accounts in the daemon
-and `ACCESS=paid` in the script; the advert, with a country. The README's
-*Accounts* and *Being found* sections are what they do now). Everything from
-the payment service on is design. This document says what is to
+**Status: phases 1 to 3 of ten are implemented** (accounts in the daemon
+and `ACCESS=paid` in the script; the advert, with a country; the payment
+service's frame, which tells what the exit costs. The README's *Accounts*,
+*Being found* and *The payment service* sections are what they do now).
+Everything from taking a payment on is design. This document says what is to
 be built, in which order, and what was decided against. Each phase arrives
 as its own pull request and moves the parts it implements from here into the
 README and `SECURITY-REVIEW.md`; where building a phase changed the design,
@@ -496,7 +497,7 @@ and `SECURITY-REVIEW.md`.
 |---|---|
 | 1 | **Done.** The daemon's accounts and the control socket. Then paid mode in the script. |
 | 2 | **Done.** `fips-exit-proto` and its vectors; `fips-exit advert` and its timer. Free exits gain an advert and a country by this alone. |
-| 3 | The payment service's frame: configuration, schema, terms, the page, the unit, a CI job. |
+| 3 | **Done.** The payment service's frame: configuration, terms, the page, the unit, a CI job. The schema waits for phase 4, which is the first to keep anything. |
 | 4 | Accounts without money: the service on the socket, a grant by hand, members, usage, pushing again after a restart. |
 | 5 | The wallet, and payment by token. |
 | 6 | Lightning. |

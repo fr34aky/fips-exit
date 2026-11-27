@@ -136,6 +136,38 @@ sudo systemctl enable --now fips-exit-advert.timer   # and every hour
 - What the tags are is specified in `payd/proto`; the script and that crate
   are held to the same file of cases.
 
+### The payment service
+
+`fips-exit-payd` runs beside the exit, as a user of its own with no
+privilege, and answers on this node's fips address. So far it says what the
+exit costs, and takes no payment:
+
+```sh
+ACCESS=paid
+PRICE_MSAT_PER_GB=2000000                   # millisatoshi a GB of 10^9 bytes: 2000 sat
+PACKAGES="1gb:1GB:1500:30 5gb:5GB:6000:90"  # optional: id:size:sat:days, sizes in bytes, MB, GB or TB
+MINTS="https://mint.example.org"            # optional: the Cashu mints that will be taken
+PAY_PORT=5170                               # optional, the default
+```
+
+```sh
+sudo systemctl enable --now fips-exit-payd
+```
+
+- `http://[<fips address>]:5170/v1/terms` is the exit's terms as JSON, and
+  `/` the same as a page for a browser on the mesh: price, packages, mints,
+  name and country, and who is asking. A caller is known by the address its
+  connection comes from, which fips authenticates. `methods` is empty: there
+  is no way to pay yet.
+- In paid mode `fips-exit up` opens that port in fips's firewall and in ufw,
+  to this node's address, for the whole mesh.
+- The service reads the config when it starts: restart it after a change.
+  With `ACCESS` other than `paid` it says so and stops.
+- It answers only requests for this exit's own name (`[address]:port` or
+  `<npub>.fips:port`), only `GET`, and only so much at a time: 64
+  connections, 8 from one address, a header of 16 KiB within 5 seconds, a
+  minute for a connection.
+
 ### Accounts
 
 With `ACCESS=paid` in the config the exit also carries addresses that are
@@ -278,18 +310,22 @@ an optimisation, not a requirement.
 
 Optional paid public exits (an advert with price and country, prepaid data
 packages, pay-as-you-go) are designed in
-[`docs/paid-exit.md`](docs/paid-exit.md). Its first two phases are here:
-accounts and `ACCESS=paid`, and the advert, both above. Nothing yet takes a
-payment, so no exit says that it is a paid one.
+[`docs/paid-exit.md`](docs/paid-exit.md). Its first three phases are
+here: accounts and `ACCESS=paid`, the advert, and the payment service's
+frame, all above. Nothing yet takes a payment, so no exit says that it is a
+paid one.
 
 ## Test
 
 ```sh
 cargo test                      # the daemon's admission and routing rules
 cargo build --release && unshare -Urnm test/netns.sh
-cargo test --manifest-path payd/Cargo.toml   # the advert's tags and the price
+cargo test --manifest-path payd/Cargo.toml   # the advert's tags, the price, the payment service
 python3 -I -m unittest discover -s test      # the script's advert
 ```
+
+The namespace test runs the payment service too, so it needs it built:
+`cargo build --release --manifest-path payd/Cargo.toml`.
 
 The second runs the daemon and the script against the real kernel, without
 root and without fips: network namespaces stand in for two clients, the
@@ -299,15 +335,18 @@ binding of a client to its addresses, isolation, removal and teardown. Then
 the same exit with `ACCESS=paid`, behind a stand-in for fips's firewall: no
 node without an account is carried, two members share an account counted to
 the byte and are cut off at the grant, a member reaches the internet and
-neither the uplink's LAN nor port 25, and leaving the mode removes what it
-made.
+neither the uplink's LAN nor port 25, the payment service tells a node that
+is no client what the exit costs and who it is, and leaving the mode removes
+what it made, the opening for the payment service with it.
 
-The third is `payd/proto`, a crate with no dependencies that the exit and
-its clients share: what an exit's advert on Nostr says (who it serves, where
-it is, and for a paid exit what it costs) and what a number of bytes costs
-at a price. It is checked against `payd/proto/vectors/advert.json`, and so
-is every other implementation of the same. `payd/` has a lockfile of its
-own, so that the daemon keeps its one dependency.
+The third is `payd/`, a workspace with a lockfile of its own, so that the
+daemon keeps its one dependency. `payd/proto` is a crate with no
+dependencies that the exit and its clients share: what an exit's advert on
+Nostr says (who it serves, where it is, and for a paid exit what it costs)
+and what a number of bytes costs at a price. It is checked against
+`payd/proto/vectors/advert.json`, and so is every other implementation of
+the same. `payd/payd` is the payment service: its config, its terms and
+page, and its HTTP server's limits, over a real socket.
 
 The fourth is the script's side of the advert: the signature against the
 vectors of BIP-340, the tags against the same file of cases, and the

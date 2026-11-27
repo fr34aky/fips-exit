@@ -1,0 +1,28 @@
+[package]
+name = "fips-exit-payd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The payment service of a paid fips exit: its terms, over the mesh"
+
+[[bin]]
+name = "fips-exit-payd"
+path = "src/main.rs"
+
+[dependencies]
+fips-exit-proto = { path = "../proto" }
+# An HTTP server over the mesh, and nothing above it: three routes are a
+# match, not a framework. tokio because the Cashu wallet library this
+# service is to use needs it.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync", "signal"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# The terms are JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util"] }

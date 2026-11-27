@@ -177,7 +177,10 @@ pub struct Package {
 }
 
 impl Package {
-    fn valid(&self) -> bool {
+    /// Is the package within the bounds an advert may carry: a name of 1 to
+    /// 20 of `A-Z a-z 0-9 . _ -`, and a size, a price and days that are none
+    /// of them nothing and none above their limit?
+    pub fn is_valid(&self) -> bool {
         (1..=MAX_PACKAGE_ID).contains(&self.id.len())
             && self.id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
             && (1..=MAX_PACKAGE_BYTES).contains(&self.bytes)
@@ -207,7 +210,7 @@ pub struct Terms {
 /// [`MAX_MINT_BYTES`] at most? Nothing here says that it is a mint, or
 /// compares two addresses beyond their bytes: the same mint written in two
 /// ways is two mints to this crate.
-fn mint_url(url: &str) -> bool {
+pub fn is_mint_url(url: &str) -> bool {
     let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
     let in_an_address = |b: u8| b.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=%".contains(&b);
     url.len() <= MAX_MINT_BYTES && rest.is_some_and(|rest| !rest.is_empty() && rest.bytes().all(in_an_address))
@@ -224,10 +227,10 @@ impl Terms {
             && distinct(&self.methods)
             && self.port != 0
             && self.mints.len() <= MAX_MINTS
-            && self.mints.iter().all(|mint| mint_url(mint))
+            && self.mints.iter().all(|mint| is_mint_url(mint))
             && distinct(&self.mints)
             && self.packages.len() <= MAX_PACKAGES
-            && self.packages.iter().all(Package::valid)
+            && self.packages.iter().all(Package::is_valid)
             && distinct(&self.packages.iter().map(|package| &package.id).collect::<Vec<_>>())
     }
 

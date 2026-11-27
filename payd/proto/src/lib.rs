@@ -28,6 +28,9 @@
 //! ["expiration", <unix seconds>]         NIP-40
 //! ```
 //!
+//! A number is written one way: digits, no sign, no zero in front. A name
+//! or a note is one line with nothing hidden in it ([`tidy`]).
+//!
 //! An advert is a hint. A client lists exits from it, and asks the exit
 //! itself for its terms, over the mesh, before it pays. Nothing but the
 //! author is to be trusted: not the price, not the country, and never a
@@ -194,18 +197,20 @@ pub struct Terms {
     /// The payment service's TCP port on the exit's fips address.
     pub port: u16,
     /// Mints accepted, for a client to choose exits by. Never to be adopted
-    /// from an advert.
+    /// from an advert. None twice, byte for byte.
     pub mints: Vec<String>,
     pub packages: Vec<Package>,
 }
 
 /// Is `url` a mint's address as an advert may carry it: `http://` or
-/// `https://` and then printable ASCII with no space, [`MAX_MINT_BYTES`] at
-/// most?
+/// `https://` and then the characters an address is made of (RFC 3986),
+/// [`MAX_MINT_BYTES`] at most? Nothing here says that it is a mint, or
+/// compares two addresses beyond their bytes: the same mint written in two
+/// ways is two mints to this crate.
 fn mint_url(url: &str) -> bool {
     let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
-    url.len() <= MAX_MINT_BYTES
-        && rest.is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_graphic()))
+    let in_an_address = |b: u8| b.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=%".contains(&b);
+    url.len() <= MAX_MINT_BYTES && rest.is_some_and(|rest| !rest.is_empty() && rest.bytes().all(in_an_address))
 }
 
 fn distinct<T: PartialEq>(items: &[T]) -> bool {
@@ -288,6 +293,9 @@ pub enum Invalid {
     Text,
     /// The country is not an ISO 3166-1 alpha-2 code.
     Country,
+    /// Already over at the time it is written, or valid for longer than
+    /// [`MAX_LIFETIME_SECS`]: no client would list it.
+    Expires,
     /// A paid advert without terms, or terms on one that is not paid.
     AccessAndTerms,
     /// The terms are out of their bounds: see [`Terms`] and the limits.
@@ -299,6 +307,7 @@ impl fmt::Display for Invalid {
         f.write_str(match self {
             Invalid::Text => "the name or the note is too long, or is not one line of printable text",
             Invalid::Country => "the country is not an ISO 3166-1 alpha-2 code",
+            Invalid::Expires => "the advert is over already, or valid for more than 31 days",
             Invalid::AccessAndTerms => "terms go with access paid, and only with it",
             Invalid::Terms => "the terms are out of bounds",
         })
@@ -317,39 +326,60 @@ fn value<'a>(tags: &'a [Vec<String>], name: &str) -> Option<Option<&'a str>> {
     tags.iter().find(|tag| name_is(tag, name)).map(|tag| tag.get(1).map(String::as_str))
 }
 
-/// A number as an advert writes one: digits and nothing else, `max_digits`
-/// at most. (`str::parse` alone would take a sign.)
+/// A number as an advert writes one, and in the one way it is written:
+/// digits and nothing else, `max_digits` at most, and no zero in front of
+/// another digit. (`str::parse` alone would take a sign and the zeros.)
 fn number(text: &str, max_digits: usize) -> Option<u64> {
-    if text.is_empty() || text.len() > max_digits || !text.bytes().all(|b| b.is_ascii_digit()) {
+    let digits = !text.is_empty() && text.len() <= max_digits && text.bytes().all(|b| b.is_ascii_digit());
+    if !digits || (text.len() > 1 && text.starts_with('0')) {
         return None;
     }
     text.parse().ok()
 }
 
-/// Bidirectional and invisible formatting characters: a note must not be
-/// able to rearrange the line it is shown on.
-fn is_format_control(c: char) -> bool {
-    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+/// What separates words: Unicode's white space, spelled out, so that an
+/// implementation in another language can hold the same list.
+fn is_space(c: char) -> bool {
+    matches!(c,
+        '\u{0009}'..='\u{000D}' | '\u{0020}' | '\u{0085}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}'
+        | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}' | '\u{3000}')
 }
 
-/// Operator text for a list on a screen: one line, no control characters
-/// (they could reorder or hide what is shown next to it), `limit`
-/// characters at most. What an advert says is cut to this, not refused.
+/// What is not shown, or changes how what is next to it is shown: control
+/// characters, the characters that turn a line round or hide in it, the
+/// invisible tag characters, and the letters that are blank. A name must
+/// not be able to rearrange the line it is shown on, carry what cannot be
+/// seen, or be an empty row. The two joiners (U+200C, U+200D) are not
+/// among them: Persian and the Indic scripts are written with them.
+fn is_hidden(c: char) -> bool {
+    matches!(c,
+        '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}'
+        | '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{E0000}'..='\u{E007F}'
+        | '\u{115F}' | '\u{1160}' | '\u{2800}' | '\u{3164}' | '\u{FFA0}')
+}
+
+/// Operator text for a list on a screen: one line of words with single
+/// spaces between them, nothing hidden ([`is_hidden`]), `limit` characters
+/// at most. What an advert says is cut to this, not refused; `vectors`
+/// has the cases, for every implementation.
 pub fn tidy(text: &str, limit: usize) -> String {
-    let cleaned: String = text
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .filter(|c| !c.is_control() && !is_format_control(*c))
-        .collect();
-    let words: Vec<&str> = cleaned.split(' ').filter(|word| !word.is_empty()).collect();
-    words.join(" ").chars().take(limit).collect()
+    let shown: String = text.chars().map(|c| if is_space(c) { ' ' } else { c }).filter(|c| !is_hidden(*c)).collect();
+    let words: Vec<&str> = shown.split(' ').filter(|word| !word.is_empty()).collect();
+    // Cut, and then no space at the end: the cut may fall just after one.
+    let cut: String = words.join(" ").chars().take(limit).collect();
+    cut.trim_end_matches(' ').to_string()
 }
 
 impl Advert {
-    /// The advert's tags, in the one order every publisher writes them.
-    /// An exit that is about to say something out of bounds is told so here
-    /// and not by clients that pass it over.
-    pub fn tags(&self) -> Result<Vec<Vec<String>>, Invalid> {
+    /// The advert's tags, in the one order every publisher writes them, as
+    /// written at `now`. An exit that is about to say something no client
+    /// would list is told so here, and not by clients that pass it over.
+    pub fn tags(&self, now: u64) -> Result<Vec<Vec<String>>, Invalid> {
+        if self.expires <= now || self.expires > now.saturating_add(MAX_LIFETIME_SECS) {
+            return Err(Invalid::Expires);
+        }
         for (text, limit) in [(&self.name, MAX_NAME), (&self.about, MAX_ABOUT)] {
             if *text != tidy(text, limit) {
                 return Err(Invalid::Text);
@@ -415,9 +445,12 @@ impl Advert {
         }
         let access = Access::from_word(value(tags, "access")??)?;
         // No expiration, or one already past: an exit that stopped
-        // advertising is gone. One absurdly far ahead is not believed.
+        // advertising is gone. One absurdly far ahead is not believed: the
+        // lifetime is counted from the later of this clock and the event's
+        // date, so that an advert written for the longest lifetime is not
+        // lost on a reader whose clock is a little behind the exit's.
         let expires = number(value(tags, "expiration")??, 20)?;
-        if expires <= now || expires > now.saturating_add(MAX_LIFETIME_SECS) {
+        if expires <= now || expires > now.max(created_at).saturating_add(MAX_LIFETIME_SECS) {
             return None;
         }
         // The text is cut to size, as it always was. A country that is not
@@ -499,7 +532,7 @@ mod tests {
         assert!(cases.len() >= 8);
         for case in cases {
             let name = case["case"].as_str().unwrap();
-            let written = advert_of(&case["advert"]).tags();
+            let written = advert_of(&case["advert"]).tags(case["now"].as_u64().unwrap());
             match case.get("tags") {
                 Some(tags) => assert_eq!(written, Ok(tags_of(tags)), "{name}"),
                 None => assert!(written.is_err(), "{name}: written as {written:?}"),
@@ -527,10 +560,11 @@ mod tests {
     fn what_is_written_is_read_back() {
         let vectors = vectors();
         for case in vectors["write"].as_array().unwrap() {
-            let advert = advert_of(&case["advert"]);
-            if let Ok(tags) = advert.tags() {
-                let now = advert.expires - 3600;
-                assert_eq!(Advert::read(&tags, now, now), Some(advert), "{}", case["case"]);
+            let (advert, now) = (advert_of(&case["advert"]), case["now"].as_u64().unwrap());
+            if let Ok(tags) = advert.tags(now) {
+                assert_eq!(Advert::read(&tags, now, now), Some(advert.clone()), "{}", case["case"]);
+                // And by a reader whose clock is ten minutes behind the exit's.
+                assert_eq!(Advert::read(&tags, now, now - MAX_SKEW_SECS), Some(advert), "{}", case["case"]);
             }
         }
     }
@@ -568,18 +602,29 @@ mod tests {
     }
 
     #[test]
-    fn text_is_cut_to_one_tidy_line() {
-        assert_eq!(tidy("  an   exit\tin\nBerlin ", 40), "an exit in Berlin");
-        assert_eq!(tidy("abc\u{202e}def\u{0}\u{7f}", 40), "abcdef");
-        assert_eq!(tidy(&"x".repeat(500), MAX_NAME).chars().count(), MAX_NAME);
-        assert_eq!(tidy("\u{e4}\u{f6}\u{fc}", 2), "\u{e4}\u{f6}", "characters, not bytes");
+    fn text_is_cut_to_one_tidy_line_as_the_vectors_say() {
+        let vectors = vectors();
+        let cases = vectors["tidy"].as_array().unwrap();
+        assert!(cases.len() >= 30);
+        for case in cases {
+            let (text, limit) = (case["text"].as_str().unwrap(), case["limit"].as_u64().unwrap() as usize);
+            let tidied = tidy(text, limit);
+            assert_eq!(tidied, case["tidy"].as_str().unwrap(), "{text:?} to {limit}");
+            // What was tidied is tidy: an exit could write it as it is.
+            assert_eq!(tidy(&tidied, limit), tidied, "{text:?} to {limit}, again");
+        }
+        // The list of white space is Unicode's, which the standard library knows too.
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            assert_eq!(is_space(c), c.is_whitespace(), "U+{:04X}", c as u32);
+            assert!(!c.is_control() || is_hidden(c), "U+{:04X} is a control character", c as u32);
+        }
     }
 
     #[test]
     fn a_number_is_digits() {
         assert_eq!(number("0", 5), Some(0));
         assert_eq!(number("65535", 5), Some(65535));
-        for not_one in ["", "+5", "-5", "5 ", " 5", "1e3", "0x10", "1.0", "123456", "\u{663}"] {
+        for not_one in ["", "+5", "-5", "5 ", " 5", "1e3", "0x10", "1.0", "123456", "\u{663}", "05", "00", "007"] {
             assert_eq!(number(not_one, 5), None, "{not_one:?}");
         }
         assert_eq!(number("18446744073709551616", 20), None, "one more than a u64 holds");

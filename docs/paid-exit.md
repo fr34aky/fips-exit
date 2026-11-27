@@ -276,13 +276,15 @@ whose access word is `paid`, which is right: it could not pay.
 | `["access","paid"]` | The new access word. | one |
 | `["country","DE"]` | ISO 3166-1 alpha-2. The operator's claim. Allowed on `open` and `allow-list` exits too. | one, two capital letters |
 | `["price","2000000"]` | Millisatoshi per gigabyte. | one, digits only, 1 to 10¹² |
-| `["pay","bolt11","onchain","cashu","channel"]` | The ways of paying on offer. Unknown words are ignored. | one, four words |
+| `["pay","bolt11","onchain","cashu","channel"]` | The ways of paying on offer. Unknown words are ignored. | one, eight words |
 | `["port","5170"]` | The payment service's TCP port on the exit's mesh address. | one |
 | `["mint","https://…"]` | Mints accepted. For filtering; a client never adopts a mint from an advert. | four |
 | `["package",id,bytes,sat,days]` | The packages, so that a list can show a "from" price. | eight |
 
 `name`, `about` and `expiration` stay as they are. An advert that says `paid`
-and lacks a price, a port or a known way of paying is not shown.
+and lacks a price, a port or a known way of paying is not shown. A number
+is written one way: digits, no sign, no zero in front. A mint is compared
+by its bytes, so one mint written in two ways is two.
 
 `fips-exit advert` publishes it on a timer. It is a port of fips2go's
 `advert.py`: root reads `/etc/fips/fips.key`, so the node's key never comes

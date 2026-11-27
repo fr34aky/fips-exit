@@ -90,6 +90,8 @@ carried from it and to it. `status` then shows a line for each.
   the daemon's socket, which is root's.
 - A client's count starts when it is put on the list or the daemon starts,
   and is gone when the client is removed or the daemon stops.
+- The daemon counts or not as the config said when it started. `status` asks
+  the daemon, and says so when the config has changed since.
 - It is off unless you turn it on. An operator who counts should say so to
   the people whose devices are on the list.
 
@@ -162,7 +164,8 @@ below.
 
 Accounts are made over a Unix socket, `/run/fips-exit/control.sock`, which
 the daemon opens only with `ACCESS=paid` or `CLIENT_COUNTS=on` (or
-`--control <path>`), for root alone. One command a line; every answer ends in a line that begins `ok` or
+`--control <path>`), for root alone. Opened for the counts alone it takes
+no accounts. One command a line; every answer ends in a line that begins `ok` or
 `err`; every number is a total, so that a command sent twice changes
 nothing.
 
@@ -177,7 +180,7 @@ drop <account>
 usage [account]                                               account <name> <granted> <used_in> <used_out> <until>
 clients                                                       client <address> <bytes from it> <bytes to it>, with CLIENT_COUNTS=on
 check <address>                                               static | member <account> v4|no4 | free v4|no4
-stat                                                          epoch=<start> accounts=<n> resolver=<0|1>
+stat                                                          epoch=<start> accounts=<n> resolver=<0|1> counts=<0|1>
 ```
 
 Whoever can write to that socket decides who uses the exit and for how much.

@@ -123,7 +123,7 @@ sys.stdout.write(answer.decode())' "$sock" "$1"
 }
 [ -S "$sock" ] || fail "no control socket: $(cat "$FIPS_EXIT_DIR/daemon.log")"
 [ "$(stat -c %a "$sock")" = 600 ] || fail "the control socket has mode $(stat -c %a "$sock")"
-case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver="?) ;; *) fail "stat: $(ctl stat)" ;; esac
+case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver="?" counts=1") ;; *) fail "stat: $(ctl stat)" ;; esac
 python3 -c '
 import socket, sys, time
 s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); time.sleep(600)' "$sock" &
@@ -235,16 +235,31 @@ grep -qx 2001:4860:1::1 "$FIPS_EXIT_DIR/peers" || fail "IPv6 not masqueraded: $(
 ok "IPv4 and IPv6 reach the internet from the exit's addresses"
 
 # --- the count of a client on the list, since the operator asked for it ---------
-# The two exchanges above, and nothing of what was refused before the client
-# was added: 31 + 51 bytes from it (20 + 8 + "100", and 40 + 8 + "100"), 128 +
-# 148 to it.
-[ "$(ctl clients)" = "$(printf 'client %s 82 276\nok 1' $C1)" ] || fail "the count of a listed client: $(ctl clients)"
-printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\nCLIENT_COUNTS=on\n" > "$FIPS_EXIT_DIR/config"
-FIPS_EXIT_CONTROL="$sock" "$here/fips-exit" status | grep -Eq "^  $C1 phone-one +82 bytes from it, +276 to it$" \
-  || fail "status: $(FIPS_EXIT_CONTROL="$sock" "$here/fips-exit" status)"
-printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n" > "$FIPS_EXIT_DIR/config"
-"$here/fips-exit" status | grep -q "bytes from it" && fail "status showed a client's count that the config does not ask for"
-ok "a client on the list is counted to the byte when the operator asks, and shown only then"
+# One exchange, sent once (ask sends again when an answer is slow, and what
+# is sent twice is counted twice): 31 bytes from the client (20 + 8 + "100")
+# and 128 to it, on top of whatever it had.
+count() { ctl clients | awk -v c="$1" '$2 == c { print $3, $4 }'; }
+before=$(count $C1)
+ip netns exec c1 python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(8)
+s.sendto(b"100", ("8.8.8.2", 4444)); print(len(s.recv(4096)))' | grep -qx 100 || fail "the one exchange to be counted"
+after=$(count $C1)
+[ "$(( ${after% *} - ${before% *} )) $(( ${after#* } - ${before#* } ))" = "31 128" ] \
+  || fail "the count of a listed client went from '$before' to '$after'"
+# `status` shows it, and says so when the config and the daemon differ.
+status() { FIPS_EXIT_CONTROL="$sock" "$here/fips-exit" status; }
+conf1() { printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n$1" > "$FIPS_EXIT_DIR/config"; }
+conf1 "CLIENT_COUNTS='on'\n"
+status | grep -Eq "^  $C1 phone-one +${after% *} bytes from it, +${after#* } to it$" || fail "status: $(status)"
+status | grep -q "STILL COUNTING" && fail "status complained though the config asks for the count"
+conf1 ""
+status | grep -q "THE DAEMON IS STILL COUNTING" || fail "status did not say that the daemon counts unasked: $(status)"
+conf1 "CLIENT_COUNTS=yes\n"
+"$here/fips-exit" up >/dev/null 2>&1 && fail "up accepted a CLIENT_COUNTS that is neither word"
+conf1 ""
+"$here/fips-exit" up >/dev/null
+ok "a client on the list is counted to the byte when the operator asks, and status says what the daemon does"
 
 # --- full-size packets towards the client --------------------------------------
 # 1280 bytes is the tunnel's MTU: IPv4 payload 1252 (DF set, as QUIC does),
@@ -359,9 +374,14 @@ ok "with no upstream answering, a client gets SERVFAIL instead of silence"
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "removed client still passes"
 [ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "remaining client broke on removal"
 ok "removing a client cuts it off and leaves the others"
-# Its count went with it; the other client's is still there.
+# Its count went with it; the other client's is still there. And a client
+# that is removed and put back at once starts at nothing: the daemon reads
+# the list when it changes, not when the next packet comes.
 ctl clients | grep -q "^client $C1 " && fail "A REMOVED CLIENT'S COUNT WAS KEPT: $(ctl clients)"
 ctl clients | grep -q "^client $C2 [1-9]" || fail "the remaining client's count: $(ctl clients)"
+"$here/fips-exit" remove phone-two >/dev/null
+"$here/fips-exit" add $C2 phone-two >/dev/null
+[ "$(ctl clients)" = "$(printf 'client %s 0 0\nok 1' $C2)" ] || fail "A CLIENT PUT BACK KEPT ITS OLD COUNT: $(ctl clients)"
 legacy fx55667788 $C2
 PATH="$FIPS_EXIT_DIR/bin:$PATH" "$here/fips-exit" down >/dev/null || fail "down with empty objects in ip's list of links"
 ip link show fx55667788 >/dev/null 2>&1 && fail "down left an old fx tunnel device"
@@ -429,7 +449,7 @@ ip addr del 100.70.0.1/24 dev wan
 "$here/fips-exit" up >/dev/null
 ip route show dev fipsexit0 | grep -q "^100.64.0.0/10 " || fail "routes in paid mode: $(ip route show dev fipsexit0)"
 ip -6 rule show | grep "lookup 5170" | grep -q "fwmark 0x8000000/0x8000000" || fail "rule in paid mode: $(ip -6 rule show | grep 5170)"
-case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver=1") ;; *) fail "stat: $(ctl stat)" ;; esac
+case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver=1 counts=0") ;; *) fail "stat: $(ctl stat)" ;; esac
 [ "$(ctl clients)" = "ok 0" ] || fail "clients were counted without CLIENT_COUNTS: $(ctl clients)"
 # What it opened in fips's firewall: the tunnel and the resolver, to this
 # node's own address, from anyone. Admission is the daemon's alone now.
@@ -574,7 +594,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 || brea
 ACCESS=paid DNS_UPSTREAMS=off "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>>"$FIPS_EXIT_DIR/daemon.log" &
 for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && break; sleep 0.2; done
 "$here/fips-exit" up >/dev/null
-case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver=0") ;; *) fail "stat without a resolver: $(ctl stat)" ;; esac
+case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver=0 counts=0") ;; *) fail "stat without a resolver: $(ctl stat)" ;; esac
 grep -q "nexthdr { 4, 41, 44 } accept" "$fw/fips.d/fips-exit.nft" || fail "drop-in: $(cat "$fw/fips.d/fips-exit.nft")"
 grep -q "dport 53" "$fw/fips.d/fips-exit.nft" && fail "PORT 53 WAS OPENED TO THE MESH WITH NO RESOLVER BEHIND IT"
 "$here/fips-exit" down >/dev/null

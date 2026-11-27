@@ -178,8 +178,9 @@ because its reply was lost changes nothing.
 | `members <account> <address,…>` | Replaces the members. |
 | `drop <account>` | Removes the account and its members. |
 | `usage [account]` | One line per account: granted, used in, used out, and its end. |
+| `clients` | One line per client on the operator's list, if the operator has them counted (`CLIENT_COUNTS=on`): the bytes from it and to it. |
 | `check <address>` | Says whether this address could be a member here, and whether it would get its inner IPv4 address. |
-| `stat` | The daemon's start time as an epoch, the number of accounts, whether the resolver runs. |
+| `stat` | The daemon's start time as an epoch, the number of accounts, whether the resolver runs, whether listed clients are counted. |
 
 - The epoch is how the payment service notices a restart: a new epoch means
   an empty table, and it pushes everything again, each account's end with

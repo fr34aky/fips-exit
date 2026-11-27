@@ -15,7 +15,9 @@ root:
   use the tunnel and as whom: the clients on the operator's list, and the
   members of *accounts*, each for the bytes its account was granted. Accounts
   are made by another program over a control socket, which exists only when
-  the daemon is started with `--control`.
+  the config says `ACCESS=paid`, or `CLIENT_COUNTS=on` (then for the counts
+  of the listed clients, and it takes no accounts), or the daemon is started
+  with `--control`.
 - `fips-exit` (a Python script): everything around it. The client list, the
   TUN's routes, NAT to the uplink, an nftables table of its own, and the
   openings it makes in two firewalls it knows (fips's own, and ufw). And,
@@ -258,12 +260,18 @@ IPv4 address derived from the client's fips address.
   time somebody sold, and may be moved either way by whoever may write to the
   socket. The same command sent twice still changes nothing. A clock that
   cannot be read ends every account that has an end.
-- The bytes the exit carries are counted for the exit as a whole, always,
-  and logged once a minute with the packets: that is nobody's in particular.
-  Per client they are counted only when the operator turns it on, and then
+- The bytes the exit carries, for all clients together, are what the TUN
+  device has counted since it was made: `status` reads them there. They are
+  not in the daemon's line in the journal, which has packets: with one
+  client on the list, bytes by the minute would be that client's. Per client
+  bytes are counted only when the operator turns it on, and then
   `CLIENT_COUNTS=on` opens the control socket too, on an exit that sells
-  nothing. Accounts could be made over it then, by root, and their members
-  would be dropped by the firewall as long as `ACCESS` is not `paid`.
+  nothing. That socket takes no accounts: where nothing is sold nobody is
+  carried for one, and none of their lookups answered.
+- The daemon reads its client list again as soon as it is told to (SIGHUP),
+  in a thread that waits for that, and no longer when the next packet
+  comes: a removed client is cut off then, and its count is gone before it
+  can be put back.
 - DNS for a member is not counted. It is answered only while the account has
   bytes, and each client has a limit on queries in flight: 64, which is what
   the whole exit had before, of 256.

@@ -170,10 +170,14 @@ IPv4 address derived from the client's fips address.
   mesh and `Clients::admits` decides alone. The clients' whole ranges are
   routed to the TUN for the same reason, and the daemon drops what it finds
   no client for. The README says what the mode opens.
-- In paid mode the IPv6 return route is looked at for what arrives on the
-  uplink only. For everything forwarded, as in the default mode, one route
-  for all of `fd00::/8` would take every forwarded packet to a unique-local
-  address.
+- In paid mode the IPv6 route to the tunnel is for all of `fd00::/8`, and is
+  looked at only for packets of connections that came out of the tunnel:
+  those are marked there, with one bit of the connection mark. Looked at
+  for everything forwarded, as the per-client routes of the default mode
+  are, it would take every forwarded packet to a unique-local address; for
+  everything from the uplink, a fips gateway's LAN traffic too. Something
+  else on the host that sets or clears that bit breaks IPv6 for the members,
+  or sends its own traffic to the tunnel, where it is dropped as nobody's.
 - TCP port 25 is closed to members and open to listed clients, who are the
   operator's own.
 - The exit's operator sees its clients' traffic, as any VPN endpoint does.

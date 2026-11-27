@@ -41,6 +41,10 @@ RULE_PRIORITY = "5170"
 MESH = ipaddress.ip_network("fd00::/8")
 # Where every client's inner IPv4 address is (inner_ipv4 below).
 INNER4 = ipaddress.ip_network("100.64.0.0/10")
+# In paid mode: one bit of the connection mark and of the packet mark, for
+# the IPv6 connections that came out of the tunnel (ruleset, cmd_up). Set
+# and read as that one bit, so that other users of the marks keep theirs.
+MARK = "0x8000000"
 
 # A mesh packet is at most 1280 bytes, so an inner packet beside the 40-byte
 # outer header travels whole up to 1240 and as two fragments above that. TCP
@@ -250,29 +254,34 @@ def paid(config):
 
 def control(line, wait=0.0):
     """One command to the daemon's control socket; its answer as lines, the
-    last of which begins `ok` or `err`. None when there is no daemon on the
-    socket within `wait` seconds: it makes the socket a moment after its
-    TUN device, which is what `up` at the start of the service waits for."""
+    last of which begins `ok` or `err`. None when there is no answer within
+    `wait` seconds. No answer has two causes, and both pass: the daemon
+    makes the socket a moment after its TUN device, which is what `up` at
+    the start of the service waits for; and it serves a few peers at a time,
+    closing the next one without a word."""
     deadline = time.monotonic() + wait
     while True:
         peer = socket.socket(socket.AF_UNIX)
         peer.settimeout(5)
+        answer = b""
         try:
             peer.connect(CONTROL)
             peer.sendall(line.encode() + b"\n")
             peer.shutdown(socket.SHUT_WR)
-            answer = b""
             while True:
                 data = peer.recv(65536)
                 if not data:
-                    return answer.decode().splitlines()
+                    break
                 answer += data
         except OSError:
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(0.2)
+            answer = b""
         finally:
             peer.close()
+        if answer:
+            return answer.decode().splitlines()
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.2)
 
 
 def daemon_stat(wait=0.0):
@@ -326,15 +335,16 @@ def inner_range_in_use(config):
             continue
         if ipaddress.ip_network(dst, strict=False).overlaps(INNER4):
             found.append(f"the route {dst} via {route.get('dev')}")
-    # The daemon's resolvers, as it reads them (src/main.rs, dns_upstreams).
+    # The resolvers: the host's own, which its own lookups go to whatever
+    # the daemon forwards to, and the daemon's if the config names them
+    # (src/main.rs, dns_upstreams).
     named = config.get("DNS_UPSTREAMS", "").replace(",", " ").split()
-    if not named:
-        try:
-            named = [line.split()[1].split("%")[0] for line in open("/etc/resolv.conf")
-                     if line.split("#")[0].split()[:1] == ["nameserver"] and len(line.split()) > 1]
-        except OSError:
-            named = []
-    for text in named:
+    try:
+        named += [line.split()[1].split("%")[0] for line in open("/etc/resolv.conf")
+                  if line.split("#")[0].split()[:1] == ["nameserver"] and len(line.split()) > 1]
+    except OSError:
+        pass
+    for text in dict.fromkeys(named):
         try:
             if ipaddress.ip_address(text) in INNER4:
                 found.append(f"the resolver {text}")
@@ -398,9 +408,23 @@ def ruleset(clients, config, wan):
         # packet inside the ICMPv6 message: bytes 8 + 6), whoever it is for.
         unreachable = (f'oifname "{mesh}" icmpv6 type destination-unreachable icmpv6 code port-unreachable '
                        "@th,112,8 { 4, 41 } drop")
+        # Which IPv6 packets go to the tunnel. A reply is addressed to the
+        # client's fips address, and the main table sends all of fd00::/8
+        # into the mesh; there is no route per member to say otherwise. So
+        # a connection is marked when it comes out of the tunnel, and what
+        # belongs to it on the way back carries the mark that cmd_up's rule
+        # reads. Anything else for a unique-local address is left to the
+        # main table: a container's, a LAN's behind a fips gateway.
+        replies = f"""
+    chain replies {{
+        type filter hook prerouting priority mangle; policy accept;
+        iifname "{tun}" meta nfproto ipv6 ct mark set ct mark or {MARK}
+        iifname != "{tun}" meta nfproto ipv6 ct mark and {MARK} == {MARK} meta mark set meta mark or {MARK}
+    }}"""
     else:
         from4, from6 = "ip saddr != @clients4 drop", "ip6 saddr != @clients6 drop"
         members_only = ""
+        replies = ""
         unreachable = (f'oifname "{mesh}" ip6 daddr @clients6 icmpv6 type destination-unreachable '
                        "icmpv6 code port-unreachable drop")
     return f"""
@@ -472,7 +496,7 @@ table inet {TABLE} {{
     chain nat {{
         type nat hook postrouting priority srcnat; policy accept;
         iifname "{tun}" oifname "{wan}" masquerade
-    }}
+    }}{replies}
 }}
 """
 
@@ -480,12 +504,7 @@ table inet {TABLE} {{
 UFW_TAG = "fips-exit"
 
 
-def resolver_runs():
-    stat = daemon_stat()
-    return bool(stat) and stat.get("resolver") == "1"
-
-
-def fips_firewall(clients, config, on):
+def fips_firewall(clients, config, on, resolver=False):
     """Let the clients' tunnel packets through fips's own firewall.
 
     That firewall drops what arrives on the mesh interface unless a drop-in
@@ -496,8 +515,9 @@ def fips_firewall(clients, config, on):
     In paid mode the clients' addresses are not known here, so both are
     admitted from any node of the mesh, to this node's own address: the
     firewall is then no second lock in front of the daemon. Port 53 is
-    opened only while the daemon says its resolver runs, or whatever else
-    listens there would be open to the mesh.
+    opened only while the daemon says its resolver runs (`resolver`, from
+    the answer `up` waited for), or whatever else listens there would be
+    open to the mesh.
     """
     firewall = config["FIPS_FIREWALL"]
     dropin = os.path.join(os.path.dirname(firewall), "fips.d", "fips-exit.nft")
@@ -509,7 +529,7 @@ def fips_firewall(clients, config, on):
         here = mesh_address(config)
         rule = ("# Written by fips-exit; do not edit.\n"
                 f"ip6 daddr {here} ip6 nexthdr {{ 4, 41, 44 }} accept\n")
-        if resolver_runs():
+        if resolver:
             rule += f"ip6 daddr {here} udp dport 53 accept\n"
     elif on and clients:
         addresses = ", ".join(str(a) for a, _ in clients)
@@ -528,7 +548,7 @@ def fips_firewall(clients, config, on):
         run("nft", "-f", firewall)
 
 
-def ufw(clients, config, on):
+def ufw(clients, config, on, resolver=False):
     """Let the tunnel through ufw, when ufw is what filters this host.
 
     ufw drops input and forwarding by default and has no syntax for
@@ -546,7 +566,7 @@ def ufw(clients, config, on):
         # fips_firewall.
         here = str(mesh_address(config))
         to_daemon = [["-i", config["MESH_IF"], "-d", here, "-p", proto, "-j", "ACCEPT"] for proto in ("4", "41")]
-        if resolver_runs():
+        if resolver:
             to_daemon.append(["-i", config["MESH_IF"], "-d", here, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
     else:
         to_daemon = [
@@ -584,12 +604,15 @@ def cmd_up():
     tun = config["TUN"]
     if not tun_present(config):
         die(f"no interface {tun}: fips-exitd is not running (systemctl start fips-exit)")
+    resolver = False
     if paid(config):
         # The daemon reads ACCESS when it starts; one that was started
         # before the config said paid has no socket, and carries no member.
-        if daemon_stat(wait=5) is None:
-            die(f"ACCESS=paid, but fips-exitd has no control socket at {CONTROL}: "
+        stat = daemon_stat(wait=5)
+        if stat is None:
+            die(f"ACCESS=paid, but fips-exitd does not answer on {CONTROL}: "
                 "systemctl restart fips-exit")
+        resolver = stat.get("resolver") == "1"
         in_use = inner_range_in_use(config)
         if in_use:
             die(f"ACCESS=paid routes all of {INNER4} to the clients, and this host uses it: "
@@ -605,8 +628,8 @@ def cmd_up():
 
     remove_kernel_tunnels(config)
     run("nft", "-f", "-", stdin=ruleset(clients, config, wan))
-    fips_firewall(clients, config, True)
-    ufw(clients, config, True)
+    fips_firewall(clients, config, True, resolver)
+    ufw(clients, config, True, resolver)
 
     # Replies to a client's IPv6 traffic are addressed to its fips address,
     # which the main table routes into the mesh as it is. Forwarded packets
@@ -615,12 +638,11 @@ def cmd_up():
     #
     # In paid mode the members are not known here, so the routes are the
     # clients' whole ranges, and what the daemon finds no client for it
-    # drops. The IPv6 one is then looked at for what arrives on the uplink
-    # only, which is where a reply comes from: for everything forwarded it
-    # would take every packet to a unique-local address, a container's or a
-    # LAN's behind a fips gateway as well.
+    # drops. The IPv6 one is then looked at only for packets of connections
+    # that came out of the tunnel (the mark, see ruleset): for everything
+    # forwarded it would take every packet to a unique-local address.
     if paid(config):
-        select, routes4, routes6 = ["iif", wan], [str(INNER4)], [str(MESH)]
+        select, routes4, routes6 = ["fwmark", f"{MARK}/{MARK}"], [str(INNER4)], [str(MESH)]
     else:
         select = ["not", "iif", "lo"]
         routes4 = [str(inner_ipv4(a)) for a, _ in clients]
@@ -694,8 +716,13 @@ def cmd_list():
 
 def apply():
     """After a change to the list: apply it now if the daemon runs, and say
-    so if it does not (the list is saved either way)."""
+    so if it does not (the list is saved either way).
+
+    The daemon is told first and by itself. It is what admits a client, so
+    a client that was removed is cut off even when the rest of `up` then
+    stops at something: a host it refuses, a daemon without its socket."""
     if tun_present(load_config()):
+        run("pkill", "-HUP", "-x", "fips-exitd", check=False)
         cmd_up()
     else:
         print("fips-exit: saved; fips-exitd is not running, so nothing was applied "
@@ -717,14 +744,14 @@ def cmd_status():
     if paid(config):
         stat = daemon_stat()
         print("access: paid, " + (f"{stat.get('accounts', '?')} account(s)" if stat
-                                  else f"but the daemon has no control socket at {CONTROL}"))
+                                  else f"but the daemon does not answer on {CONTROL}"))
 
 
 def cmd_accounts():
     """The accounts the daemon holds: what each may use and has used."""
     if not paid(load_config()):
         die(f"no accounts: ACCESS is not paid in {CONFIG}")
-    answer = control("usage")
+    answer = control("usage", wait=2)
     if not answer or not answer[-1].startswith("ok"):
         die(f"no answer from fips-exitd on {CONTROL}" + (f": {answer[-1]}" if answer else ""))
     rows = [line.split()[1:] for line in answer[:-1] if line.startswith("account ")]

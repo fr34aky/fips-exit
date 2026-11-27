@@ -345,7 +345,8 @@ ok "with no upstream answering, a client gets SERVFAIL instead of silence"
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "removed client still passes"
 [ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "remaining client broke on removal"
 ok "removing a client cuts it off and leaves the others"
-"$here/fips-exit" down >/dev/null || fail "down with empty objects in ip's list of links"
+legacy fx55667788 $C2
+PATH="$FIPS_EXIT_DIR/bin:$PATH" "$here/fips-exit" down >/dev/null || fail "down with empty objects in ip's list of links"
 ip link show fx55667788 >/dev/null 2>&1 && fail "down left an old fx tunnel device"
 ip route show dev fipsexit0 | grep -q . && fail "routes left after down"
 ip -6 rule show | grep -q "lookup 5170" && fail "rule left after down"
@@ -389,7 +390,7 @@ conf "ACCESS=paid\n"
 # The daemon reads ACCESS when it starts. This one was started without it and
 # has no socket where the script looks: nothing may be opened for it.
 out=$("$here/fips-exit" up 2>&1) && fail "up in paid mode went ahead without the daemon's socket"
-case "$out" in *"no control socket"*) ;; *) fail "up without the socket said: $out" ;; esac
+case "$out" in *"does not answer on /run/fips-exit/control.sock"*) ;; *) fail "up without the socket said: $out" ;; esac
 nft list table inet fips_exit >/dev/null 2>&1 && fail "a table was made for a daemon without a socket"
 ok "paid mode is refused while the daemon was not started for it"
 
@@ -410,7 +411,7 @@ case "$out" in *"100.70.0.1 on wan"*) ;; *) fail "up on such a host said: $out" 
 ip addr del 100.70.0.1/24 dev wan
 "$here/fips-exit" up >/dev/null
 ip route show dev fipsexit0 | grep -q "^100.64.0.0/10 " || fail "routes in paid mode: $(ip route show dev fipsexit0)"
-ip -6 rule show | grep "lookup 5170" | grep -q "iif wan" || fail "rule in paid mode: $(ip -6 rule show | grep 5170)"
+ip -6 rule show | grep "lookup 5170" | grep -q "fwmark 0x8000000/0x8000000" || fail "rule in paid mode: $(ip -6 rule show | grep 5170)"
 case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver=1") ;; *) fail "stat: $(ctl stat)" ;; esac
 # What it opened in fips's firewall: the tunnel and the resolver, to this
 # node's own address, from anyone. Admission is the daemon's alone now.
@@ -422,7 +423,24 @@ ok "paid mode starts where the clients' range is free, and not where the host us
 [ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A NODE WITHOUT AN ACCOUNT WAS CARRIED"
 [ "$(resolve c3 $C3 example.com)" = timeout ] || fail "a node without an account got DNS"
 [ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "a client on the list, in paid mode"
-ok "paid mode carries the clients on the list, and no node that has no account"
+# A member of an account with nothing granted is known, and not carried.
+[ "$(ctl "put empty 0 0 0 $C3")" = "ok $C3=v4" ] || fail "put: $(ctl "check $C3")"
+[ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "A MEMBER WAS CARRIED WITHOUT A GRANT"
+[ "$(ctl "drop empty")" = ok ] || fail "drop"
+[ "$(ctl "check $C3")" = "ok free v4" ] || fail "after drop: $(ctl "check $C3")"
+ok "paid mode carries the clients on the list, and no node that has no account or no grant"
+
+# --- a removed client is cut off, even when `up` then stops -------------------------
+# `remove` saves the list and applies it. If applying stops at something (here:
+# the host has moved into the clients' range), the client must still be gone
+# from the daemon, which is what carries it.
+ip addr add 100.70.0.1/24 dev wan
+"$here/fips-exit" remove phone-two >/dev/null 2>&1 && fail "remove went through on a host inside 100.64.0.0/10"
+[ "$(ask c2 4 8.8.8.2 100)" = timeout ] || fail "A REMOVED CLIENT WAS STILL CARRIED BECAUSE up COULD NOT RUN"
+ip addr del 100.70.0.1/24 dev wan
+"$here/fips-exit" add $C2 phone-two >/dev/null
+[ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "a client put back on the list"
+ok "a removed client is cut off by the daemon even when the rest of up cannot run"
 
 # --- two members share an account, to the byte -------------------------------------
 # 400 bytes. A request is 31 (20 + 8 + "100") and its answer 128: two
@@ -449,6 +467,7 @@ ok "members share their account's bytes, counted exactly, and are carried no fur
 [ "$(ask c3 6 2001:4860:1::2 100)" = 100 ] || fail "a member over IPv6"
 [ "$(ask c3 4 8.8.8.2 1252)" = 1252 ] || fail "a 1280-byte packet towards a member"
 [ "$(fetch c3 8.8.8.2)" = 200000 ] || fail "TCP for a member"
+[ "$(fetch c3 2001:4860:1::2)" = 200000 ] || fail "TCP over IPv6 for a member"
 # The internet only, as for any client; and no mail between servers, which
 # the clients on the list may send.
 [ "$(ask c3 4 192.168.77.2 100)" = timeout ] || fail "A MEMBER REACHED A PRIVATE ADDRESS ON THE UPLINK'S LAN"
@@ -457,6 +476,29 @@ ip netns exec c3 ping -c 1 -W 1 -q $C2V4 >/dev/null 2>&1 && fail "a member reach
 [ "$(fetch c2 8.8.8.2 25)" = 200000 ] || fail "a client on the list and port 25"
 "$here/fips-exit" accounts | grep -Eq "^pkg +1000000 +[0-9]+ +[0-9]+ +[0-9]+$" || fail "accounts: $("$here/fips-exit" accounts)"
 ok "a member reaches the internet in both families and nothing else, and not port 25"
+
+# --- only replies go to the tunnel -----------------------------------------------------
+# All of fd00::/8 is routed to the tunnel in this mode, for the members. That
+# must be for the connections that came out of the tunnel and for nothing
+# else: a host that also forwards into the mesh from its uplink (a fips
+# gateway for its LAN, a published port) must go on doing so. Here the
+# "internet" sends to a mesh node through the exit, as such a LAN would.
+ip -n inet -6 route add fd00::/8 via 2001:4860:1::1
+ip netns exec c1 python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind((sys.argv[1], 7777)); s.settimeout(4)
+try: s.recv(100); print("arrived")
+except socket.timeout: print("lost")' $C1 > "$FIPS_EXIT_DIR/forwarded" &
+listener=$!
+sleep 0.5
+ip netns exec inet python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+for _ in range(3): s.sendto(b"hello", (sys.argv[1], 7777)); time.sleep(0.3)' $C1
+wait $listener
+ip -n inet -6 route del fd00::/8 via 2001:4860:1::1
+[ "$(cat "$FIPS_EXIT_DIR/forwarded")" = arrived ] || fail "WHAT THE UPLINK SENT TO THE MESH WENT INTO THE TUNNEL INSTEAD"
+ok "only the replies to what came out of the tunnel are sent to it"
 
 # --- the list changes, the accounts stay --------------------------------------------
 before=$(ctl "usage pkg")
@@ -472,7 +514,8 @@ ok "an account outlives a reload of the list, and a client on the list is not co
 conf ""
 "$here/fips-exit" up >/dev/null
 ip route show dev fipsexit0 | grep -q "100.64.0.0/10" && fail "the clients' whole range is still routed after paid mode"
-ip -6 rule show | grep "lookup 5170" | grep -q "iif wan" && fail "paid mode's rule is still there"
+ip -6 rule show | grep "lookup 5170" | grep -q fwmark && fail "paid mode's rule is still there"
+nft list chain inet fips_exit replies >/dev/null 2>&1 && fail "paid mode's marking of connections is still there"
 grep -q "daddr" "$fw/fips.d/fips-exit.nft" && fail "fips's firewall is still open to the mesh: $(cat "$fw/fips.d/fips-exit.nft")"
 [ "$(ask c3 4 8.8.8.2 100)" = timeout ] || fail "a member was served without paid mode"
 # The daemon would still answer this member, whose account has bytes: here it

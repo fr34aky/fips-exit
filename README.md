@@ -124,10 +124,15 @@ What `ACCESS=paid` changes on the machine, beyond what the list alone does:
   tunnel packets (next header 4, 41 and 44) from any node of the mesh to this
   node's fips address, and DNS queries while the daemon's resolver runs. The
   daemon is then the only place where it is decided who is carried.
-- **All of `100.64.0.0/10` is routed to the tunnel**, and `fd00::/8` for
-  what arrives on the uplink. `up` refuses to start on a host that has an
-  address, a route or a resolver in `100.64.0.0/10` itself: that route would
-  take the host's own traffic.
+- **All of `100.64.0.0/10` is routed to the tunnel.** `up` refuses to start
+  on a host that has an address, a route or a resolver in that range itself:
+  the route would take the host's own traffic.
+- **IPv6 replies are found by a mark.** A connection that comes out of the
+  tunnel is marked (one bit, `0x8000000`, of the connection mark and of the
+  packet mark), and only packets of such connections are routed to the
+  tunnel for `fd00::/8`. Whatever else the host forwards to unique-local
+  addresses goes where it went before. Other software that uses those marks
+  keeps its bits, as long as it leaves this one alone.
 - **A member cannot connect to TCP port 25.** A client on the list can.
 - Leaving paid mode again (`ACCESS=allow-list`, restart) puts back the
   routes and openings for the listed clients alone.

@@ -29,9 +29,11 @@
 //! Who is a client: an address on the operator's list, carried without a
 //! count; or a member of an *account*, carried while the account has bytes
 //! left ([`Account`]). Accounts are not this daemon's idea: something else
-//! (a payment service) makes them over the control socket ([`serve_control`],
-//! `--control PATH`), and without that option there are none. The daemon
-//! counts and stops; it knows nothing about money.
+//! (a payment service) makes them over the control socket
+//! ([`serve_control`]), which is there with `--control PATH`, or at
+//! [`CONTROL_SOCKET`] when the config in the environment says
+//! `ACCESS=paid`. Without either there are no accounts. The daemon counts
+//! and stops; it knows nothing about money.
 //!
 //! It also answers its clients' DNS. A fips2go phone sends every lookup to
 //! UDP port 53 on its exit's fips address, over the mesh and outside the

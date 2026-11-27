@@ -1256,9 +1256,23 @@ def cmd_status():
     if tun_present(config):
         stats = json.loads(run("ip", "-j", "-s", "link", "show", config["TUN"]).stdout)[0]["stats64"]
         # The TUN's point of view: what it receives came from the clients.
-        print(f"{config['TUN']}: {stats['rx']['packets']} packets from clients, "
-              f"{stats['tx']['packets']} to clients")
-    print(f"clients: {len(load_clients())}")
+        # For the exit as a whole; whose they were is not in these numbers.
+        print(f"{config['TUN']}: {stats['rx']['packets']} packets ({stats['rx']['bytes']} bytes) from clients, "
+              f"{stats['tx']['packets']} ({stats['tx']['bytes']} bytes) to clients")
+    clients = load_clients()
+    print(f"clients: {len(clients)}")
+    if config.get("CLIENT_COUNTS") == "on":
+        # What each client on the list has moved, since it was put there or
+        # since the daemon started: kept by the daemon in memory, because
+        # the config asks for it.
+        answer = control("clients", wait=1)
+        if not answer or not answer[-1].startswith("ok"):
+            print(f"  (CLIENT_COUNTS=on, but the daemon does not answer on {CONTROL}: "
+                  "it reads the config when it starts)")
+        names = {str(address): name for address, name in clients}
+        for line in (answer or [])[:-1]:
+            _, address, from_client, to_client = line.split()
+            print(f"  {address} {names.get(address, ''):<16} {from_client:>15} bytes from it, {to_client:>15} to it")
     if paid(config):
         stat = daemon_stat()
         print("access: paid, " + (f"{stat.get('accounts', '?')} account(s)" if stat

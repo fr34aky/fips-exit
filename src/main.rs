@@ -149,24 +149,58 @@ impl Account {
     }
 }
 
+/// What a client on the operator's list has moved, when that is counted: the
+/// bytes carried from it and to it since it was put on the list, or since
+/// the daemon started. Nothing is decided by these numbers.
+#[derive(Default)]
+struct Tally {
+    from: AtomicU64,
+    to: AtomicU64,
+}
+
+/// What a packet that was carried is counted against.
+enum Counted {
+    /// A member's account, which the packet uses up.
+    Account(Arc<Account>),
+    /// A listed client's tally.
+    Tally(Arc<Tally>),
+}
+
+impl Counted {
+    /// Count a packet that was passed on, of `bytes`, from the client or
+    /// (`from` false) to it.
+    fn count(&self, from: bool, bytes: usize) {
+        let counter = match (self, from) {
+            (Counted::Account(account), true) => &account.used_in,
+            (Counted::Account(account), false) => &account.used_out,
+            (Counted::Tally(tally), true) => &tally.from,
+            (Counted::Tally(tally), false) => &tally.to,
+        };
+        counter.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
 /// Who an address in the table is.
 enum Client {
-    /// On the operator's list: carried, and not counted.
-    Static,
+    /// On the operator's list: carried without a limit. Counted only when
+    /// the operator asked for that ([`Clients::count_listed`]): then there
+    /// is a tally here, two numbers that end with the client's place on
+    /// the list.
+    Static(Option<Arc<Tally>>),
     /// A member of an account: carried while the account has bytes left,
     /// and until its end if it has one.
     Member(Arc<Account>),
 }
 
-/// What is to happen to a packet. `Carry` names the account to count it
-/// against once it has really been passed on; `None` is a client on the
-/// operator's list.
+/// What is to happen to a packet. `Carry` names what to count it against
+/// once it has really been passed on; `None` is a client on the operator's
+/// list that is not counted.
 enum Verdict<T> {
     /// Not a client's packet, or not a packet.
     Refused,
     /// A member's, whose account has no bytes left, or whose time is over.
     Exhausted,
-    Carry(T, Option<Arc<Account>>),
+    Carry(T, Option<Counted>),
 }
 
 impl<T> Verdict<T> {
@@ -237,6 +271,10 @@ struct Clients {
     /// Inner IPv4 addresses given up: the last holder, and until when only
     /// that holder may have the address back.
     held: HashMap<[u8; 4], ([u8; 16], Instant)>,
+    /// Whether the clients on the operator's list are counted. Off unless
+    /// the operator turned it on: what a client moved is not kept for no
+    /// reason.
+    count_listed: bool,
     /// Whether some member sits without its inner IPv4 address. It is
     /// seated again from time to time ([`Clients::seat_all`]), and gets the
     /// address once nobody holds it and nobody is waited for.
@@ -305,13 +343,24 @@ impl Clients {
     /// its own address at once, and with an inner IPv4 address the removed
     /// client held once the wait for that client is over.
     fn set_list(&mut self, list: Vec<[u8; 16]>, now: Instant) {
-        let old: Vec<[u8; 16]> =
-            self.by_v6.iter().filter(|(_, client)| matches!(client, Client::Static)).map(|(addr, _)| *addr).collect();
+        // A client that stays on the list keeps its tally; one that is
+        // taken off it loses it, with its place.
+        let mut tallies: HashMap<[u8; 16], Arc<Tally>> = HashMap::new();
+        let mut old = Vec::new();
+        for (addr, client) in &self.by_v6 {
+            if let Client::Static(tally) = client {
+                old.push(*addr);
+                if let Some(tally) = tally {
+                    tallies.insert(*addr, tally.clone());
+                }
+            }
+        }
         for addr in &old {
             self.unseat(addr, now);
         }
         for addr in &list {
-            self.by_v6.insert(*addr, Client::Static);
+            let tally = self.count_listed.then(|| tallies.remove(addr).unwrap_or_default());
+            self.by_v6.insert(*addr, Client::Static(tally));
             self.by_v4.insert(inner_ipv4(addr), *addr);
             self.held.remove(&inner_ipv4(addr));
         }
@@ -354,7 +403,7 @@ impl Clients {
         let mut seats = Vec::with_capacity(members.len());
         for addr in members {
             let client = self.by_v6.entry(addr).or_insert_with(|| Client::Member(account.clone()));
-            if matches!(client, Client::Static) {
+            if matches!(client, Client::Static(_)) {
                 seats.push((addr, Seat::Static));
                 continue;
             }
@@ -493,7 +542,7 @@ impl Clients {
         let holds = self.by_v4.get(&inner) == Some(addr);
         let kept_for_another = matches!(self.held.get(&inner), Some((last, until)) if last != addr && now < *until);
         match (self.by_v6.get(addr), self.member_of.get(addr)) {
-            (Some(Client::Static), _) => "static".into(),
+            (Some(Client::Static(_)), _) => "static".into(),
             (_, Some(name)) => format!("member {name} {}", word(holds)),
             _ => format!("free {}", word(!self.by_v4.contains_key(&inner) && !kept_for_another)),
         }
@@ -517,11 +566,26 @@ impl Clients {
             .collect()
     }
 
+    /// One line for each client on the operator's list that is counted: its
+    /// address, and the bytes carried from it and to it. None when the
+    /// operator did not ask for the count.
+    fn tallies(&self) -> Vec<String> {
+        let mut lines: Vec<([u8; 16], String)> = Vec::new();
+        for (addr, client) in &self.by_v6 {
+            if let Client::Static(Some(tally)) = client {
+                let (from, to) = (tally.from.load(Ordering::Relaxed), tally.to.load(Ordering::Relaxed));
+                lines.push((*addr, format!("client {} {from} {to}", Ipv6Addr::from(*addr))));
+            }
+        }
+        lines.sort();
+        lines.into_iter().map(|(_, line)| line).collect()
+    }
+
     /// Is `addr` someone the resolver answers: a client on the operator's
     /// list, or a member whose account has bytes left?
     fn resolves_for(&self, addr: &[u8; 16]) -> bool {
         match self.by_v6.get(addr) {
-            Some(Client::Static) => true,
+            Some(Client::Static(_)) => true,
             Some(Client::Member(account)) => account.funded(),
             None => false,
         }
@@ -556,8 +620,8 @@ impl Clients {
             return Verdict::Refused;
         }
         match client {
-            Client::Static => Verdict::Carry((), None),
-            Client::Member(account) if account.funded() => Verdict::Carry((), Some(account.clone())),
+            Client::Static(tally) => Verdict::Carry((), tally.clone().map(Counted::Tally)),
+            Client::Member(account) if account.funded() => Verdict::Carry((), Some(Counted::Account(account.clone()))),
             Client::Member(_) => Verdict::Exhausted,
         }
     }
@@ -580,8 +644,10 @@ impl Clients {
             return Verdict::Refused;
         };
         match self.by_v6.get(&client) {
-            Some(Client::Static) => Verdict::Carry((proto, client), None),
-            Some(Client::Member(account)) if account.funded() => Verdict::Carry((proto, client), Some(account.clone())),
+            Some(Client::Static(tally)) => Verdict::Carry((proto, client), tally.clone().map(Counted::Tally)),
+            Some(Client::Member(account)) if account.funded() => {
+                Verdict::Carry((proto, client), Some(Counted::Account(account.clone())))
+            }
             Some(Client::Member(_)) => Verdict::Exhausted,
             None => Verdict::Refused,
         }
@@ -717,6 +783,10 @@ fn raw_socket(proto: i32, local: &[u8; 16]) -> io::Result<OwnedFd> {
 struct Counters {
     to_internet: AtomicU64,
     to_clients: AtomicU64,
+    /// The bytes of those packets, for the exit as a whole: nobody's in
+    /// particular.
+    bytes_to_internet: AtomicU64,
+    bytes_to_clients: AtomicU64,
     refused: AtomicU64,
     /// Packets of members whose account had no bytes left or was over,
     /// either way.
@@ -775,10 +845,6 @@ impl State {
     }
 }
 
-/// Count a packet that was passed on against the account that pays for it.
-fn bill(counter: &AtomicU64, bytes: usize) {
-    counter.fetch_add(bytes as u64, Ordering::Relaxed);
-}
 
 /// Mesh → TUN, for one next-header value. Returns only on a socket error.
 fn from_mesh(state: &State, socket: RawFd, proto: i32, tun: RawFd) -> io::Error {
@@ -817,8 +883,9 @@ fn from_mesh(state: &State, socket: RawFd, proto: i32, tun: RawFd) -> io::Error 
             continue;
         }
         state.counters.to_internet.fetch_add(1, Ordering::Relaxed);
-        if let Some(account) = payer {
-            bill(&account.used_in, inner.len());
+        state.counters.bytes_to_internet.fetch_add(inner.len() as u64, Ordering::Relaxed);
+        if let Some(counted) = payer {
+            counted.count(true, inner.len());
         }
     }
 }
@@ -873,8 +940,9 @@ fn from_tun(state: &State, tun: RawFd, socket4: RawFd, socket6: RawFd) -> io::Er
             continue;
         }
         state.counters.to_clients.fetch_add(1, Ordering::Relaxed);
-        if let Some(account) = payer {
-            bill(&account.used_out, inner.len());
+        state.counters.bytes_to_clients.fetch_add(inner.len() as u64, Ordering::Relaxed);
+        if let Some(counted) = payer {
+            counted.count(false, inner.len());
         }
     }
 }
@@ -1128,6 +1196,7 @@ fn serve_dns(state: Arc<State>, socket: UdpSocket, upstreams: Vec<SocketAddr>) -
 //   members <account> <address,…|->
 //   drop <account>
 //   usage [account]
+//   clients
 //   check <address>
 //   stat
 //
@@ -1152,6 +1221,7 @@ enum Command {
     Members { name: String, members: Vec<[u8; 16]> },
     Drop { name: String },
     Usage { name: Option<String> },
+    Clients,
     Check { addr: [u8; 16] },
     Stat,
 }
@@ -1237,11 +1307,12 @@ fn parse_command(line: &[u8]) -> Result<Command, String> {
         ["drop", name] => Ok(Command::Drop { name: account_name(name)? }),
         ["usage"] => Ok(Command::Usage { name: None }),
         ["usage", name] => Ok(Command::Usage { name: Some(account_name(name)?) }),
+        ["clients"] => Ok(Command::Clients),
         ["check", addr] => Ok(Command::Check { addr: address(addr)? }),
         ["stat"] => Ok(Command::Stat),
         [] => Err("syntax".into()),
         [
-            "put" | "grant" | "until" | "members" | "drop" | "usage" | "check" | "stat",
+            "put" | "grant" | "until" | "members" | "drop" | "usage" | "clients" | "check" | "stat",
             ..,
         ] => Err("arguments".into()),
         _ => Err("command".into()),
@@ -1290,6 +1361,12 @@ fn control_reply(state: &State, line: &[u8], now: Instant) -> String {
                 reply.push_str(&format!("ok {}\n", lines.len()));
                 Ok(reply)
             }
+        }
+        Command::Clients => {
+            let lines = state.clients().tallies();
+            let mut reply: String = lines.iter().map(|line| format!("{line}\n")).collect();
+            reply.push_str(&format!("ok {}\n", lines.len()));
+            Ok(reply)
         }
         Command::Check { addr } => Ok(format!("ok {}\n", state.clients().check(&addr, now))),
         Command::Stat => Ok(format!(
@@ -1481,7 +1558,11 @@ fn run() -> Result<(), String> {
     let socket6 = raw_socket(PROTO_IPV6, &local).map_err(|e| e.to_string())?;
     let tun = open_tun(&args.tun).map_err(|e| e.to_string())?;
 
-    let mut clients = Clients::default();
+    // Whether the clients on the list are counted: only if the config says
+    // so (CLIENT_COUNTS=on). Decided before the list is read, and for as
+    // long as the daemon runs.
+    let count_listed = plain(std::env::var("CLIENT_COUNTS").ok().as_deref()) == "on";
+    let mut clients = Clients { count_listed, ..Clients::default() };
     match std::fs::read_to_string(&args.clients) {
         Ok(text) => clients.set_list(parse_list(&text), Instant::now()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1538,7 +1619,7 @@ fn run() -> Result<(), String> {
         }
     }
     // Accounts, for whatever sells access: with `--control`, or at the usual
-    // place when the config says `ACCESS=paid`. After the TUN, which a second
+    // place when the config says `ACCESS=paid` or `CLIENT_COUNTS=on`. After the TUN, which a second
     // daemon could not have opened: the socket of a running one is never
     // replaced. And after the resolver, so that from the socket's first
     // answer `stat` says how it is. A socket that cannot be made is said
@@ -1546,12 +1627,17 @@ fn run() -> Result<(), String> {
     // carried without it, and nobody else is.
     let control = match (args.control.as_str(), plain(std::env::var("ACCESS").ok().as_deref())) {
         ("", "paid") => CONTROL_SOCKET,
+        // The counts of listed clients are read over the same socket.
+        ("", _) if count_listed => CONTROL_SOCKET,
         (path, _) => path,
     };
     if !control.is_empty() {
         match control_listener(control) {
             Ok(listener) => {
-                eprintln!("fips-exitd: accounts over {control}");
+                eprintln!(
+                    "fips-exitd: accounts over {control}{}",
+                    if count_listed { "; the clients on the list are counted" } else { "" }
+                );
                 let state = state.clone();
                 std::thread::spawn(move || serve_control(state, listener));
             }
@@ -1562,7 +1648,7 @@ fn run() -> Result<(), String> {
         // Once a minute, and only if something moved: a line for the journal.
         let state = state.clone();
         std::thread::spawn(move || {
-            let mut last = (0, 0, 0, 0, 0, 0, 0, 0);
+            let mut last = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
             loop {
                 std::thread::sleep(Duration::from_secs(60));
                 state.reload_if_asked();
@@ -1581,12 +1667,14 @@ fn run() -> Result<(), String> {
                     c.dns_answered.load(Ordering::Relaxed),
                     c.dns_refused.load(Ordering::Relaxed),
                     c.dns_failed.load(Ordering::Relaxed),
+                    c.bytes_to_internet.load(Ordering::Relaxed),
+                    c.bytes_to_clients.load(Ordering::Relaxed),
                 );
                 if now != last {
                     eprintln!(
-                        "fips-exitd: packets to internet {}, to clients {}, refused {}, out of bytes or time {}, \
-                         unrouted {}; DNS answered {}, refused {}, failed {}",
-                        now.0, now.1, now.2, now.3, now.4, now.5, now.6, now.7
+                        "fips-exitd: packets to internet {} ({} bytes), to clients {} ({} bytes), refused {}, \
+                         out of bytes or time {}, unrouted {}; DNS answered {}, refused {}, failed {}",
+                        now.0, now.8, now.1, now.9, now.2, now.3, now.4, now.5, now.6, now.7
                     );
                     last = now;
                 }
@@ -1741,8 +1829,8 @@ mod tests {
     fn send(c: &Clients, from: [u8; 16], len: usize) -> bool {
         match c.admits(PROTO_IPV6, &from, &v6(from, [0x20; 16], len)) {
             Verdict::Carry((), payer) => {
-                if let Some(account) = payer {
-                    bill(&account.used_in, len);
+                if let Some(counted) = payer {
+                    counted.count(true, len);
                 }
                 true
             }
@@ -1753,8 +1841,8 @@ mod tests {
     fn reply_to(c: &Clients, to: [u8; 16], len: usize) -> bool {
         match c.route(&v6([0x20; 16], to, len)) {
             Verdict::Carry(_, payer) => {
-                if let Some(account) = payer {
-                    bill(&account.used_out, len);
+                if let Some(counted) = payer {
+                    counted.count(false, len);
                 }
                 true
             }
@@ -1899,6 +1987,37 @@ mod tests {
         c.set_list(vec![m], Instant::now());
         assert_eq!(ctl(&mut c, &format!("until pkg {past}")), "ok\n");
         assert!(send(&c, m, 100));
+    }
+
+    /// The clients on the operator's list are counted only when the
+    /// operator asked for it, and a client's count ends with its place on
+    /// the list.
+    #[test]
+    fn listed_clients_are_counted_only_when_asked() {
+        let (a, b) = (addr(A), addr(B));
+        // Not asked: carried, and nothing is kept.
+        let mut c = clients();
+        assert!(send(&c, a, 100) && reply_to(&c, a, 300));
+        assert!(matches!(c.admits(PROTO_IPV6, &a, &v6(a, [0x20; 16], 60)), Verdict::Carry((), None)));
+        assert_eq!(ctl(&mut c, "clients"), "ok 0\n");
+        // Asked: bytes each way, per client, in the order of their addresses.
+        let mut c = Clients { count_listed: true, ..Clients::default() };
+        c.set_list(parse_list(&format!("{B}\n{A}\n")), Instant::now());
+        assert_eq!(ctl(&mut c, "clients"), format!("client {A} 0 0\nclient {B} 0 0\nok 2\n"));
+        assert!(send(&c, a, 100) && send(&c, a, 60) && reply_to(&c, a, 300) && send(&c, b, 40));
+        assert_eq!(ctl(&mut c, "clients"), format!("client {A} 160 300\nclient {B} 40 0\nok 2\n"));
+        // The list is read again: who stays keeps its count, who is new
+        // starts one, and who is gone leaves nothing, also when it comes back.
+        c.set_list(parse_list(&format!("{A}\n{C}\n")), Instant::now());
+        assert_eq!(ctl(&mut c, "clients"), format!("client {A} 160 300\nclient {C} 0 0\nok 2\n"));
+        c.set_list(parse_list(&format!("{A}\n{B}\n")), Instant::now());
+        assert_eq!(ctl(&mut c, "clients"), format!("client {A} 160 300\nclient {B} 0 0\nok 2\n"));
+        // A listed client that is a member too is counted as a client, and
+        // its account not at all; a member is no client here.
+        assert_eq!(ctl(&mut c, &format!("put pkg 1000 0 0 {A},{D}")), format!("ok {A}=static {D}=v4\n"));
+        assert!(send(&c, a, 40) && send(&c, addr(D), 70));
+        assert_eq!(ctl(&mut c, "clients"), format!("client {A} 200 300\nclient {B} 0 0\nok 2\n"));
+        assert_eq!(ctl(&mut c, "usage"), "account pkg 1000 70 0 0\nok 1\n");
     }
 
     #[test]
@@ -2057,6 +2176,8 @@ mod tests {
         bad(b"reboot now", "command");
         bad(b"PUT a 1 0 0 -", "command");
         bad(b"stat please", "arguments");
+        bad(b"clients all", "arguments");
+        assert_eq!(parse_command(b"clients"), Ok(Command::Clients));
         bad(b"put pkg 10 2 3", "arguments");
         bad(b"put pkg 10 2 3 - 5 6", "arguments");
         bad(b"put pkg 10 2 3 - soon", "number");
@@ -2094,8 +2215,9 @@ mod tests {
     fn no_line_makes_the_parser_panic_or_the_table_change() {
         let mut c = Clients::default();
         assert_eq!(ctl(&mut c, &format!("put pkg 500 1 2 {C}")), format!("ok {C}=v4\n"));
-        let words: [&[u8]; 15] = [
-            b"put", b"grant", b"until", b"members", b"drop", b"usage", b"check", b"stat", b"pkg", b"-", b"1",
+        let words: [&[u8]; 16] = [
+            b"put", b"grant", b"until", b"members", b"drop", b"usage", b"clients", b"check", b"stat", b"pkg", b"-",
+            b"1",
             b"fd55:aaaa:bbbb:cccc::3", b",", b"\xff", b"99999999999999999999",
         ];
         // A fixed sequence, not a random one: the same lines every run.

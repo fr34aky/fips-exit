@@ -98,7 +98,9 @@ daemon="$here/target/release/fips-exitd"
 "$here/fips-exit" up 2>&1 | grep -q "fips-exitd is not running" || fail "up without the daemon"
 ok "up without the daemon is refused"
 sock="$FIPS_EXIT_DIR/control.sock"
-DNS_UPSTREAMS=8.8.8.2 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 --control "$sock" 2>"$FIPS_EXIT_DIR/daemon.log" &
+# CLIENT_COUNTS=on: the clients on the list are counted, which an exit does
+# only when its operator asks for it. The second half runs without.
+CLIENT_COUNTS=on DNS_UPSTREAMS=8.8.8.2 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 --control "$sock" 2>"$FIPS_EXIT_DIR/daemon.log" &
 daemon_pid=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && [ -S "$sock" ] && break; sleep 0.2; done
 ip link show fipsexit0 >/dev/null 2>&1 || fail "the daemon did not create its TUN: $(cat "$FIPS_EXIT_DIR/daemon.log")"
@@ -232,6 +234,18 @@ grep -qx 8.8.8.1 "$FIPS_EXIT_DIR/peers" || fail "IPv4 not masqueraded: $(cat "$F
 grep -qx 2001:4860:1::1 "$FIPS_EXIT_DIR/peers" || fail "IPv6 not masqueraded: $(cat "$FIPS_EXIT_DIR/peers")"
 ok "IPv4 and IPv6 reach the internet from the exit's addresses"
 
+# --- the count of a client on the list, since the operator asked for it ---------
+# The two exchanges above, and nothing of what was refused before the client
+# was added: 31 + 51 bytes from it (20 + 8 + "100", and 40 + 8 + "100"), 128 +
+# 148 to it.
+[ "$(ctl clients)" = "$(printf 'client %s 82 276\nok 1' $C1)" ] || fail "the count of a listed client: $(ctl clients)"
+printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\nCLIENT_COUNTS=on\n" > "$FIPS_EXIT_DIR/config"
+FIPS_EXIT_CONTROL="$sock" "$here/fips-exit" status | grep -Eq "^  $C1 phone-one +82 bytes from it, +276 to it$" \
+  || fail "status: $(FIPS_EXIT_CONTROL="$sock" "$here/fips-exit" status)"
+printf "WAN=wan\nFIPS_FIREWALL=\nBLOCK_CIDRS=9.9.9.0/24\n" > "$FIPS_EXIT_DIR/config"
+"$here/fips-exit" status | grep -q "bytes from it" && fail "status showed a client's count that the config does not ask for"
+ok "a client on the list is counted to the byte when the operator asks, and shown only then"
+
 # --- full-size packets towards the client --------------------------------------
 # 1280 bytes is the tunnel's MTU: IPv4 payload 1252 (DF set, as QUIC does),
 # IPv6 payload 1232. Neither fits one mesh packet beside the outer header, so
@@ -345,6 +359,9 @@ ok "with no upstream answering, a client gets SERVFAIL instead of silence"
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "removed client still passes"
 [ "$(ask c2 4 8.8.8.2 100)" = 100 ] || fail "remaining client broke on removal"
 ok "removing a client cuts it off and leaves the others"
+# Its count went with it; the other client's is still there.
+ctl clients | grep -q "^client $C1 " && fail "A REMOVED CLIENT'S COUNT WAS KEPT: $(ctl clients)"
+ctl clients | grep -q "^client $C2 [1-9]" || fail "the remaining client's count: $(ctl clients)"
 legacy fx55667788 $C2
 PATH="$FIPS_EXIT_DIR/bin:$PATH" "$here/fips-exit" down >/dev/null || fail "down with empty objects in ip's list of links"
 ip link show fx55667788 >/dev/null 2>&1 && fail "down left an old fx tunnel device"
@@ -413,6 +430,7 @@ ip addr del 100.70.0.1/24 dev wan
 ip route show dev fipsexit0 | grep -q "^100.64.0.0/10 " || fail "routes in paid mode: $(ip route show dev fipsexit0)"
 ip -6 rule show | grep "lookup 5170" | grep -q "fwmark 0x8000000/0x8000000" || fail "rule in paid mode: $(ip -6 rule show | grep 5170)"
 case "$(ctl stat)" in "ok epoch="*" accounts=0 resolver=1") ;; *) fail "stat: $(ctl stat)" ;; esac
+[ "$(ctl clients)" = "ok 0" ] || fail "clients were counted without CLIENT_COUNTS: $(ctl clients)"
 # What it opened in fips's firewall: the tunnel and the resolver, to this
 # node's own address, from anyone. Admission is the daemon's alone now.
 grep -qx "ip6 daddr $E ip6 nexthdr { 4, 41, 44 } accept" "$fw/fips.d/fips-exit.nft" || fail "drop-in: $(cat "$fw/fips.d/fips-exit.nft")"

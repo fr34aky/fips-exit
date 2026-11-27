@@ -53,7 +53,7 @@ IPv4 address derived from the client's fips address.
 5. **Lines on the control socket**, when there is one. It is a Unix socket
    with mode 0600, so its peer is root today; it is meant for a payment
    service that is not. `parse_command` reads each line as bytes: one of
-   eight commands with exactly its arguments, a name of 1 to 64 safe
+   nine commands with exactly its arguments, a name of 1 to 64 safe
    characters, numbers of digits only up to a quarter of a u64, fips
    addresses. Anything else is answered with an error and changes nothing. A
    line is at most 4096 bytes and has five seconds to arrive, an account has
@@ -97,6 +97,12 @@ IPv4 address derived from the client's fips address.
   address, that names a file or runs something, or a line that makes the
   daemon panic or stop carrying. Also: the socket readable or writable by
   anyone but its owner.
+- **What a client moved, kept without being asked for or for longer than
+  said.** The clients on the list are counted only with `CLIENT_COUNTS=on`:
+  two numbers each, in memory. Counting them by default, keeping the count
+  of a client that was removed, writing counts to a file or the journal, or
+  adding times or destinations to them, would each make a record of people
+  that the README says is not kept. The socket they are read over is root's.
 - **A reload losing the accounts.** `fips-exit add` and `remove` make the
   daemon read the list again; the accounts must be as they were afterwards.
 - **Misrouted replies.** A packet from the TUN delivered to a client other
@@ -252,6 +258,12 @@ IPv4 address derived from the client's fips address.
   time somebody sold, and may be moved either way by whoever may write to the
   socket. The same command sent twice still changes nothing. A clock that
   cannot be read ends every account that has an end.
+- The bytes the exit carries are counted for the exit as a whole, always,
+  and logged once a minute with the packets: that is nobody's in particular.
+  Per client they are counted only when the operator turns it on, and then
+  `CLIENT_COUNTS=on` opens the control socket too, on an exit that sells
+  nothing. Accounts could be made over it then, by root, and their members
+  would be dropped by the firewall as long as `ACCESS` is not `paid`.
 - DNS for a member is not counted. It is answered only while the account has
   bytes, and each client has a limit on queries in flight: 64, which is what
   the whole exit had before, of 256.

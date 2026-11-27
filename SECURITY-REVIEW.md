@@ -23,11 +23,13 @@ root:
   openings it makes in two firewalls it knows (fips's own, and ufw). And,
   when the operator names relays, the exit's advert on Nostr: for that it
   reads the node's secret key and signs one event an hour with it.
-- `fips-exit-payd` (`payd/payd`, Rust with tokio and hyper): the payment
-  service, for `ACCESS=paid`. Not root: a user made for it by systemd, with
-  no capability and little of the machine. It answers HTTP on the node's
-  fips address. So far it reads the config and says what the exit costs; it
-  takes no payment, holds no money, and has no way to make an account.
+- `fips-exit-payd` (`payd/payd`, Rust with tokio, hyper and SQLite): the
+  payment service, for `ACCESS=paid`. Not root: a user made for it by
+  systemd, with no capability and little of the machine, in the group
+  `fips-exit` to which the daemon opens its control socket. It answers HTTP
+  at the node's npub on the mesh, says what the exit costs, and keeps the
+  packages the operator gives away: it makes the daemon's accounts for
+  them. It takes no payment and holds no money.
 
 Clients are fips2go phones and other fips nodes. The wire contract is shared
 with fips2go (`shim/src/exit.rs`) and its exit container
@@ -85,14 +87,22 @@ IPv4 address derived from the client's fips address.
 8. **Requests to the payment service.** Anyone on the mesh may connect to
    `PAY_PORT` in paid mode; the firewalls are opened for that. A peer whose
    address is not a fips address is closed at once. A request must name
-   this exit in `Host` (its `[address]:port` or `<npub>.fips:port`), or it is
+   this exit in `Host`, `<npub>.fips:port` and nothing else, or it is
    answered 421: a page elsewhere must not be able to read what this one
-   says to a browser on the mesh. Only `GET` and `HEAD`, three paths. A
+   says to a browser on the mesh. What a member is told of its package is
+   its own: what is left, until when, how many share it; not the key, and
+   not who the others are. Only `GET` and `HEAD`, three paths. A
    header has 5 seconds and 16 KiB, a connection a minute; there are 64
    connections at once and 8 from one address. What the service says back
    is the operator's config and the caller's own address, and the
    operator's text is escaped on the page, which has no script and loads
    nothing from elsewhere.
+
+9. **The operator's commands to the payment service**, on its socket in
+   `/run/fips-exit-payd`, which only the service's user and root can open.
+   Lines of words, each checked: a size, a number of days up to 3660,
+   npubs or fips addresses, a label of one printable line. Not hostile, but
+   a package made there carries whoever is in it.
 
 ## Things that would be serious in this codebase
 
@@ -161,9 +171,18 @@ IPv4 address derived from the client's fips address.
   mode only, to this node's address only, and only while the service
   itself listens there (`up` asks the kernel which process does): leaving
   paid mode, or the service stopping, closes it.
-- **The payment service naming another node.** It shows an npub, and
-  answers to `<npub>.fips`, only when that npub's fips address is the one
-  it answers on; a stale key file is not believed.
+- **The payment service naming another node.** It answers to
+  `<npub>.fips`, and starts at all, only when that npub's fips address is
+  one this node has; a stale key file is not believed.
+- **The payment service making accounts it should not.** It is in the
+  daemon's admission now: whatever it puts is carried. It must put a
+  package's members, for the package's bytes and end, only while the
+  package is live, and drop it when it is used up, over or revoked; never
+  touch an account that is not its own (`p` and 16 hex digits); and never
+  lose what the daemon counted, which it folds into its store before it
+  decides anything. A package's key is kept only as its hash.
+- **An address in two packages.** A device is in one package at a time; it
+  may be moved only out of one that is no longer live.
 - **The node's key going anywhere.** `fips-exit advert` reads the fips
   identity's secret key. It must never be printed, logged, put in an error
   message or sent: only the signature leaves. That includes a key file that
@@ -199,6 +218,12 @@ IPv4 address derived from the client's fips address.
   address, which is a change to the contract with fips2go.
 - **An advert is not taken back.** An exit that stops is listed until its
   last advert expires, three hours at most.
+- **The payment service's store is SQLite from `rusqlite` 0.31**, which has
+  an open advisory, RUSTSEC-2026-0459: memory disclosure on a crafted WAL
+  file. Only the service's user and root can write its state directory,
+  and either already holds everything in it. 0.31 because the Cashu wallet
+  library the service is to use pins it, and there can be one SQLite in a
+  build.
 - **An account's end is by this machine's clock.** A machine that starts
   with its clock in the past (no battery, no time yet from the network)
   carries the members of an account whose time is over, until the clock is

@@ -14,9 +14,9 @@ pub const VERSION: u32 = 1;
 /// Who the exit is, as the caller sees it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Exit {
-    /// Its npub, when this service could read it: the node's own key file
-    /// says it, and the advert is signed with it.
-    pub npub: Option<String>,
+    /// Its npub: its name on the mesh (`<npub>.fips`), and the way to it.
+    /// The node's own key file says it, and the advert is signed with it.
+    pub npub: String,
     /// Its fips address, the one this service answers on.
     pub address: Ipv6Addr,
     pub name: String,
@@ -38,6 +38,25 @@ pub struct PackageTerms {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct You {
     pub address: Ipv6Addr,
+    /// The package it is a member of, if any: as the caller may see it.
+    pub package: Option<YourPackage>,
+}
+
+/// A caller's own package: what is left of it, until when, and how. Not
+/// its key, and not who else shares it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct YourPackage {
+    pub id: String,
+    /// `live`, `used-up`, `over` or `revoked`.
+    pub standing: String,
+    pub bytes_left: u64,
+    /// Unix seconds, or none.
+    pub until: Option<u64>,
+    /// How many addresses share it, this one included.
+    pub members: usize,
+    /// Whether this address is carried over IPv4 too: false when another
+    /// client of this exit derives the same inner IPv4 address.
+    pub ipv4: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -55,16 +74,16 @@ pub struct Terms {
     pub you: You,
 }
 
-pub fn terms(config: &Config, exit: &Exit, caller: Ipv6Addr) -> Terms {
-    let package = |p: &Package| PackageTerms { id: p.id.clone(), bytes: p.bytes, sat: p.sat, days: p.days };
+pub fn terms(config: &Config, exit: &Exit, caller: Ipv6Addr, package: Option<YourPackage>) -> Terms {
+    let offered = |p: &Package| PackageTerms { id: p.id.clone(), bytes: p.bytes, sat: p.sat, days: p.days };
     Terms {
         version: VERSION,
         exit: exit.clone(),
         price_msat_per_gb: config.price_msat_per_gb,
-        packages: config.packages.iter().map(package).collect(),
+        packages: config.packages.iter().map(offered).collect(),
         mints: config.mints.clone(),
         methods: Vec::new(),
-        you: You { address: caller },
+        you: You { address: caller, package },
     }
 }
 
@@ -95,6 +114,23 @@ pub fn bytes_shown(bytes: u64) -> String {
         }
     }
     format!("{bytes} bytes")
+}
+
+/// A moment for a person: the date and time in UTC.
+pub fn date(unix: u64) -> String {
+    let (days, seconds) = (unix / 86_400, unix % 86_400);
+    // Days to a date in the proleptic Gregorian calendar (Howard Hinnant's
+    // civil_from_days).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year}-{month:02}-{day:02} {:02}:{:02} UTC", seconds / 3600, seconds % 3600 / 60)
 }
 
 /// Satoshi for a person: millisatoshi rounded up to whole satoshi.
@@ -133,7 +169,29 @@ pub fn page(terms: &Terms) -> String {
     };
     let country = exit.country.as_deref().map(|c| format!(" &middot; {}", escape(c))).unwrap_or_default();
     let about = if exit.about.is_empty() { String::new() } else { format!("<p>{}</p>\n", escape(&exit.about)) };
-    let npub = exit.npub.as_deref().map(|n| format!("<code>{}</code><br>", escape(n))).unwrap_or_default();
+    let npub = format!("<code>{}.fips</code>", escape(&exit.npub));
+    let yours = match &terms.you.package {
+        None => String::new(),
+        Some(p) => {
+            let until = p.until.map(|until| format!(", until {}", date(until))).unwrap_or_default();
+            let ipv4 = if p.ipv4 {
+                ""
+            } else {
+                " Another client of this exit has the same inner IPv4 address as this device: it is carried over IPv6 only."
+            };
+            let now = match p.standing.as_str() {
+                "live" => format!("<strong>{}</strong> left{until}.", bytes_shown(p.bytes_left)),
+                "used-up" => "It is used up.".to_string(),
+                "over" => "Its time is over.".to_string(),
+                _ => "It was taken back by the operator.".to_string(),
+            };
+            format!(
+                "<h2>Your package</h2>\n<p>This device is in package <code>{}</code>, with {} device(s). {now}{ipv4}</p>\n",
+                escape(&p.id),
+                p.members
+            )
+        }
+    };
     format!(
         "<!doctype html>
 <html lang=\"en\">
@@ -146,8 +204,8 @@ pub fn page(terms: &Terms) -> String {
 <body>
 <main>
 <h1>{title}</h1>
-<p class=\"who\">{npub}<code>{address}</code>{country}</p>
-{about}<h2>Price</h2>
+<p class=\"who\">{npub}{country}</p>
+{about}{yours}<h2>Price</h2>
 <p><strong>{per_gb}</strong> a gigabyte, used as you go.</p>
 <h2>Packages</h2>
 {packages}
@@ -159,7 +217,6 @@ pub fn page(terms: &Terms) -> String {
 </body>
 </html>
 ",
-        address = exit.address,
         per_gb = sat_shown(terms.price_msat_per_gb),
         you = terms.you.address,
     )
@@ -187,7 +244,7 @@ mod tests {
 
     fn exit() -> Exit {
         Exit {
-            npub: Some("npub1example".into()),
+            npub: "npub1example".into(),
             address: "fd14::1".parse().unwrap(),
             name: "An <b>exit</b> & \"more\"".into(),
             about: "In a rack".into(),
@@ -214,7 +271,7 @@ mod tests {
     #[test]
     fn the_terms_are_the_config_and_the_caller() {
         let caller: Ipv6Addr = "fd99::2".parse().unwrap();
-        let json = serde_json::to_value(terms(&config(), &exit(), caller)).unwrap();
+        let json = serde_json::to_value(terms(&config(), &exit(), caller, None)).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
@@ -226,14 +283,14 @@ mod tests {
                              {"id": "500mb", "bytes": 500000000, "sat": 900, "days": 7}],
                 "mints": ["https://mint.example.org/<x>"],
                 "methods": [],
-                "you": {"address": "fd99::2"}
+                "you": {"address": "fd99::2", "package": null}
             })
         );
     }
 
     #[test]
     fn the_page_shows_the_terms_and_nothing_as_markup() {
-        let page = page(&terms(&config(), &exit(), "fd99::2".parse().unwrap()));
+        let page = page(&terms(&config(), &exit(), "fd99::2".parse().unwrap(), None));
         assert!(page.contains("<title>An &lt;b&gt;exit&lt;/b&gt; &amp; &quot;more&quot;</title>"));
         assert!(!page.contains("<b>exit</b>"), "the operator's text is not markup");
         assert!(page.contains("<code>https://mint.example.org/&lt;x&gt;</code>"));
@@ -244,13 +301,42 @@ mod tests {
         assert!(page.contains("&middot; CH"));
         assert!(page.contains("Nothing can be bought here yet"));
         assert!(!page.contains("<script") && !page.contains("http://") && !page.contains("//fonts"));
-        let none = Terms { packages: vec![], mints: vec![], ..terms(&config(), &exit(), "fd99::2".parse().unwrap()) };
+        let none =
+            Terms { packages: vec![], mints: vec![], ..terms(&config(), &exit(), "fd99::2".parse().unwrap(), None) };
         let none = super::page(&none);
         assert!(none.contains("No packages are offered.") && none.contains("No mint is named."));
     }
 
     #[test]
+    fn a_member_sees_its_package() {
+        let package = YourPackage {
+            id: "p0123456789abcdef".into(),
+            standing: "live".into(),
+            bytes_left: 750_000_000,
+            until: Some(1_800_000_000),
+            members: 2,
+            ipv4: false,
+        };
+        let t = terms(&config(), &exit(), "fd99::2".parse().unwrap(), Some(package.clone()));
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(
+            json["you"]["package"],
+            serde_json::json!({"id": "p0123456789abcdef", "standing": "live", "bytes_left": 750000000,
+                               "until": 1800000000, "members": 2, "ipv4": false})
+        );
+        let shown = page(&t);
+        assert!(shown.contains("<strong>750 MB</strong> left, until 2027-01-15 08:00 UTC."), "{shown}");
+        assert!(shown.contains("over IPv6 only"));
+        let over = YourPackage { standing: "over".into(), ipv4: true, ..package };
+        let shown = page(&terms(&config(), &exit(), "fd99::2".parse().unwrap(), Some(over)));
+        assert!(shown.contains("Its time is over.") && !shown.contains("IPv6 only"));
+    }
+
+    #[test]
     fn numbers_for_a_person() {
+        assert_eq!(date(0), "1970-01-01 00:00 UTC");
+        assert_eq!(date(1_800_000_000), "2027-01-15 08:00 UTC");
+        assert_eq!(date(951_782_400), "2000-02-29 00:00 UTC");
         assert_eq!(bytes_shown(999), "999 bytes");
         assert_eq!(bytes_shown(1_500), "1.5 kB");
         assert_eq!(bytes_shown(1_000_000_000), "1 GB");

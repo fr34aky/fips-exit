@@ -1411,6 +1411,45 @@ fn control_listener(path: &str) -> io::Result<UnixListener> {
     listener
 }
 
+/// The group a payment service runs in, which the control socket is opened
+/// to when accounts are made over it: `install.sh` makes it, and the
+/// service's unit puts the service in it.
+const CONTROL_GROUP: &str = "fips-exit";
+
+/// The id of group `name`, if there is one.
+fn group_id(name: &str) -> Option<libc::gid_t> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut group: libc::group = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut found: *mut libc::group = std::ptr::null_mut();
+    let status =
+        unsafe { libc::getgrnam_r(name.as_ptr(), &mut group, buffer.as_mut_ptr(), buffer.len(), &mut found) };
+    (status == 0 && !found.is_null()).then_some(group.gr_gid)
+}
+
+/// Let the members of `group` connect to the socket at `path`: the socket
+/// and the directory it is in become the group's, the socket readable and
+/// writable by it, the directory passable. Without the group, or when that
+/// cannot be done, the socket stays root's alone, which is said.
+fn share_with_group(path: &str, group: &str) {
+    let Some(gid) = group_id(group) else {
+        eprintln!("fips-exitd: no group {group}: the control socket is root's alone");
+        return;
+    };
+    let directory = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("/"));
+    let shared = [(directory, 0o750), (std::path::Path::new(path), 0o660)].into_iter().all(|(at, mode)| {
+        let Ok(c_path) = std::ffi::CString::new(at.as_os_str().as_encoded_bytes()) else { return false };
+        unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) == 0 && libc::chmod(c_path.as_ptr(), mode) == 0 }
+    });
+    if shared {
+        eprintln!("fips-exitd: the control socket is open to group {group}");
+    } else {
+        // Whatever was done is undone: root's alone, as before.
+        let _ = std::ffi::CString::new(path).map(|c_path| unsafe { libc::chmod(c_path.as_ptr(), 0o600) });
+        eprintln!("fips-exitd: the control socket could not be given to group {group}: {}", io::Error::last_os_error());
+    }
+}
+
 enum Line {
     Read,
     TooLong,
@@ -1668,6 +1707,11 @@ fn run() -> Result<(), String> {
         match control_listener(control) {
             Ok(listener) => {
                 eprintln!("fips-exitd: {what} over {control}");
+                // Accounts are made by a payment service that is not root.
+                // The counts alone are root's to read.
+                if state.accounts {
+                    share_with_group(control, CONTROL_GROUP);
+                }
                 let state = state.clone();
                 std::thread::spawn(move || serve_control(state, listener));
             }
@@ -2346,6 +2390,23 @@ mod tests {
         drop(control_listener(path).unwrap());
         let listener = control_listener(path).unwrap();
         assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        // A group there is not: root's alone, as it was.
+        share_with_group(path, "no-such-group-for-fips-exitd");
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        // A group this user is in: the socket and its directory become it.
+        let own = unsafe { libc::getegid() };
+        let mut name = vec![0 as libc::c_char; 16 * 1024];
+        let mut group: libc::group = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::group = std::ptr::null_mut();
+        unsafe { libc::getgrgid_r(own, &mut group, name.as_mut_ptr(), name.len(), &mut found) };
+        if !found.is_null() {
+            let own_name = unsafe { std::ffi::CStr::from_ptr(group.gr_name) }.to_str().unwrap().to_string();
+            assert_eq!(group_id(&own_name), Some(own));
+            share_with_group(path, &own_name);
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o660);
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o750);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         let state = Arc::new(State {
             clients_path: String::new(),

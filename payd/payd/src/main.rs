@@ -9,18 +9,23 @@
 //! browser at `/`) and takes no payment. What is to come is in
 //! docs/paid-exit.md.
 
+mod admin;
 mod config;
 mod http;
+mod identity;
+mod store;
+mod sync;
 mod terms;
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 use crate::config::Config;
+use crate::identity::{key_address, npub_key};
 use crate::terms::Exit;
 
 struct Args {
@@ -28,11 +33,33 @@ struct Args {
     public_key: String,
     /// Where to listen instead of the mesh address: for tests.
     listen: Option<SocketAddr>,
+    /// The directory the store is kept in.
+    state: PathBuf,
+    /// The daemon's control socket, and the operator's socket of this
+    /// service.
+    control: PathBuf,
+    admin: PathBuf,
+}
+
+/// A directory systemd made for the service and named in `variable`, or
+/// `fallback`.
+fn directory(variable: &str, fallback: &str) -> PathBuf {
+    // systemd may name several, with colons between them: the first.
+    match std::env::var(variable) {
+        Ok(named) if !named.is_empty() => PathBuf::from(named.split(':').next().unwrap_or(&named)),
+        _ => PathBuf::from(fallback),
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args =
-        Args { config: "/etc/fips-exit/config".into(), public_key: "/etc/fips/fips.pub".into(), listen: None };
+    let mut args = Args {
+        config: "/etc/fips-exit/config".into(),
+        public_key: "/etc/fips/fips.pub".into(),
+        listen: None,
+        state: directory("STATE_DIRECTORY", "/var/lib/fips-exit-payd"),
+        control: "/run/fips-exit/control.sock".into(),
+        admin: directory("RUNTIME_DIRECTORY", "/run/fips-exit-payd").join("admin.sock"),
+    };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
         let value = argv.next().ok_or_else(|| format!("{flag} needs a value"))?;
@@ -40,9 +67,13 @@ fn parse_args() -> Result<Args, String> {
             "--config" => args.config = value,
             "--pub" => args.public_key = value,
             "--listen" => args.listen = Some(value.parse().map_err(|_| format!("--listen {value}: [address]:port"))?),
+            "--state" => args.state = value.into(),
+            "--control" => args.control = value.into(),
+            "--admin" => args.admin = value.into(),
             other => {
                 return Err(format!(
-                    "unknown argument {other}\nusage: fips-exit-payd [--config FILE] [--pub FILE] [--listen [ADDRESS]:PORT]"
+                    "unknown argument {other}\nusage: fips-exit-payd [--config FILE] [--pub FILE] [--listen [ADDRESS]:PORT] \
+                     [--state DIRECTORY] [--control SOCKET] [--admin SOCKET]"
                 ));
             }
         }
@@ -74,57 +105,6 @@ fn mesh_addresses(interface: &str, list: &str) -> Vec<Ipv6Addr> {
     found
 }
 
-const BECH32: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-
-fn bech32_polymod(values: &[u8]) -> u32 {
-    const GENERATOR: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
-    let mut check = 1u32;
-    for value in values {
-        let top = check >> 25;
-        check = (check & 0x1ff_ffff) << 5 ^ u32::from(*value);
-        for (i, generator) in GENERATOR.iter().enumerate() {
-            if (top >> i) & 1 == 1 {
-                check ^= generator;
-            }
-        }
-    }
-    check
-}
-
-/// The 32-byte key in an `npub1…`, if it is one, checksum and all.
-fn npub_key(npub: &str) -> Option<[u8; 32]> {
-    let data = npub.strip_prefix("npub1")?;
-    let values: Vec<u8> =
-        data.bytes().map(|c| BECH32.iter().position(|b| *b == c).map(|at| at as u8)).collect::<Option<_>>()?;
-    let mut expanded: Vec<u8> = b"npub".iter().map(|c| c >> 5).collect();
-    expanded.push(0);
-    expanded.extend(b"npub".iter().map(|c| c & 31));
-    expanded.extend(&values);
-    if values.len() < 6 || bech32_polymod(&expanded) != 1 {
-        return None;
-    }
-    let (mut acc, mut bits, mut key) = (0u32, 0u32, Vec::new());
-    for value in &values[..values.len() - 6] {
-        acc = (acc << 5 | u32::from(*value)) & 0xfff;
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            key.push((acc >> bits) as u8);
-        }
-    }
-    key.try_into().ok()
-}
-
-/// The fips address of a key: `fd` and the first 15 bytes of its SHA-256,
-/// as fips derives it.
-fn key_address(key: &[u8; 32]) -> Ipv6Addr {
-    let digest = Sha256::digest(key);
-    let mut octets = [0u8; 16];
-    octets[0] = 0xfd;
-    octets[1..].copy_from_slice(&digest[..15]);
-    Ipv6Addr::from(octets)
-}
-
 /// The node's npub, from its public key file: shown, and a name this
 /// service answers to (`<npub>.fips`). None if it cannot be read or is not
 /// an npub.
@@ -134,25 +114,22 @@ fn npub(path: &str) -> Option<String> {
     npub_key(&npub).map(|_| npub)
 }
 
-/// Where to listen, of the fips addresses `interface` has, and whether the
-/// node's npub is the one there. The address of the npub, when the
-/// interface has it; otherwise the interface's one fips address, and the
-/// npub not shown, since it would name another node. An interface with
-/// several and none of them the npub's is not guessed at: the script opens
-/// the firewall for one of them, which may not be the one chosen here.
-fn choose(addresses: &[Ipv6Addr], npub: Option<String>) -> Result<(Ipv6Addr, Option<String>), String> {
-    let of_npub = npub.as_deref().and_then(npub_key).map(|key| key_address(&key));
-    if let Some(address) = of_npub.filter(|address| addresses.contains(address)) {
-        return Ok((address, npub));
-    }
-    match addresses {
-        [] => Err("no fips address".into()),
-        [only] => Ok((*only, None)),
-        _ => Err(format!(
-            "{} fips addresses, and none of them is the node's own ({}): which one to answer on?",
-            addresses.len(),
-            npub.as_deref().unwrap_or("its public key file cannot be read")
-        )),
+/// Where to listen: the fips address of the node's npub, which `interface`
+/// must have. The npub is the exit's name on the mesh, and the only way to
+/// it: a node reaches a fips address only once it has resolved the npub
+/// that address belongs to (`<npub>.fips`). An exit whose npub is not known
+/// here, or is another node's, is not served at all.
+fn choose(addresses: &[Ipv6Addr], npub: Option<&str>, key_file: &str) -> Result<Ipv6Addr, String> {
+    let Some(npub) = npub else {
+        return Err(format!("{key_file} has no npub: the exit is reached by its npub, and it is not known here"));
+    };
+    let of_npub = npub_key(npub).map(|key| key_address(&key)).ok_or_else(|| format!("{npub} is not an npub"))?;
+    if addresses.contains(&of_npub) {
+        Ok(of_npub)
+    } else if addresses.is_empty() {
+        Err("no fips address: is fips running?".into())
+    } else {
+        Err(format!("{npub} (from {key_file}) is not this node: its address {of_npub} is not here"))
     }
 }
 
@@ -167,14 +144,13 @@ async fn run() -> Result<(), String> {
         return Ok(());
     };
     let read_npub = npub(&args.public_key);
-    let (listen, npub) = match args.listen {
+    let listen = match args.listen {
         Some(listen) => {
             let IpAddr::V6(address) = listen.ip() else {
                 return Err(format!("{listen}: an IPv6 address, the exit's fips address"));
             };
-            // The npub only if it is this address's.
-            let theirs = read_npub.as_deref().and_then(npub_key).map(|key| key_address(&key));
-            (listen, read_npub.clone().filter(|_| theirs == Some(address)))
+            choose(&[address], read_npub.as_deref(), &args.public_key)?;
+            listen
         }
         None => {
             // fips brings its interface up a moment after it starts.
@@ -189,28 +165,37 @@ async fn run() -> Result<(), String> {
                     break;
                 }
             }
-            let (address, npub) = choose(&addresses, read_npub.clone()).map_err(|e| {
-                format!("{}: {e}{}", config.mesh_if, if addresses.is_empty() { ": is fips running?" } else { "" })
-            })?;
-            (SocketAddr::new(IpAddr::V6(address), config.port), npub)
+            let address = choose(&addresses, read_npub.as_deref(), &args.public_key)
+                .map_err(|e| format!("{}: {e}", config.mesh_if))?;
+            SocketAddr::new(IpAddr::V6(address), config.port)
         }
     };
-    if npub.is_none()
-        && let Some(stale) = &read_npub
-    {
-        eprintln!("fips-exit-payd: {stale} in {} is not the npub of {}: not shown", args.public_key, listen.ip());
-    }
-    let IpAddr::V6(address) = listen.ip() else { unreachable!("checked above") };
+    let (Some(npub), IpAddr::V6(address)) = (read_npub, listen.ip()) else { unreachable!("checked by choose") };
     let exit =
         Exit { npub, address, name: config.name.clone(), about: config.about.clone(), country: config.country.clone() };
     let listener = TcpListener::bind(listen).await.map_err(|e| format!("cannot listen on {listen}: {e}"))?;
     eprintln!(
-        "fips-exit-payd: the terms of {} on http://{listen}/ (price {} msat a GB, {} package(s), nothing for sale yet)",
-        exit.npub.as_deref().unwrap_or("this exit"),
+        "fips-exit-payd: the terms on http://{}.fips:{}/ (price {} msat a GB, {} package(s), nothing for sale yet)",
+        exit.npub,
+        listen.port(),
         config.price_msat_per_gb,
         config.packages.len()
     );
-    let site = Arc::new(http::Site::new(config, exit));
+    // The packages, kept; the daemon kept as they say; the operator's way in.
+    let store = Arc::new(store::Store::open(&args.state.join("payd.db"))?);
+    let seats = sync::Seats::default();
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let admin = admin::listen(&args.admin)?;
+    eprintln!(
+        "fips-exit-payd: {} package(s) kept in {}; the operator's socket is {}; the daemon's, {}",
+        store.packages().map_err(|e| e.to_string())?.len(),
+        args.state.display(),
+        args.admin.display(),
+        args.control.display()
+    );
+    tokio::spawn(sync::keep(store.clone(), args.control.clone(), seats.clone(), changed.clone()));
+    tokio::spawn(admin::serve(admin, store.clone(), changed));
+    let site = Arc::new(http::Site::new(config, exit, store, seats));
     // With --listen, which tests use, a peer from anywhere is talked to.
     let admit: fn(IpAddr) -> bool = if args.listen.is_some() { |_| true } else { http::on_the_mesh };
     tokio::select! {
@@ -276,19 +261,16 @@ mod tests {
     }
 
     #[test]
-    fn the_address_answered_on_is_the_npubs_or_the_only_one() {
+    fn the_address_answered_on_is_the_npubs_and_nothing_else() {
         let node: Ipv6Addr = NODE_ADDRESS.parse().unwrap();
         let other: Ipv6Addr = "fd99::a".parse().unwrap();
-        let npub = Some(NODE.to_string());
-        assert_eq!(choose(&[other, node], npub.clone()), Ok((node, npub.clone())));
-        assert_eq!(choose(&[node], npub.clone()), Ok((node, npub.clone())));
-        // The npub names another node: the one address, and no npub shown.
-        assert_eq!(choose(&[other], npub.clone()), Ok((other, None)));
-        assert_eq!(choose(&[other], None), Ok((other, None)));
-        // Several, and none the npub's: not guessed.
-        assert!(choose(&[other, "fd99::b".parse().unwrap()], npub.clone()).is_err());
-        assert!(choose(&[other, "fd99::b".parse().unwrap()], None).is_err());
-        assert!(choose(&[], npub).is_err());
+        assert_eq!(choose(&[other, node], Some(NODE), "fips.pub"), Ok(node));
+        assert_eq!(choose(&[node], Some(NODE), "fips.pub"), Ok(node));
+        // The npub names another node, or there is none: nothing is served,
+        // not even on the interface's one address.
+        assert!(choose(&[other], Some(NODE), "fips.pub").unwrap_err().contains("is not this node"));
+        assert!(choose(&[other], None, "fips.pub").unwrap_err().contains("has no npub"));
+        assert!(choose(&[], Some(NODE), "fips.pub").unwrap_err().contains("is fips running?"));
     }
 
     #[test]

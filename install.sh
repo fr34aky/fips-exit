@@ -5,6 +5,8 @@ set -eu
 cd "$(dirname "$0")"
 cargo build --release
 cargo build --release --manifest-path payd/Cargo.toml
+# The group the payment service is in, to which the daemon opens its socket.
+getent group fips-exit >/dev/null || sudo groupadd --system fips-exit
 sudo install -m 755 target/release/fips-exitd /usr/local/sbin/fips-exitd
 sudo install -m 755 payd/target/release/fips-exit-payd /usr/local/sbin/fips-exit-payd
 sudo install -m 755 fips-exit /usr/local/sbin/fips-exit

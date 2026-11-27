@@ -139,8 +139,9 @@ sudo systemctl enable --now fips-exit-advert.timer   # and every hour
 ### The payment service
 
 `fips-exit-payd` runs beside the exit, as a user of its own with no
-privilege, and answers on this node's fips address. So far it says what the
-exit costs, and takes no payment:
+privilege, and answers at `http://<npub>.fips:5170/`, the exit's npub being
+its name on the mesh. It says what the exit costs, keeps the packages the
+operator gives away, and takes no payment yet:
 
 ```sh
 ACCESS=paid
@@ -154,24 +155,49 @@ PAY_PORT=5170                               # optional, the default
 sudo systemctl enable --now fips-exit-payd
 ```
 
-- `http://[<fips address>]:5170/v1/terms` is the exit's terms as JSON, and
-  `/` the same as a page for a browser on the mesh: price, packages, mints,
-  name and country, and who is asking. A caller is known by the address its
-  connection comes from, which fips authenticates. `methods` is empty: there
-  is no way to pay yet.
+- `http://<npub>.fips:5170/v1/terms` is the exit's terms as JSON, and `/`
+  the same as a page for a browser on the mesh: price, packages, mints, name
+  and country, and who is asking, with its package if it is in one. A caller
+  is known by the address its connection comes from, which fips
+  authenticates. `methods` is empty: there is no way to pay yet.
+- The npub is the only way to the exit: a node reaches a fips address only
+  once it has resolved the npub it belongs to. The service answers requests
+  for `<npub>.fips:5170` and for nothing else, not the bare address, and
+  does not start without the node's npub (`/etc/fips/fips.pub`) or with one
+  that is not this node's.
 - In paid mode `fips-exit up` opens that port in fips's firewall and in ufw,
   to this node's address, for the whole mesh, while the service listens
   there, and only then: nothing else that listens on the port is to be
   reached. The service's unit runs `up` when it starts and stops, so the
   port follows it. `status` says whether it answers.
-- It answers on the address of the node's npub (`/etc/fips/fips.pub`), and
-  shows the npub only when it is that address's.
 - The service reads the config when it starts: restart it after a change.
   With `ACCESS` other than `paid` it says so and stops.
-- It answers only requests for this exit's own name (`[address]:port` or
-  `<npub>.fips:port`), only `GET`, and only so much at a time: 64
-  connections, 8 from one address, a header of 16 KiB within 5 seconds, a
-  minute for a connection.
+- Only `GET`, and only so much at a time: 64 connections, 8 from one
+  address, a header of 16 KiB within 5 seconds, a minute for a connection.
+
+Packages the operator gives away, for nothing, until the service sells
+them:
+
+```sh
+sudo fips-exit grant 5GB 30 npub1…,npub1… a friend   # 5 GB for 30 days (0: no end), for these devices
+sudo fips-exit packages                               # each package: what is left, until when, who is in it
+sudo fips-exit top-up <package> 1GB 7                 # more bytes, and more days
+sudo fips-exit members <package> npub1…               # who shares it, in place of who did
+sudo fips-exit revoke <package>                       # taken back
+```
+
+- A package is an account in the daemon, kept as the service says: its
+  members are carried until its bytes are used up or its time is over, and
+  carried again when it is topped up. A device is in one package at a time.
+- `grant` prints the package's key once. The service keeps only its hash.
+  (What the key is for, a buyer managing its own package, comes next.)
+- The service keeps its packages in `/var/lib/fips-exit-payd`, and what the
+  daemon counts is written there every two seconds: a restart of the daemon
+  or of the service loses at most those seconds, in the members' favour.
+- The service is in the group `fips-exit`, which `install.sh` makes; the
+  daemon opens its control socket to that group in paid mode. The operator's
+  commands go to the service's own socket, `/run/fips-exit-payd/admin.sock`,
+  which only root and the service can open.
 
 ### Accounts
 

@@ -73,7 +73,7 @@ fn digits(text: &str) -> Option<u64> {
 
 /// A size: a number of bytes, or one with MB, GB or TB after it, in powers
 /// of ten as a price counts them.
-fn size(text: &str) -> Option<u64> {
+pub fn size(text: &str) -> Option<u64> {
     let (number, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
         Some(at) => text.split_at(at),
         None => (text, ""),

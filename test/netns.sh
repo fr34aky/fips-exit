@@ -18,6 +18,9 @@ mount -t tmpfs tmpfs /run
 
 E=fd0e::1 C1=fd11:2233:4455:6677::1 C2=fd99:8877:6655:4433::2
 C1V4=100.81.34.51 C2V4=100.89.136.119
+# The per-client report the daemon rewrites in the background, and the tick it
+# is rewritten on: 200 ms instead of the minute so the test need not wait one.
+USAGE=$FIPS_EXIT_DIR/usage.json
 fail() { echo "FAIL: $*"; exit 1; }
 ok() { echo "ok: $*"; }
 
@@ -88,7 +91,7 @@ daemon="$here/target/release/fips-exitd"
 # --- without the daemon, the script says so and applies nothing ----------------
 "$here/fips-exit" up 2>&1 | grep -q "fips-exitd is not running" || fail "up without the daemon"
 ok "up without the daemon is refused"
-DNS_UPSTREAMS=8.8.8.2 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>"$FIPS_EXIT_DIR/daemon.log" &
+DNS_UPSTREAMS=8.8.8.2 USAGE_REPORT="$USAGE" USAGE_REPORT_INTERVAL_MS=200 "$daemon" --clients "$FIPS_EXIT_DIR/clients" --mesh-if fips0 --tun fipsexit0 2>"$FIPS_EXIT_DIR/daemon.log" &
 for i in 1 2 3 4 5 6 7 8 9 10; do ip link show fipsexit0 >/dev/null 2>&1 && break; sleep 0.2; done
 ip link show fipsexit0 >/dev/null 2>&1 || fail "the daemon did not create its TUN: $(cat "$FIPS_EXIT_DIR/daemon.log")"
 
@@ -181,6 +184,105 @@ ok "up removes a tunnel device of the version before the daemon"
 [ "$(resolve c1 $C1 example.com)" = timeout ] || fail "DNS answered without a client entry"
 ok "no client entry, no traffic and no DNS"
 
+# --- per-client byte accounting ------------------------------------------------
+# The daemon keeps one row per client that actually moved bytes and rewrites
+# that as JSON for a gate to read. The rewrite happens on its own tick, which
+# USAGE_REPORT_INTERVAL_MS shortens from the minute to 200 ms; the contents,
+# the atomic rename and the default are what a real node runs.
+cat > "$FIPS_EXIT_DIR/usage.py" <<'PY'
+import json, sys, time
+
+path, what = sys.argv[1], sys.argv[2]
+
+
+def read():
+    # A gate parses this file. It is never grepped here, and a file that does
+    # not parse is a failure at every point it is read.
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        sys.exit("the report is not a JSON array: %r" % (data,))
+    for row in data:
+        missing = [k for k in ("client", "from_client_bytes", "to_client_bytes", "packets") if k not in row]
+        if missing:
+            sys.exit("a row has no %s: %r" % (", ".join(missing), row))
+    return data
+
+
+def rows(data):
+    return "; ".join(
+        "%s from_client_bytes=%d to_client_bytes=%d packets=%d"
+        % (r["client"], r["from_client_bytes"], r["to_client_bytes"], r["packets"])
+        for r in data) or "(no rows)"
+
+
+def wait(condition, describe):
+    deadline = time.time() + 5
+    while True:
+        data = read()
+        if condition(data):
+            return data
+        if time.time() > deadline:
+            sys.exit("the report never showed %s; it reads: %s" % (describe, rows(data)))
+        time.sleep(0.1)
+
+
+if what == "empty":
+    wait(lambda d: d == [], "no rows at all")
+    print("(the report is exactly [])")
+elif what == "one":
+    client, least = sys.argv[3], int(sys.argv[4])
+    data = wait(
+        lambda d: len(d) == 1 and d[0]["client"] == client
+        and d[0]["from_client_bytes"] > 0 and d[0]["to_client_bytes"] > 0
+        and d[0]["packets"] >= least,
+        "one row for %s with bytes each way and packets >= %d" % (client, least))
+    print(rows(data))
+elif what == "still":
+    # Nothing new crossed, so the report must read exactly as it did; the
+    # settle gives the daemon several ticks to write anything it thinks moved.
+    expected, absent = sys.argv[3], (sys.argv[4] if len(sys.argv) > 4 else None)
+    time.sleep(0.7)
+    data = read()
+    if absent and any(r["client"] == absent for r in data):
+        sys.exit("client %s was billed without sending anything: %s" % (absent, rows(data)))
+    if rows(data) != expected:
+        sys.exit("the report changed with no traffic: want [%s], got [%s]" % (expected, rows(data)))
+    print(rows(data))
+else:
+    sys.exit("usage.py: unknown check %r" % what)
+PY
+usage() { python3 "$FIPS_EXIT_DIR/usage.py" "$USAGE" "$@"; }
+
+# (a) Before any client is added.
+r=$(usage empty) || fail "the usage report before any client: $r"
+ok "the usage report starts empty $r"
+
+# (b) One request and its reply: two crossings, each counted on its own.
+"$here/fips-exit" add $C1 phone-one >/dev/null
+[ "$(ask c1 4 8.8.8.2 100)" = 100 ] || fail "accounting: the billed packet did not pass"
+c1row=$(usage one $C1 2) || fail "no usage row for $C1"
+case $c1row in "$C1 "*) ;; *) fail "the row is not $C1's: $c1row" ;; esac
+ok "one request and its reply are billed to $C1: $c1row"
+
+# (c) A client that is admitted and sends nothing is not billed for anything:
+# adding it changes the list, not the report.
+"$here/fips-exit" add $C2 phone-two >/dev/null
+"$here/fips-exit" list | grep -q "$C2  $C2V4  phone-two" || fail "accounting: $C2 was not admitted"
+r=$(usage still "$c1row" $C2) || fail "an idle client was billed: $r"
+[ "$r" = "$c1row" ] || fail "an idle client was billed: $r"
+ok "an admitted client that sends nothing has no row: $r"
+
+# (d) Removal ends admission and must not erase the meter.
+"$here/fips-exit" remove phone-one >/dev/null
+"$here/fips-exit" list | grep -q "$C1" && fail "accounting: $C1 is still on the list"
+r=$(usage still "$c1row") || fail "the meter forgot a removed client: $r"
+[ "$r" = "$c1row" ] || fail "the meter forgot a removed client: $r"
+ok "a removed client keeps its row and its counts: $r"
+"$here/fips-exit" remove phone-two >/dev/null
+r=$(usage still "$c1row" $C2) || fail "the report after removing both clients: $r"
+
+# The list is back as the sections below expect it: neither client is admitted.
 "$here/fips-exit" add $C1 phone-one >/dev/null
 "$here/fips-exit" list | grep -q "$C1  $C1V4  phone-one" || fail "list: $("$here/fips-exit" list)"
 ok "client added: $("$here/fips-exit" list)"

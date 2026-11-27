@@ -36,11 +36,30 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+/// Issue an ioctl with a platform-correct request argument.
+///
+/// `libc::ioctl`'s request parameter is `c_ulong` on glibc and `c_int` on musl,
+/// while the consts (`TUNSETIFF`, `SIOCSIFMTU`, …) are unsigned. Casting at each
+/// call site either truncates on musl or fails to compile on glibc, so every
+/// call goes through here and this is the only place that knows the difference.
+#[cfg(target_env = "musl")]
+#[inline]
+fn ioctl_req(request: libc::c_ulong) -> libc::c_int {
+    request as libc::c_int
+}
+
+#[cfg(not(target_env = "musl"))]
+#[inline]
+fn ioctl_req(request: libc::c_ulong) -> libc::c_ulong {
+    request
+}
 
 const PROTO_IPV4: i32 = 4; // IPPROTO_IPIP
 const PROTO_IPV6: i32 = 41; // IPPROTO_IPV6
@@ -192,7 +211,7 @@ fn open_tun(name: &str) -> io::Result<OwnedFd> {
     let mut req = IfReq::new(name)?;
     let flags = (libc::IFF_TUN | libc::IFF_NO_PI) as i16;
     req.data[..2].copy_from_slice(&flags.to_ne_bytes());
-    if unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETIFF, &req) } < 0 {
+    if unsafe { libc::ioctl(tun.as_raw_fd(), ioctl_req(TUNSETIFF), &req) } < 0 {
         return Err(last_error("create TUN device"));
     }
 
@@ -203,16 +222,16 @@ fn open_tun(name: &str) -> io::Result<OwnedFd> {
     let ctl = unsafe { OwnedFd::from_raw_fd(ctl) };
     let mut req = IfReq::new(name)?;
     req.data[..4].copy_from_slice(&TUN_MTU.to_ne_bytes());
-    if unsafe { libc::ioctl(ctl.as_raw_fd(), libc::SIOCSIFMTU, &req) } < 0 {
+    if unsafe { libc::ioctl(ctl.as_raw_fd(), ioctl_req(libc::SIOCSIFMTU), &req) } < 0 {
         return Err(last_error("set TUN MTU"));
     }
     let mut req = IfReq::new(name)?;
-    if unsafe { libc::ioctl(ctl.as_raw_fd(), libc::SIOCGIFFLAGS, &mut req) } < 0 {
+    if unsafe { libc::ioctl(ctl.as_raw_fd(), ioctl_req(libc::SIOCGIFFLAGS), &mut req) } < 0 {
         return Err(last_error("read TUN flags"));
     }
     let flags = i16::from_ne_bytes([req.data[0], req.data[1]]) | libc::IFF_UP as i16;
     req.data[..2].copy_from_slice(&flags.to_ne_bytes());
-    if unsafe { libc::ioctl(ctl.as_raw_fd(), libc::SIOCSIFFLAGS, &req) } < 0 {
+    if unsafe { libc::ioctl(ctl.as_raw_fd(), ioctl_req(libc::SIOCSIFFLAGS), &req) } < 0 {
         return Err(last_error("bring TUN up"));
     }
     Ok(tun)
@@ -297,6 +316,120 @@ struct Counters {
 
 static RELOAD: AtomicBool = AtomicBool::new(false);
 
+/// Replace the report atomically: a reader (a TollGate gate polling this
+/// file) must never observe a half-written one. Same temp+rename discipline
+/// the module uses for its config, for the same reason.
+fn write_report(path: &Path, json: &str) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// How often the report thread wakes. A minute unless
+/// `USAGE_REPORT_INTERVAL_MS` overrides it, which the test harness uses to
+/// see the report without waiting for the minute. A value of zero would make
+/// the loop spin and a value that is not a number is no interval at all, so
+/// both keep the default; the default is what an unset variable means.
+fn report_interval(setting: Option<&str>) -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(60);
+    let Some(text) = setting else { return DEFAULT };
+    let text = text.trim();
+    match text.parse::<u64>() {
+        Ok(ms) if ms > 0 => match u32::try_from(ms) {
+            Ok(ms) => Duration::from_millis(u64::from(ms)),
+            Err(_) => {
+                eprintln!(
+                    "fips-exitd: USAGE_REPORT_INTERVAL_MS={text} is out of range; \
+                     reporting every {}s",
+                    DEFAULT.as_secs()
+                );
+                DEFAULT
+            }
+        },
+        _ => {
+            eprintln!(
+                "fips-exitd: USAGE_REPORT_INTERVAL_MS={text:?} is not a positive number of \
+                 milliseconds; reporting every {}s",
+                DEFAULT.as_secs()
+            );
+            DEFAULT
+        }
+    }
+}
+
+/// Which way a packet crossed the exit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// A client's packet leaving for the internet (mesh → TUN).
+    FromClient,
+    /// An internet reply on its way back to a client (TUN → mesh).
+    ToClient,
+}
+
+/// What each client has moved since the daemon started.
+///
+/// Kept apart from `Clients` on purpose: dropping a client from the
+/// allow-list ends admission and must not erase the record of what it
+/// already moved, and re-reading the list on SIGHUP must not zero it.
+#[derive(Default)]
+struct Usage {
+    rows: Mutex<HashMap<[u8; 16], Row>>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Row {
+    from_client: u64,
+    to_client: u64,
+    packets: u64,
+}
+
+impl Usage {
+    fn record(&self, client: [u8; 16], bytes: u64, direction: Direction) {
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows.entry(client).or_default();
+        match direction {
+            Direction::FromClient => row.from_client = row.from_client.saturating_add(bytes),
+            Direction::ToClient => row.to_client = row.to_client.saturating_add(bytes),
+        }
+        row.packets = row.packets.saturating_add(1);
+    }
+
+    /// One row per client ever seen, ordered by address so the output is
+    /// stable between reads. `(client, from_client_bytes, to_client_bytes,
+    /// packets)`.
+    fn snapshot(&self) -> Vec<(Ipv6Addr, u64, u64, u64)> {
+        let rows = self.rows.lock().unwrap();
+        let mut out: Vec<_> = rows
+            .iter()
+            .map(|(client, row)| {
+                (Ipv6Addr::from(*client), row.from_client, row.to_client, row.packets)
+            })
+            .collect();
+        out.sort_by_key(|row| row.0);
+        out
+    }
+
+    /// The same rows as a JSON array, written where a TollGate gate can read
+    /// them. Bytes rather than packets because that is what a purchase is
+    /// denominated in.
+    fn to_json(&self) -> String {
+        let mut out = String::from("[");
+        for (i, (client, from_client, to_client, packets)) in self.snapshot().iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"client\":\"{client}\",\"from_client_bytes\":{from_client},\
+                 \"to_client_bytes\":{to_client},\"packets\":{packets}}}"
+            ));
+        }
+        out.push(']');
+        out
+    }
+}
+
 extern "C" fn on_hangup(_: libc::c_int) {
     RELOAD.store(true, Ordering::Relaxed);
 }
@@ -305,6 +438,7 @@ struct State {
     clients_path: String,
     clients: RwLock<Clients>,
     counters: Counters,
+    usage: Usage,
 }
 
 impl State {
@@ -343,13 +477,19 @@ fn from_mesh(state: &State, socket: RawFd, proto: i32, tun: RawFd) -> io::Error 
         }
         state.reload_if_asked();
         let inner = &buf[..n as usize];
-        if !state.clients.read().unwrap().admits(proto, &from.sin6_addr.s6_addr, inner) {
+        let client = from.sin6_addr.s6_addr;
+        if !state.clients.read().unwrap().admits(proto, &client, inner) {
             state.counters.refused.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         // A failed write is that packet's loss (the TUN's queue is full).
-        unsafe { libc::write(tun, inner.as_ptr().cast(), inner.len()) };
-        state.counters.to_internet.fetch_add(1, Ordering::Relaxed);
+        let written = unsafe { libc::write(tun, inner.as_ptr().cast(), inner.len()) };
+        if written >= 0 {
+            state.counters.to_internet.fetch_add(1, Ordering::Relaxed);
+            state
+                .usage
+                .record(client, inner.len() as u64, Direction::FromClient);
+        }
     }
 }
 
@@ -395,6 +535,9 @@ fn from_tun(state: &State, tun: RawFd, socket4: RawFd, socket6: RawFd) -> io::Er
             continue;
         }
         state.counters.to_clients.fetch_add(1, Ordering::Relaxed);
+        state
+            .usage
+            .record(client, inner.len() as u64, Direction::ToClient);
     }
 }
 
@@ -644,6 +787,7 @@ fn run() -> Result<(), String> {
         clients_path: args.clients,
         clients: RwLock::new(clients),
         counters: Counters::default(),
+        usage: Usage::default(),
     });
 
     for (socket, proto) in [(socket4.as_raw_fd(), PROTO_IPV4), (socket6.as_raw_fd(), PROTO_IPV6)] {
@@ -680,13 +824,29 @@ fn run() -> Result<(), String> {
         }
     }
     {
-        // Once a minute, and only if something moved: a line for the journal.
+        // Once a minute, and only if something moved: a line for the journal,
+        // plus the per-client report a TollGate gate reads.
         let state = state.clone();
         std::thread::spawn(move || {
             let mut last = (0, 0, 0, 0, 0, 0, 0);
+            let mut last_usage = String::new();
+            let interval = report_interval(std::env::var("USAGE_REPORT_INTERVAL_MS").ok().as_deref());
             loop {
-                std::thread::sleep(Duration::from_secs(60));
+                std::thread::sleep(interval);
                 state.reload_if_asked();
+                if let Some(path) = std::env::var_os("USAGE_REPORT") {
+                    let json = state.usage.to_json();
+                    if json != last_usage {
+                        if let Err(e) = write_report(Path::new(&path), &json) {
+                            eprintln!(
+                                "fips-exitd: usage report {}: {e}",
+                                Path::new(&path).display()
+                            );
+                        } else {
+                            last_usage = json;
+                        }
+                    }
+                }
                 let c = &state.counters;
                 let now = (
                     c.to_internet.load(Ordering::Relaxed),
@@ -761,6 +921,102 @@ mod tests {
 
     /// The same vectors as fips2go's `exit::tests` and its exit container's
     /// `test_exitctl.py`: all three derive one address for one client.
+    #[test]
+    fn the_usage_report_is_json_a_gate_can_read() {
+        let usage = Usage::default();
+        let a = addr(A);
+        usage.record(a, 1024, Direction::FromClient);
+        usage.record(a, 64, Direction::ToClient);
+        let json = usage.to_json();
+        assert_eq!(
+            json,
+            format!(
+                "[{{\"client\":\"{}\",\"from_client_bytes\":1024,\
+                 \"to_client_bytes\":64,\"packets\":2}}]",
+                Ipv6Addr::from(a)
+            )
+        );
+        assert_eq!(Usage::default().to_json(), "[]");
+    }
+
+    /// The report interval is a minute unless `USAGE_REPORT_INTERVAL_MS` says
+    /// otherwise, and a value that is not a positive number of milliseconds is
+    /// not allowed to turn the loop into a spin: it falls back to the minute.
+    #[test]
+    fn the_report_interval_is_a_minute_unless_overridden_with_a_real_number() {
+        let minute = Duration::from_secs(60);
+        assert_eq!(report_interval(None), minute);
+        assert_eq!(report_interval(Some("200")), Duration::from_millis(200));
+        assert_eq!(report_interval(Some(" 2500 ")), Duration::from_millis(2500));
+        // Zero would busy-loop the report thread; not a number, not a duration.
+        assert_eq!(report_interval(Some("0")), minute);
+        assert_eq!(report_interval(Some("")), minute);
+        assert_eq!(report_interval(Some("-5")), minute);
+        assert_eq!(report_interval(Some("soon")), minute);
+        assert_eq!(report_interval(Some("1.5")), minute);
+        // A number too large for a Duration is a bad value too, not a panic.
+        assert_eq!(report_interval(Some("999999999999999999999")), minute);
+    }
+
+    #[test]
+    fn a_written_report_leaves_no_partial_file() {
+        let dir = std::env::temp_dir().join(format!("fips-exit-usage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage.json");
+        let usage = Usage::default();
+        usage.record(addr(A), 7, Direction::FromClient);
+        write_report(&path, &usage.to_json()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), usage.to_json());
+        // A stale reader never sees a truncated file: the write renames.
+        assert!(!dir.join("usage.json.tmp").exists());
+        // An existing report is replaced, not appended to.
+        usage.record(addr(A), 3, Direction::FromClient);
+        write_report(&path, &usage.to_json()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), usage.to_json());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn usage_is_counted_per_client_and_survives_a_list_reload() {
+        let usage = Usage::default();
+        let (a, b) = (addr(A), addr(B));
+        usage.record(a, 100, Direction::FromClient);
+        usage.record(a, 250, Direction::ToClient);
+        usage.record(b, 40, Direction::FromClient);
+        let snap = usage.snapshot();
+        // Sorted by address, one row per client, both directions in bytes.
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].0, Ipv6Addr::from(a));
+        assert_eq!((snap[0].1, snap[0].2, snap[0].3), (100, 250, 2));
+        assert_eq!((snap[1].1, snap[1].2, snap[1].3), (40, 0, 1));
+
+        // A second SIGHUP-driven list reload must not silently zero billing
+        // state: the daemon keeps usage in its own map for exactly this reason.
+        let state = State {
+            clients_path: "/nonexistent".into(),
+            clients: RwLock::new(Clients::default()),
+            counters: Counters::default(),
+            usage,
+        };
+        assert_eq!(state.usage.snapshot(), snap);
+    }
+
+    #[test]
+    fn usage_of_a_removed_client_is_still_reportable() {
+        let usage = Usage::default();
+        let a = addr(A);
+        usage.record(a, 10, Direction::FromClient);
+        // Dropping the client from the allow-list ends admission, not the
+        // record of what it already moved.
+        usage.record(addr(B), 5, Direction::FromClient);
+        let snap = usage.snapshot();
+        assert!(
+            snap.iter()
+                .any(|row| row.0 == Ipv6Addr::from(a) && row.1 == 10)
+        );
+        assert_eq!(snap.len(), 2);
+    }
+
     #[test]
     fn the_inner_address_follows_the_shared_formula() {
         let inner = |b1, b2, b3| {

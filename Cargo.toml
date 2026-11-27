@@ -8,6 +8,15 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+# BIP340 verification for the admission rule. `k256` is pure Rust on purpose:
+# the daemon cross-compiles to musl targets and must not need a C compiler for
+# its verifier. No default features, no RNG: this crate only verifies.
+k256 = { version = "0.13.4", default-features = false, features = ["arithmetic", "schnorr"] }
+sha2 = { version = "0.10.9", default-features = false }
+
+[dev-dependencies]
+serde_json = "1.0"
+hex = "0.4"
 
 [profile.release]
 strip = true

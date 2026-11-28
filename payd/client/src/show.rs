@@ -26,6 +26,32 @@ pub fn is_order_id(id: &str) -> bool {
     id.len() == 17 && id.starts_with('o') && id[1..].bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// A package's name as the service writes one: `p` and 16 small hex digits.
+pub fn is_package_id(id: &str) -> bool {
+    id.len() == 17 && id.starts_with('p') && id[1..].bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// JSON for a terminal or a program: the same value, with every character
+/// that is not plain ASCII written as an escape. What an exit put into a
+/// name stays in it, and does nothing to the terminal on its way.
+pub fn ascii(json: &Value) -> String {
+    let mut out = String::new();
+    for c in json.to_string().chars() {
+        match c {
+            ' '..='~' => out.push(c),
+            // Outside a string JSON has none of these, and inside one an
+            // escape is the same character.
+            c => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A package's key: 64 hex digits.
 pub fn is_key(key: &str) -> bool {
     key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
@@ -140,6 +166,16 @@ mod tests {
             assert!(!is_order_id(not), "{not}");
         }
         assert!(is_key(&"aB".repeat(32)) && !is_key(&"a".repeat(63)) && !is_key(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn json_goes_out_as_plain_ascii_and_is_the_same_value() {
+        let loud = serde_json::json!({ "name": "An exit\u{9b}2J\u{202e}\u{1b}[2J \u{1f600} caf\u{e9}", "n": 1 });
+        let out = ascii(&loud);
+        assert!(out.bytes().all(|b| (b' '..=b'~').contains(&b)), "{out:?}");
+        assert!(out.contains("\\u009b2J\\u202e\\u001b[2J \\ud83d\\ude00 caf\\u00e9"), "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), loud);
+        assert!(is_package_id("p0123456789abcdef") && !is_package_id("o0123456789abcdef") && !is_package_id("p../x"));
     }
 
     #[test]

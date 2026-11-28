@@ -16,6 +16,7 @@ fn main() -> ExitCode {
             env: &|name| std::env::var(name).ok(),
             tty,
             pace: None,
+            resolve: &fips_exit_pay::resolve,
         },
     );
     ExitCode::from(ended)

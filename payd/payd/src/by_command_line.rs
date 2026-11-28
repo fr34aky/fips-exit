@@ -46,12 +46,9 @@ impl Shop {
     async fn run(&self, line: &str, input: &str) -> (u8, String, String) {
         let mut args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
         args.insert(1, NPUB.to_string());
-        args.extend([
-            "--connect".to_string(),
-            self.at.to_string(),
-            "--state".to_string(),
-            self.state.display().to_string(),
-        ]);
+        // By its own name and port, at the socket it listens on here.
+        args.extend(["--port".to_string(), "5170".to_string(), "--connect".to_string(), self.at.to_string()]);
+        args.extend(["--state".to_string(), self.state.display().to_string()]);
         let input = input.to_string();
         tokio::task::spawn_blocking(move || {
             let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -62,6 +59,7 @@ impl Shop {
                     err: &mut err,
                     input: &mut input.as_bytes(),
                     env: &|_| None,
+                    resolve: &fips_exit_pay::resolve,
                     tty: true,
                     pace: Some(Duration::from_millis(300)),
                 },
@@ -86,6 +84,15 @@ impl Shop {
 
     fn kept(&self) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(self.state.join(format!("{NPUB}.json"))).unwrap()).unwrap()
+    }
+
+    /// The package used here, and its key, as they are kept.
+    fn kept_key(&self) -> (String, String) {
+        let kept = self.kept();
+        let package = kept["package"].as_str().unwrap().to_string();
+        let keys = kept["keys"].as_array().unwrap();
+        let key = keys.iter().find(|key| key["package"] == package.as_str()).unwrap()["key"].as_str().unwrap();
+        (package, key.to_string())
     }
 }
 
@@ -140,10 +147,9 @@ async fn a_token_buys_a_package_from_the_command_line() {
     );
     let key = key_in(&out);
     // The key is kept, in a file that is its owner's alone.
-    let kept = shop.kept();
-    assert_eq!(kept["key"], key.as_str());
+    let (package, kept) = shop.kept_key();
+    assert_eq!(kept, key);
     assert_eq!((mode(&shop.state), mode(&shop.state.join(format!("{NPUB}.json")))), (0o700, 0o600));
-    let package = kept["package"].as_str().unwrap().to_string();
     assert!(out.contains(&format!("package {package}")), "{out}");
     assert_eq!(shop.site.store.package_with_key(&key).unwrap().unwrap().id, package);
     // The key as it is kept, and the package it opens.
@@ -162,7 +168,7 @@ async fn a_token_buys_a_package_from_the_command_line() {
     assert_eq!(shop.site.store.sold(&shop.w.mint).unwrap(), 64);
     // It is answered with a key again, a new one: that is the one kept now.
     let (first, key) = (key, key_in(&out));
-    assert!(first != key && shop.kept()["key"] == key.as_str());
+    assert!(first != key && shop.kept_key().1 == key);
     // Another, from standard input, added to the same package by its key.
     let (ended, out, err) = shop.run("buy small --token-file - --add", &shop.w.token(64).await).await;
     assert_eq!(ended, DONE, "{err}");
@@ -190,13 +196,17 @@ async fn a_token_buys_a_package_from_the_command_line() {
     std::fs::write(&wrong, "ab".repeat(32)).unwrap();
     let (ended, _, err) = shop.run(&format!("package --key-file {}", wrong.display()), "").await;
     assert!(ended == FAILED && err.contains("no package has that key"), "{err}");
-    assert_eq!(shop.kept()["key"], key.as_str(), "a key that opened nothing is not kept");
+    assert_eq!(shop.kept_key(), (package.clone(), key.clone()), "a key that opened nothing is not kept");
     let (_, other_key) = shop.site.store.grant(1000, 0, &[], "another", crate::sync::unix_now()).unwrap();
     let other = shop.w.dir.join("other-key");
     std::fs::write(&other, &other_key).unwrap();
-    let (ended, out, _) = shop.run(&format!("package --key-file {}", other.display()), "").await;
+    let (ended, out, err) = shop.run(&format!("package --key-file {}", other.display()), "").await;
     assert!(ended == DONE && out.contains("1 kB left, with no end"), "{out}");
-    assert_eq!(shop.kept()["key"], other_key.as_str());
+    assert_eq!(shop.kept_key().1, other_key);
+    // The package bought here is not forgotten for it: said, and still opened.
+    assert!(err.contains(&format!("The key of {package} is kept still: --package {package}")), "{err}");
+    let (ended, out, _) = shop.run(&format!("package --package {package}"), "").await;
+    assert!(ended == DONE && out.starts_with(&format!("package {package}\n")), "{out}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -236,10 +246,7 @@ async fn an_invoice_is_shown_paid_and_buys_a_package_from_the_command_line() {
     assert!(out.contains(&format!("package {package}, with this node in it")), "{out}");
     let key = key_in(&out);
     assert_eq!(shop.site.store.package_with_key(&key).unwrap().unwrap().id, package);
-    assert_eq!(
-        (shop.kept()["key"].as_str(), shop.kept()["package"].as_str()),
-        (Some(key.as_str()), Some(package.as_str()))
-    );
+    assert_eq!(shop.kept_key(), (package.clone(), key.clone()));
     // Asked again, it is paid, and the key that is kept stays the key.
     let (ended, out, _) = shop.run("order", "").await;
     assert!(ended == DONE && out.contains("paid: 64 sat arrived") && !out.contains("its key"), "{out}");
@@ -248,7 +255,7 @@ async fn an_invoice_is_shown_paid_and_buys_a_package_from_the_command_line() {
     let (ended, out, _) = shop.run("key --new", "").await;
     let new = key_in(&out);
     assert!(ended == DONE && new != key && shop.site.store.package_with_key(&key).unwrap().is_none());
-    assert_eq!(shop.kept()["key"], new.as_str());
+    assert_eq!(shop.kept_key().1, new);
     // Bought and waited for in one go, added to that package by its key.
     let had = shop.site.store.orders(50).unwrap().len();
     let buying = shop.run("buy small --invoice --add --json", "");

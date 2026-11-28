@@ -514,15 +514,20 @@ fips-exit-pay leave npub1…                       # take this node out of the p
   anything on the node does, through fips, and asks only if it comes out as
   the address that follows from the npub: the mesh carries a connection
   to that address to the holder of that key and to nobody else. So there
-  is no TLS, and none is missing. `--connect <address>` names the address
-  by hand instead, and then nothing but you says who answers there.
-- **What it checks before it shows you something to pay**: that the terms
-  are of the kind it knows; that who answers says it is the exit you
-  named; that the order is for the price those terms name; that an invoice
-  asks for exactly that many sat (it reads the amount out of the invoice);
-  that an address is written as one; and that the order has not ended. If
-  one of them does not hold, nothing is shown. It cannot check whom an
-  invoice or an address pays: that is the exit's word, and its mint's.
+  is no TLS, and none is missing. `--connect <address>:<port>` names the
+  address by hand instead, and then nothing but you says who answers
+  there.
+- **What it checks before it shows you something to pay**, when it is
+  bought and whenever `order` shows it again: that the terms are of the
+  kind it knows; that who answers says it is the exit you named; that the
+  order is for the price that was written down when it was made (the
+  price the exit's terms named then); that an invoice asks for exactly
+  that many sat (it reads the amount out of the invoice); and that an
+  address is written as one. If one of them does not hold, nothing is
+  shown. An order that has ended by this node's clock while the exit says
+  it can be paid is shown with a warning: one of the two clocks is wrong.
+  It cannot check whom an invoice or an address pays: that is the exit's
+  word, and its mint's.
 - **A token is read from a file or from standard input**, not from the
   command line, which other users of the machine can read. The same token
   sent again is the same purchase, so when an answer is lost the command
@@ -530,14 +535,22 @@ fips-exit-pay leave npub1…                       # take this node out of the p
   running the same again is safe.
 - **What it keeps**: `~/.local/state/fips-exit-pay/<npub>.json` (or under
   `$XDG_STATE_HOME`; `--state <dir>` for another place), a file that is
-  yours alone, with the orders made at that exit and the key of the
-  package bought there. An order paid by invoice or on the chain is found
-  again by its name only, and a package is managed by its key only: the
-  exit tells neither to a node that has lost it. Whoever reads the file
-  manages the package. The key is printed when it is first had, too.
-- A package's key is asked for by itself once an invoice or an address is
-  paid. `key --new` asks the exit for another, and the one before opens
-  nothing any more.
+  yours alone, with the orders made at that exit and the keys of the
+  packages bought or used there. An order paid by invoice or on the chain
+  is found again by its name only, and a package is managed by its key
+  only: the exit tells neither to a node that has lost it. Whoever reads
+  the file manages the packages. A key is printed when it is first had,
+  too. The package last bought or used is the one the commands mean;
+  `--package <id>` means another whose key is kept. A file there that the
+  command cannot read as its own is left as it is, and said.
+- A package's key is asked for by itself when the command has waited for
+  an invoice or an address and sees it paid: nobody was shown that key.
+  Asked about later, an order's key is not asked for by itself, since a
+  key that is asked for replaces the one before, which another device of
+  yours may hold: `key --new` does it when you say so.
+- Waiting ends by itself, with 3, when the exit has not answered sixty
+  times in a row, or an order is still not decided an hour after its end.
+  The order stays, and `order` asks again.
 - For a program: `--json` prints the exit's own answers, a line each. The
   command ends with 0 when it is done, 1 when the exit refused or it
   failed, 3 when it is not decided yet (an order that waits, a token whose

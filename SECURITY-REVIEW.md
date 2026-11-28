@@ -188,15 +188,22 @@ IPv4 address derived from the client's fips address.
     answer is read with a deadline, 256 KiB at the most, and is one JSON
     object with its length or it is nothing; a body in pieces is refused.
     Of it, text reaches the terminal only through one function (one line,
-    no control or hidden character, a length), and JSON only re-encoded.
+    no control or hidden character, a length), and JSON (`--json`) only
+    written again here, with every character that is not plain ASCII as
+    an escape.
     Nothing in it names a file: the state file's name is the npub the user
     typed, checked as an npub, and an order's name goes into a path only
     if it is `o` and 16 hex digits. Before an invoice or an address is
-    shown to be paid: the terms' version, the exit's npub in its own
-    terms, the order's price against those terms, the amount written in
-    the invoice against that price, the form of an address, and the order's
-    end. The state file is written whole, to a new file of mode 0600 in a
-    directory of mode 0700, and renamed.
+    shown to be paid, when it is ordered and each time `order` shows it:
+    the terms' version, the exit's npub in its own terms, the order's
+    price against the one written down here when it was made (the terms'
+    then; the terms' now for an order this node did not write down), the
+    amount written in the invoice against that price, and the form of an
+    address. No key is asked for unless the user says so or the command
+    itself has just seen the payment arrive: asking replaces the key
+    before. The state file is written whole, under a lock, to a new file
+    of mode 0600 in a directory of mode 0700, and renamed; one that is
+    there and is not this program's is not written over.
 
 ## Things that would be serious in this codebase
 
@@ -428,8 +435,10 @@ IPv4 address derived from the client's fips address.
   as anything but words (an escape sequence in a name, an error or a
   package's id); an answer that makes the command read without end, write
   outside its state directory, or ask for a path of the exit's choosing;
-  a key or a token on a command line, where another user reads it; and a
-  state file that another user can read.
+  a key or a token on a command line, where another user reads it; a
+  state file that another user can read; a key of a package replaced at
+  the exit, or dropped from the state file, without the user having asked
+  for that; and a command that waits for an exit without end.
 
 ## Known gaps — real, not yet fixed
 

@@ -46,12 +46,16 @@ pub enum Failed {
     /// The request was sent, or may have been, and what became of it is
     /// not known.
     NotKnown(String),
+    /// Refused, and not in an exit's words: the service turns away what
+    /// it does not read (too long, to another name than its own) with a
+    /// line of text. Sent again, it is refused again.
+    Refused(String),
 }
 
 impl Failed {
     pub fn said(&self) -> &str {
         match self {
-            Failed::NotReached(why) | Failed::NotKnown(why) => why,
+            Failed::NotReached(why) | Failed::NotKnown(why) | Failed::Refused(why) => why,
         }
     }
 }
@@ -93,7 +97,13 @@ pub fn ask(exit: &Exit, method: &str, path: &str, body: Option<&Value>, patience
             return Err(Failed::NotKnown(format!("no answer in time from {}", exit.host)));
         }
     }
-    read(&answer).map_err(|why| Failed::NotKnown(format!("{} answered with {why}", exit.host)))
+    read(&answer).map_err(|(status, why)| match status {
+        Some(status) if (400..500).contains(&status) => Failed::Refused(format!(
+            "{} refused, with {status} and not in an exit's words: is this its payment service, asked at its own port?",
+            exit.host
+        )),
+        _ => Failed::NotKnown(format!("{} answered with {why}", exit.host)),
+    })
 }
 
 /// What is left until `until`, and never nothing: a timeout of zero is no
@@ -102,10 +112,12 @@ fn left(until: Instant) -> Duration {
     until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))
 }
 
-/// An answer as it came: a status, and a body that is one JSON object.
-fn read(answer: &[u8]) -> Result<Answer, String> {
-    let split = answer.windows(4).position(|w| w == b"\r\n\r\n").ok_or("what is no HTTP answer")?;
-    let head = std::str::from_utf8(&answer[..split]).map_err(|_| "what is no HTTP answer")?;
+/// An answer as it came: a status, and a body that is one JSON object. Or
+/// why it is none; with its status where it has one and is not JSON.
+fn read(answer: &[u8]) -> Result<Answer, (Option<u16>, String)> {
+    let no = |why: &str| (None, why.to_string());
+    let split = answer.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| no("what is no HTTP answer"))?;
+    let head = std::str::from_utf8(&answer[..split]).map_err(|_| no("what is no HTTP answer"))?;
     let body = &answer[split + 4..];
     let mut lines = head.split("\r\n");
     let status = lines
@@ -114,28 +126,28 @@ fn read(answer: &[u8]) -> Result<Answer, String> {
         .and_then(|rest| rest.get(..3))
         .and_then(|digits| digits.parse::<u16>().ok())
         .filter(|status| (200..600).contains(status))
-        .ok_or("what is no HTTP answer")?;
+        .ok_or_else(|| no("what is no HTTP answer"))?;
     let (mut json, mut length) = (false, None);
     for line in lines {
-        let (name, value) = line.split_once(':').ok_or("what is no HTTP answer")?;
+        let (name, value) = line.split_once(':').ok_or_else(|| no("what is no HTTP answer"))?;
         let value = value.trim();
         match name.to_ascii_lowercase().as_str() {
             "content-type" => json = value.to_ascii_lowercase().starts_with("application/json"),
-            "content-length" => length = Some(value.parse::<usize>().map_err(|_| "a length that is none")?),
+            "content-length" => length = Some(value.parse::<usize>().map_err(|_| no("a length that is none"))?),
             // The service sends a body whole, with its length.
-            "transfer-encoding" => return Err("a body in pieces, which this program does not read".into()),
+            "transfer-encoding" => return Err(no("a body in pieces, which this program does not read")),
             _ => {}
         }
     }
     if length.is_some_and(|length| length != body.len()) {
-        return Err("less than it said it would".into());
+        return Err(no("less than it said it would"));
     }
     if !json {
-        return Err(format!("{status}, and not with JSON: is this an exit's payment service?"));
+        return Err((Some(status), format!("{status}, and not with JSON: is this an exit's payment service?")));
     }
-    let body: Value = serde_json::from_slice(body).map_err(|_| "what is not JSON")?;
+    let body: Value = serde_json::from_slice(body).map_err(|_| no("what is not JSON"))?;
     if !body.is_object() {
-        return Err("JSON that is no object".into());
+        return Err(no("JSON that is no object"));
     }
     Ok(Answer { status, body })
 }
@@ -233,6 +245,21 @@ mod tests {
             let failed = ask(&exit, "GET", "/v1/terms", None, SOON).unwrap_err();
             assert!(matches!(failed, Failed::NotKnown(_)), "{failed:?}");
             assert!(!failed.said().contains('\u{1b}') && failed.said().len() < 300, "{failed:?}");
+        }
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn a_refusal_in_a_line_of_text_is_a_refusal_and_not_something_unknown() {
+        let text = |status: &str| format!("HTTP/1.1 {status}\r\ncontent-type: text/plain\r\n\r\nno\n").into_bytes();
+        let (exit, served) = service(vec![
+            text("413 Payload Too Large"),
+            text("421 Misdirected Request"),
+            text("500 Internal Server Error"),
+        ]);
+        for refused in [true, true, false] {
+            let failed = ask(&exit, "GET", "/v1/terms", None, SOON).unwrap_err();
+            assert_eq!(matches!(failed, Failed::Refused(_)), refused, "{failed:?}");
         }
         served.join().unwrap();
     }

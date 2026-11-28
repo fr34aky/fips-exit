@@ -29,7 +29,9 @@
 //!
 //! An order is given up only on the mint's word, asked after its invoice
 //! has ended. One that was paid while this service was not running is
-//! found at its next start, however late that is.
+//! found at its next start, however late that is. An invoice is shown to
+//! its buyer only while it can be paid: not once it has ended, though the
+//! order is still asked about for a while then.
 //!
 //! An order is its buyer's: the address that asked sees it, and nobody
 //! else. The package it makes has a key that nobody was shown. Its buyer
@@ -72,6 +74,14 @@ const LOOK: Duration = Duration::from_secs(3);
 const PACE: (u64, u64) = (5, 60);
 /// How long an order that was given up is still there to be asked about.
 const KEPT: u64 = 86_400;
+/// An invoice is given to a buyer only if it lasts this long, in seconds:
+/// one that ends before it can be paid is a way to lose what is paid.
+const LIFE: u64 = 60;
+/// What is asked for again within this many seconds is the order there is
+/// for it already: a form sent twice makes one invoice.
+const SAME: u64 = 60;
+/// How long a request waits for another of its address that is under way.
+const UNDER_WAY: Duration = Duration::from_secs(5);
 /// How often the page of an invoice that waits looks again, in seconds.
 const REFRESH: &str = "5";
 
@@ -86,10 +96,11 @@ pub struct Waiting {
     recounted: Mutex<HashSet<String>>,
     /// Told when there is an invoice to look at.
     pub look: Notify,
-    /// [`LOOK`], [`GRACE`] and [`PACE`], which a test shortens.
+    /// [`LOOK`], [`GRACE`], [`PACE`] and [`LIFE`], which a test shortens.
     pub every: Duration,
     pub grace: u64,
     pub pace: (u64, u64),
+    pub life: u64,
 }
 
 impl Default for Waiting {
@@ -101,6 +112,7 @@ impl Default for Waiting {
             every: LOOK,
             grace: GRACE,
             pace: PACE,
+            life: LIFE,
         }
     }
 }
@@ -159,11 +171,31 @@ pub async fn order(site: &Arc<Site>, caller: Ipv6Addr, asked: &Asked, until: Ins
         .await
         .map_err(|_| Fault::Again)??;
     let id = Store::order_id()?;
+    // The same asked again a moment later (a form sent twice) is the order
+    // there is for it already.
+    let there_is = || {
+        let now = unix_now();
+        let (since, lasts) = (now.saturating_sub(SAME), now.saturating_add(desk.invoices.life));
+        site.store.invoice_recent(caller, &mint.name, &offer.id, target.as_deref(), since, lasts)
+    };
     // One at a time for an address: so that what it has waiting is counted
-    // before another is added to it.
-    let _at_work = desk.enter(&id, caller).ok_or(Fault::Busy)?;
-    let now = unix_now();
-    let (its, all) = site.store.invoices_waiting(caller, now)?;
+    // before another is added to it. Another request of this address that
+    // is under way is waited for a little: it may be making that order.
+    let patience = Instant::now() + UNDER_WAY;
+    let _at_work = loop {
+        if let Some(order) = there_is()? {
+            return Ok(order);
+        }
+        match desk.enter(&id, caller) {
+            Some(at_work) => break at_work,
+            None if Instant::now() < patience.min(until) => tokio::time::sleep(Duration::from_millis(200)).await,
+            None => return Err(Fault::UnderWay),
+        }
+    };
+    if let Some(order) = there_is()? {
+        return Ok(order);
+    }
+    let (its, all) = site.store.invoices_waiting(caller, unix_now())?;
     if its >= WAITING_FOR_ONE {
         return Err(Fault::TooMany(its));
     }
@@ -176,14 +208,19 @@ pub async fn order(site: &Arc<Site>, caller: Ipv6Addr, asked: &Asked, until: Ins
         mint.invoice(offer.sat, &about).await
     };
     let quote = match tokio::time::timeout_at(until, of_the_mint).await {
-        Ok(Ok(quote)) if quote.expires > now => quote,
-        Ok(Ok(_)) => return Err(Fault::NoInvoice(format!("The mint {} gave an invoice that has ended.", mint.name))),
+        Ok(Ok(quote)) => quote,
         Ok(Err(e)) => {
             eprintln!("fips-exit-payd: {}: no invoice of {} sat: {e}", mint.name, offer.sat);
             return Err(Fault::NoInvoice(format!("The mint {} gave no invoice: {e}", mint.name)));
         }
         Err(_) => return Err(Fault::Again),
     };
+    // By the clock as it is now, the mint having answered: an invoice that
+    // ends before it can be paid is not given to anyone.
+    let now = unix_now();
+    if quote.expires < now.saturating_add(desk.invoices.life) {
+        return Err(Fault::NoInvoice(format!("The mint {} gave an invoice that ends too soon to pay.", mint.name)));
+    }
     // Written down before anyone sees the invoice. If this does not come to
     // pass, the mint has a quote nobody knows how to pay.
     let new = NewInvoice {
@@ -246,13 +283,39 @@ pub fn new_key(site: &Site, caller: Ipv6Addr, id: &str) -> Result<(Order, String
     Ok((order, key))
 }
 
-/// `waiting`, `paid`, or `expired`: given up, its invoice having ended
-/// unpaid.
-fn state(order: &Order) -> &'static str {
-    match order {
-        order if order.paid => "paid",
-        order if order.ended > 0 => "expired",
-        _ => "waiting",
+/// What an order has come to, as its buyer is told.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum State {
+    /// Its invoice can be paid.
+    Waiting,
+    /// Nothing can be paid for it now, and what became of it is still being
+    /// found out: its invoice has ended and may have been paid in time, its
+    /// mint is not one this exit takes any more, or it is a token's order
+    /// whose mint has not answered.
+    Checking,
+    Paid,
+    /// Given up: its invoice ended unpaid.
+    Expired,
+}
+
+impl State {
+    fn of(site: &Site, order: &Order, now: u64) -> State {
+        let taken_here = || site.desk.as_ref().is_some_and(|desk| desk.wallets.named(&order.mint).is_some());
+        match order {
+            order if order.paid => State::Paid,
+            order if order.ended > 0 => State::Expired,
+            order if order.method == BOLT11 && now < order.expires && taken_here() => State::Waiting,
+            _ => State::Checking,
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            State::Waiting => "waiting",
+            State::Checking => "checking",
+            State::Paid => "paid",
+            State::Expired => "expired",
+        }
     }
 }
 
@@ -261,11 +324,12 @@ fn added(order: &Order) -> bool {
     order.target.is_some() && order.target == order.package
 }
 
-/// An order, for a program.
-pub fn view(order: &Order) -> serde_json::Value {
+/// An order, for a program. Its invoice is in it only while it can be paid.
+pub fn view(site: &Site, order: &Order) -> serde_json::Value {
+    let state = State::of(site, order, unix_now());
     let mut said = serde_json::json!({
         "order": order.id,
-        "state": state(order),
+        "state": state.word(),
         "method": order.method,
         "offer": order.offer,
         "bytes": order.bytes,
@@ -277,7 +341,7 @@ pub fn view(order: &Order) -> serde_json::Value {
         said["paid_sat"] = order.paid_sat.into();
         said["added"] = added(order).into();
         said["package"] = serde_json::json!({ "id": order.package });
-    } else if order.ended == 0 && order.method == BOLT11 {
+    } else if state == State::Waiting {
         said["request"] = order.request.clone().into();
         said["expires"] = order.expires.into();
     }
@@ -367,8 +431,23 @@ async fn look_at(site: &Site, desk: &Desk, mint: &Mint, order: &Order) {
     }
 }
 
-/// Look at the invoice that is most due, if one is. How many wait.
-async fn round(site: &Site, desk: &Desk, looked: &mut HashMap<String, Instant>) -> usize {
+/// What the one who looks at invoices remembers from one look to the next.
+#[derive(Default)]
+pub struct Looks {
+    /// When each waiting order was last looked at, since the service
+    /// started.
+    looked: HashMap<String, Instant>,
+    /// Whether the last look went to an order because its buyer asked: the
+    /// next goes to the one not looked at for longest, whoever asks.
+    asked_last: bool,
+    /// The orders said, in the log, to wait for a mint that is not taken
+    /// here any more.
+    stranded: HashSet<String>,
+}
+
+/// Look at the invoice that is most due, if one is. How many wait at a mint
+/// that is taken here.
+async fn round(site: &Site, desk: &Desk, looks: &mut Looks) -> usize {
     let now = unix_now();
     if let Err(e) = site.store.invoices_forget(now.saturating_sub(KEPT)) {
         eprintln!("fips-exit-payd: orders that were given up could not be forgotten: {e}");
@@ -380,36 +459,58 @@ async fn round(site: &Site, desk: &Desk, looked: &mut HashMap<String, Instant>) 
             return 0;
         }
     };
-    looked.retain(|id, _| open.iter().any(|order| order.id == *id));
-    desk.invoices.recounted.lock().unwrap_or_else(|p| p.into_inner()).retain(|id| open.iter().any(|o| o.id == *id));
+    let waits = |id: &String| open.iter().any(|order| order.id == *id);
+    looks.looked.retain(|id, _| waits(id));
+    looks.stranded.retain(|id| waits(id));
+    desk.invoices.recounted.lock().unwrap_or_else(|p| p.into_inner()).retain(|id| waits(id));
     let wanted: HashSet<String> = {
         let mut wanted = desk.invoices.wanted();
-        wanted.retain(|id| open.iter().any(|order| order.id == *id));
+        wanted.retain(|id| waits(id));
         wanted.clone()
     };
-    // Of those that are due at a mint that is there: one that is asked
-    // about first, and then the one not looked at for longest.
-    let ago = |order: &Order| looked.get(&order.id).map(Instant::elapsed);
-    let next = open
+    // An invoice of a mint that was taken out of MINTS cannot be asked
+    // about: what is paid for it is at that mint, and the order is kept,
+    // with what claims it, until the mint is taken here again. Said once.
+    let (here, stranded): (Vec<&Order>, Vec<&Order>) =
+        open.iter().partition(|order| desk.wallets.named(&order.mint).is_some());
+    for order in stranded {
+        if looks.stranded.insert(order.id.clone()) {
+            eprintln!(
+                "fips-exit-payd: ORDER {} WAITS FOR AN INVOICE OF {}, WHICH IS NOT AMONG MINTS ANY MORE. If it is \
+                 paid, what was paid is at that mint, and nothing is granted for it: put the mint back in MINTS \
+                 until `fips-exit orders` shows no order of it open.",
+                order.id, order.mint
+            );
+        }
+    }
+    // Of those that are due at a mint that is reached: one whose buyer is
+    // asking, and then the one not looked at for longest. Every other look
+    // goes to the one not looked at for longest whoever is asking, so that
+    // those who ask do not keep everyone else from being looked at.
+    let ago = |order: &Order| looks.looked.get(&order.id).map(Instant::elapsed);
+    let asked = |order: &Order| wanted.contains(&order.id);
+    let fair = looks.asked_last;
+    let next = here
         .iter()
-        .filter(|order| due(order, wanted.contains(&order.id), ago(order), &desk.invoices, now))
-        .filter_map(|order| Some((order, desk.wallets.named(&order.mint).filter(|mint| mint.ready())?)))
-        .max_by_key(|(order, _)| (wanted.contains(&order.id), ago(order).is_none(), ago(order)));
+        .filter(|order| due(order, asked(order), ago(order), &desk.invoices, now))
+        .filter_map(|order| Some((*order, desk.wallets.named(&order.mint).filter(|mint| mint.ready())?)))
+        .max_by_key(|(order, _)| (!fair && asked(order), ago(order).is_none(), ago(order)));
     if let Some((order, mint)) = next {
-        looked.insert(order.id.clone(), Instant::now());
+        looks.asked_last = !fair && asked(order);
+        looks.looked.insert(order.id.clone(), Instant::now());
         desk.invoices.wanted().remove(&order.id);
         look_at(site, desk, mint, order).await;
     }
-    open.len()
+    here.len()
 }
 
 /// Look at the invoices that wait, for as long as the service runs: one at
 /// a time, [`LOOK`] apart, and not at all while there are none.
 pub async fn keep(site: Arc<Site>) {
     let Some(desk) = site.desk.clone() else { return };
-    let mut looked = HashMap::new();
+    let mut looks = Looks::default();
     loop {
-        let waiting = round(&site, &desk, &mut looked).await;
+        let waiting = round(&site, &desk, &mut looks).await;
         tokio::time::sleep(desk.invoices.every).await;
         if waiting == 0 {
             tokio::select! {
@@ -459,13 +560,24 @@ fn order_page(site: &Site, caller: Ipv6Addr, order: &Order) -> Response<Full<Byt
         body.push_str(back);
         return page(StatusCode::OK, "Paid", &body);
     }
-    if order.ended > 0 || order.method != BOLT11 {
-        let said = if order.ended > 0 {
-            "This order's invoice ended unpaid. Nothing was bought."
-        } else {
-            "What became of this order's token is not known yet."
-        };
+    let state = State::of(site, order, unix_now());
+    if state == State::Expired {
+        let said = "This order's invoice ended unpaid. Nothing was bought.";
         return page(StatusCode::OK, "Not bought", &format!("<p class=\"note\">{said}</p>\n{back}"));
+    }
+    if state == State::Checking {
+        // Nothing to pay here now: no invoice, no code, no link.
+        let said = if order.method != BOLT11 {
+            "What became of this order's token is not known yet."
+        } else if unix_now() >= order.expires {
+            "This order's invoice has ended: it cannot be paid any more. If it was paid before it ended, the \
+             payment is still looked for, and this page says so when it is found."
+        } else {
+            "This exit does not take payments at this order's mint any more: do not pay its invoice."
+        };
+        let mut checking = page(StatusCode::OK, "Not paid", &format!("<p class=\"note\">{said}</p>\n{back}"));
+        checking.headers_mut().insert("refresh", HeaderValue::from_static(REFRESH));
+        return checking;
     }
     let request = order.request.as_deref().unwrap_or_default();
     let adds = match &order.target {
@@ -508,7 +620,7 @@ pub async fn respond(
 ) -> Response<Full<Bytes>> {
     match (kind, order(site, caller, asked, until).await) {
         (_, Err(fault)) => refuse_as(kind, &fault, false),
-        (Kind::Json, Ok(order)) => json(StatusCode::CREATED, &view(&order)),
+        (Kind::Json, Ok(order)) => json(StatusCode::CREATED, &view(site, &order)),
         (Kind::Form, Ok(order)) => see(&order),
     }
 }
@@ -517,7 +629,7 @@ pub async fn respond(
 pub fn read(site: &Site, caller: Ipv6Addr, id: &str, kind: Kind) -> Response<Full<Bytes>> {
     match (kind, of(site, caller, id)) {
         (_, Err(fault)) => refuse_as(kind, &fault, false),
-        (Kind::Json, Ok(order)) => json(StatusCode::OK, &view(&order)),
+        (Kind::Json, Ok(order)) => json(StatusCode::OK, &view(site, &order)),
         (Kind::Form, Ok(order)) => order_page(site, caller, &order),
     }
 }
@@ -565,6 +677,7 @@ mod tests {
     use super::*;
     use crate::orders::testing::{world, world_with};
     use crate::store::Standing;
+    use crate::wallet::Wallets;
 
     const BUYER: &str = "fd77::7";
     const OTHER: &str = "fd88::8";
@@ -591,13 +704,10 @@ mod tests {
         order(site, a(caller), &by_invoice(package, key), soon()).await
     }
 
-    /// The service's rounds, as one who looks at invoices would make them.
-    #[derive(Default)]
-    struct Looks(HashMap<String, Instant>);
-
+    /// The service's rounds, as the one who looks at invoices makes them.
     impl Looks {
         async fn look(&mut self, site: &Arc<Site>) -> usize {
-            round(site, site.desk.as_ref().unwrap(), &mut self.0).await
+            round(site, site.desk.as_ref().unwrap(), self).await
         }
 
         /// Look until order `id` is not waiting any more, or a while has
@@ -633,7 +743,7 @@ mod tests {
         assert!((now + 3500..=now + 3600).contains(&ordered.expires), "it ends when the mint says");
         assert!(ordered.quote.is_some() && ordered.quote_key.is_some(), "the quote, and the key it is locked to");
         // Its buyer sees it, and nobody else that it is there.
-        let seen = view(&of(&w.site, a(BUYER), &ordered.id).unwrap());
+        let seen = view(&w.site, &of(&w.site, a(BUYER), &ordered.id).unwrap());
         assert_eq!(
             (&seen["state"], &seen["request"], &seen["expires"]),
             (&"waiting".into(), &request.clone().into(), &ordered.expires.into())
@@ -661,7 +771,7 @@ mod tests {
         );
         assert_eq!(package.standing(unix_now()), Standing::Live);
         assert_eq!((w.holds().await, w.site.store.sold(&w.mint).unwrap()), (64, 64));
-        let seen = view(&of(&w.site, a(BUYER), &ordered.id).unwrap());
+        let seen = view(&w.site, &of(&w.site, a(BUYER), &ordered.id).unwrap());
         assert_eq!((&seen["state"], &seen["paid_sat"], &seen["added"]), (&"paid".into(), &64.into(), &false.into()));
         assert_eq!(seen["package"]["id"], package.id.as_str());
         assert!(seen.get("request").is_none(), "{seen}");
@@ -677,7 +787,7 @@ mod tests {
         // An order paid with a token gives its key to the token, not here.
         let with_token = w.buy(OTHER, "small", &w.token(64).await, None).await.unwrap();
         assert_eq!(new_key(&w.site, a(OTHER), &with_token.order), Err(Fault::NoNewKey));
-        assert_eq!(view(&of(&w.site, a(OTHER), &with_token.order).unwrap())["method"], "cashu");
+        assert_eq!(view(&w.site, &of(&w.site, a(OTHER), &with_token.order).unwrap())["method"], "cashu");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -694,7 +804,7 @@ mod tests {
         assert!(paid.paid && paid.package == paid.target, "{paid:?}");
         let package = w.site.store.package(&first.settled.package.id).unwrap().unwrap();
         assert_eq!((package.granted, package.members.clone()), (1_010_000_000, vec![a(BUYER)]));
-        assert_eq!(view(&paid)["added"], true);
+        assert_eq!(view(&w.site, &paid)["added"], true);
         assert_eq!(
             new_key(&w.site, a(OTHER), &ordered.id),
             Err(Fault::NoNewKey),
@@ -716,8 +826,19 @@ mod tests {
         let mut looks = Looks::default();
         assert_eq!(looks.look(&w.site).await, 1);
         assert_eq!(w.site.store.order(&ordered.id).unwrap().unwrap().ended, 0, "not before it has ended");
-        // Ended, and the mint cannot be asked: it is not given up on that.
+        // Ended: it is not shown to be paid any more, as JSON or on its page,
+        // though it is still asked about.
         tokio::time::sleep(Duration::from_millis(2600)).await;
+        let seen = view(&w.site, &of(&w.site, a(BUYER), &ordered.id).unwrap());
+        assert_eq!(seen["state"], "checking");
+        assert!(seen.get("request").is_none() && seen.get("expires").is_none(), "{seen}");
+        let page = read(&w.site, a(BUYER), &ordered.id, Kind::Form);
+        assert_eq!(page.headers()["refresh"], "5", "it looks again: a payment made in time may yet be found");
+        let page = body(page).await;
+        assert!(page.contains("has ended: it cannot be paid any more"), "{page}");
+        assert!(!page.contains("lnbc") && !page.contains("<svg") && !page.contains("lightning:"), "{page}");
+        assert_eq!(w.site.store.invoices_waiting(a(BUYER), unix_now()).unwrap(), (0, 0), "it keeps nobody's place");
+        // The mint cannot be asked: it is not given up on that.
         w.proxy.go_away();
         assert!(w.the_mint().reach().await.is_err());
         assert_eq!(looks.look(&w.site).await, 1);
@@ -726,7 +847,7 @@ mod tests {
         w.the_mint().reach().await.unwrap();
         let ended = looks.until_decided(&w.site, &ordered.id).await;
         assert!(!ended.paid && ended.ended > 0, "{ended:?}");
-        let seen = view(&of(&w.site, a(BUYER), &ordered.id).unwrap());
+        let seen = view(&w.site, &of(&w.site, a(BUYER), &ordered.id).unwrap());
         assert_eq!(seen["state"], "expired");
         assert!(seen.get("request").is_none(), "nothing to pay any more: {seen}");
         assert_eq!(new_key(&w.site, a(BUYER), &ordered.id), Err(Fault::NotPaid));
@@ -823,17 +944,26 @@ mod tests {
     async fn invoices_are_few_for_an_address_and_for_all() {
         let w = world(0, GIVE_UP).await;
         w.hold().await;
-        let mut waiting = Vec::new();
-        for _ in 0..WAITING_FOR_ONE {
-            waiting.push(ask(&w.site, BUYER, "small", None).await.unwrap());
-        }
-        assert_eq!(ask(&w.site, BUYER, "small", None).await, Err(Fault::TooMany(3)));
+        let (_, key) = w.site.store.grant(1000, 0, &[], "another", unix_now()).unwrap();
+        let small = ask(&w.site, BUYER, "small", None).await.unwrap();
+        let big = ask(&w.site, BUYER, "big", None).await.unwrap();
+        let added = ask(&w.site, BUYER, "small", Some(&key)).await.unwrap();
+        assert!(small.id != big.id && small.id != added.id && small.request != added.request);
+        assert_eq!(ask(&w.site, BUYER, "big", Some(&key)).await, Err(Fault::TooMany(3)));
         assert_eq!(Fault::TooMany(3).status(), StatusCode::TOO_MANY_REQUESTS);
-        ask(&w.site, OTHER, "small", None).await.unwrap();
-        // One that is paid waits no more, and makes room.
-        w.pay(waiting[0].request.as_deref().unwrap()).await;
-        assert!(Looks::default().until_decided(&w.site, &waiting[0].id).await.paid);
-        ask(&w.site, BUYER, "small", None).await.unwrap();
+        // The same asked again is the order there is for it, not a fourth:
+        // a form sent twice makes one invoice.
+        assert_eq!(ask(&w.site, BUYER, "small", None).await.unwrap().id, small.id);
+        assert_eq!(ask(&w.site, BUYER, "small", Some(&key)).await.unwrap().id, added.id);
+        // And at the same moment: one asks the mint, the other waits for it.
+        let (one, other) = tokio::join!(ask(&w.site, OTHER, "small", None), ask(&w.site, OTHER, "small", None));
+        assert_eq!(one.unwrap().id, other.unwrap().id);
+        assert_eq!(w.site.store.invoices_waiting(a(OTHER), unix_now()).unwrap(), (1, 4));
+        // One that is paid waits no more, and makes room; what is asked
+        // then is a new order.
+        w.pay(small.request.as_deref().unwrap()).await;
+        assert!(Looks::default().until_decided(&w.site, &small.id).await.paid);
+        assert!(ask(&w.site, BUYER, "small", None).await.unwrap().id != small.id);
         // Each is asked of a mint from the same budget as a token is taken:
         // ten at once, for everyone together.
         let mut asked = 5;
@@ -846,6 +976,110 @@ mod tests {
         assert_eq!((busy, asked), (Fault::Busy, 10));
         assert!(Fault::Busy.words(false).contains("invoices") && !Fault::Busy.words(false).contains("token"));
         assert_eq!(w.buy("fd99::99", "small", &w.token(64).await, None).await, Err(Fault::Busy), "a token's too");
+        // What is asked for again costs nothing of it.
+        assert_eq!(ask(&w.site, BUYER, "big", None).await.unwrap().id, big.id);
+    }
+
+    /// Those who ask about their orders do not keep the others from being
+    /// looked at: every other look goes to whichever waited longest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_order_nobody_asks_about_is_looked_at_all_the_same() {
+        let w = world(0, GIVE_UP).await;
+        w.hold().await;
+        let asked_about = ask(&w.site, BUYER, "small", None).await.unwrap();
+        let mut looks = Looks::default();
+        // Looked at once each, so that neither is new to the one who looks.
+        looks.look(&w.site).await;
+        looks.look(&w.site).await;
+        let quiet = ask(&w.site, OTHER, "small", None).await.unwrap();
+        looks.look(&w.site).await;
+        let at = |looks: &Looks, order: &Order| looks.looked[&order.id];
+        for _ in 0..3 {
+            // Its buyer asks, over and over: a look for it, and then one for
+            // the other, which nobody asks about.
+            of(&w.site, a(BUYER), &asked_about.id).unwrap();
+            let (before, quiet_before) = (at(&looks, &asked_about), at(&looks, &quiet));
+            looks.look(&w.site).await;
+            assert!(at(&looks, &asked_about) > before && at(&looks, &quiet) == quiet_before);
+            of(&w.site, a(BUYER), &asked_about.id).unwrap();
+            let before = at(&looks, &asked_about);
+            looks.look(&w.site).await;
+            assert!(at(&looks, &asked_about) == before && at(&looks, &quiet) > quiet_before, "the other's turn");
+        }
+        // So one that is paid with nobody watching is found among them.
+        w.pay(quiet.request.as_deref().unwrap()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for _ in 0..2 {
+            of(&w.site, a(BUYER), &asked_about.id).unwrap();
+            looks.look(&w.site).await;
+        }
+        assert!(w.site.store.order(&quiet.id).unwrap().unwrap().paid);
+    }
+
+    /// An invoice of a mint that was taken out of MINTS: nothing can be
+    /// asked about it, so it is not shown to be paid, and it is not given
+    /// up either; with the mint back, what was paid is found.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invoice_of_a_mint_that_is_not_taken_any_more_waits_for_it() {
+        let w = world(0, GIVE_UP).await;
+        w.hold().await;
+        let ordered = ask(&w.site, BUYER, "small", None).await.unwrap();
+        let another = fips_exit_test_mint::start("127.0.0.1:0".parse().unwrap(), 0).await.unwrap();
+        let dir = w.dir.join("without");
+        std::fs::create_dir(&dir).unwrap();
+        let wallets = Wallets::open(&dir, std::slice::from_ref(&another)).await.unwrap();
+        wallets.mints[0].reach().await.unwrap();
+        let without = w.with_wallets(wallets);
+        let mut looks = Looks::default();
+        assert_eq!(looks.look(&without).await, 0, "none that can be looked at");
+        assert!(looks.stranded.contains(&ordered.id), "and it is said, once");
+        let seen = view(&without, &of(&without, a(BUYER), &ordered.id).unwrap());
+        assert_eq!(seen["state"], "checking");
+        assert!(seen.get("request").is_none(), "{seen}");
+        let page = body(read(&without, a(BUYER), &ordered.id, Kind::Form)).await;
+        assert!(
+            page.contains("does not take payments at this order&#39;s mint any more")
+                || page.contains("order's mint any more"),
+            "{page}"
+        );
+        assert!(!page.contains("lnbc"), "{page}");
+        let kept = without.store.order(&ordered.id).unwrap().unwrap();
+        assert!(!kept.paid && kept.ended == 0);
+        // Paid all the same, and the mint taken again: found.
+        w.pay(ordered.request.as_deref().unwrap()).await;
+        assert!(Looks::default().until_decided(&w.site, &ordered.id).await.paid);
+    }
+
+    /// The wallet's file knows the quote and not its key (it learnt the
+    /// quote from the mint, and stopped before it had the key from the
+    /// order): the key is put to it whenever it is missing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quote_the_wallet_has_without_its_key_gets_it_from_the_order() {
+        let w = world(0, GIVE_UP).await;
+        w.hold().await;
+        let ordered = ask(&w.site, BUYER, "small", None).await.unwrap();
+        w.the_mint().forget_key(ordered.quote.as_deref().unwrap()).await;
+        w.pay(ordered.request.as_deref().unwrap()).await;
+        let paid = Looks::default().until_decided(&w.site, &ordered.id).await;
+        assert!(paid.paid && w.holds().await == 64, "{paid:?}");
+    }
+
+    /// An invoice that ends before it could be paid is given to nobody; and
+    /// what a mint said of its invoices is remembered from one start to the
+    /// next.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invoice_that_ends_too_soon_is_not_given() {
+        let w = world_with(0, GIVE_UP, 30, "").await;
+        w.hold().await;
+        let strict = w.with_invoice_life(LIFE);
+        let Err(Fault::NoInvoice(why)) = ask(&strict, BUYER, "small", None).await else { panic!("an invoice") };
+        assert!(why.contains("ends too soon to pay"), "{why}");
+        assert!(w.site.store.orders(10).unwrap().is_empty(), "and no order is made of it");
+        ask(&w.with_invoice_life(20), BUYER, "small", None).await.unwrap();
+        // A service that starts again, its mint not reached yet: it sells
+        // nothing, and knows what it will sell for.
+        let again = Wallets::open(&w.dir, std::slice::from_ref(&w.mint)).await.unwrap();
+        assert!(again.mints[0].gives_invoices(None) && !again.mints[0].ready() && !again.invoicing());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -878,7 +1112,7 @@ mod tests {
         assert!(!Fault::Listed.words(false).contains("token"), "no token was sent, and none is spoken of");
         // Nor is anyone while the mint cannot be reached, or once the time
         // to answer in is over.
-        assert_eq!(order(&w.site, a(BUYER), &by_invoice("small", None), Instant::now()).await, Err(Fault::Again));
+        assert_eq!(order(&w.site, a("fd55::5"), &by_invoice("big", None), Instant::now()).await, Err(Fault::Again));
         w.proxy.go_away();
         assert!(w.the_mint().reach().await.is_err());
         assert_eq!(ask(&w.site, BUYER, "small", None).await, Err(Fault::MintAway(w.mint.clone())));

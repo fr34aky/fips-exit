@@ -238,7 +238,7 @@ program asks the same way, without a token:
 ```text
 POST /v1/orders              {"package": "1gb", "method": "bolt11"}               201: the order, with its invoice
 POST /v1/orders              {"package": "1gb", "method": "bolt11", "key": "…"}   to be added to the package that key opens
-GET  /v1/orders/<order>                                                         what became of it: waiting, paid, expired
+GET  /v1/orders/<order>                                                         what became of it: waiting, checking, paid, expired
 POST /v1/orders/<order>/key  {}                                                 a key for the package it made
 ```
 
@@ -250,7 +250,8 @@ POST /v1/orders/<order>/key  {}                                                 
 - An order is its buyer's. The device that asked sees it, by its name;
   nobody else is told that it is there. Its page shows the invoice as text,
   as a `lightning:` link and as a QR code (drawn by the service: no script,
-  nothing fetched), and looks again by itself every few seconds.
+  nothing fetched), and looks again by itself every few seconds. The same
+  asked again within a minute (a form sent twice) is the same order.
 - The package is there once the payment has arrived, with the device that
   asked in it, whether or not anyone is looking at the page. Nobody was
   shown its key. Its buyer asks for one (the last line above, or "Show a
@@ -259,12 +260,21 @@ POST /v1/orders/<order>/key  {}                                                 
   `key` of a package there already is, the bytes and the days are added to
   that one instead.
 - **What is paid after an invoice has ended is lost to whoever paid it.**
-  The page says when that is. The mint is asked what became of an invoice,
-  one at a time and at most every three seconds: at once for an order whose
-  buyer is asking, more seldom the older an order is. An order is given up
-  only when the mint, asked ten minutes after the invoice has ended, says
-  it is not paid. One paid while the service was not running is found when
-  it starts again. An order that was given up can be asked about for a day.
+  The page says when that is, and an invoice is shown only while it can be
+  paid: one that would end within a minute is not given to anyone, and once
+  it has ended the order says `checking`, with nothing to pay, until the
+  mint has said what became of it. The mint is asked about one invoice at a
+  time, at most every three seconds: about an order whose buyer is asking,
+  and every other time about whichever was not asked about for longest, so
+  that those who ask do not keep the others waiting; more seldom the older
+  an order is. An order is given up (`expired`) only when the mint, asked
+  ten minutes after the invoice has ended, says it is not paid. One paid
+  while the service was not running is found when it starts again. An
+  order that was given up can be asked about for a day.
+- Leave a mint in `MINTS` while `fips-exit orders` shows an invoice of it
+  open. With the mint taken out, such an order cannot be asked about: it
+  says `checking`, the log says so, and what is paid for it meanwhile is
+  at that mint, granted only once the mint is named again.
 - If the mint minted and its answer did not arrive, the mint says so of the
   quote, and that is the payment: a quote is minted for the wallet that
   knows it and holds its key (NUT-20, where the mint has it), and what was

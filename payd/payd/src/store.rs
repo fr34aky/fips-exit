@@ -789,6 +789,28 @@ impl Store {
         Ok((count("AND buyer = ?2", &[&now, &buyer.to_string()])?, count("", &[&now])?))
     }
 
+    /// The newest invoice of `buyer`'s that waits for just this (`offer`
+    /// from `mint`, for `target` or a package of its own), was asked for at
+    /// `since` or after, and does not end before `lasts`: what the same
+    /// request, sent again, is answered with.
+    pub fn invoice_recent(
+        &self,
+        buyer: Ipv6Addr,
+        mint: &str,
+        offer: &str,
+        target: Option<&str>,
+        since: u64,
+        lasts: u64,
+    ) -> Result<Option<Order>, Refused> {
+        Ok(Store::orders_where(
+            &self.db(),
+            "WHERE paid = 0 AND ended = 0 AND method = 'bolt11' AND buyer = ?1 AND mint = ?2 AND offer = ?3
+               AND target IS ?4 AND created >= ?5 AND expires >= ?6 ORDER BY created DESC, id LIMIT 1",
+            &[&buyer.to_string(), &mint, &offer, &target, &as_i64(since), &as_i64(lasts)],
+        )?
+        .pop())
+    }
+
     /// Order `id`'s invoice ended unpaid: given up. One that is paid is not.
     pub fn invoice_end(&self, id: &str, now: u64) -> Result<(), Refused> {
         self.db().execute(

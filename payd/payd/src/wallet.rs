@@ -161,6 +161,19 @@ pub enum Paid {
     Minted(u64),
 }
 
+impl Lightning {
+    /// What a mint's description of itself says of its invoices (NUT-04),
+    /// if it gives any for sat.
+    fn of(info: &cdk::nuts::MintInfo) -> Option<Lightning> {
+        let minting = &info.nuts.nut04;
+        minting.get_settings(&CurrencyUnit::Sat, &bolt11()).filter(|_| !minting.disabled).map(|its| Lightning {
+            least: its.min_amount.map_or(1, |least| least.to_u64().max(1)),
+            most: its.max_amount.map_or(u64::MAX, |most| most.to_u64()),
+            describes: matches!(its.options, Some(MintMethodOptions::Bolt11 { description: true })),
+        })
+    }
+}
+
 fn bolt11() -> PaymentMethod {
     PaymentMethod::Known(KnownMethod::Bolt11)
 }
@@ -264,16 +277,7 @@ impl Mint {
                 return Err("it has no keys for sat".to_string());
             }
             // Whether it gives invoices, as it says itself (NUT-04).
-            let minting = &info.nuts.nut04;
-            let lightning =
-                minting.get_settings(&CurrencyUnit::Sat, &bolt11()).filter(|_| !minting.disabled).map(|its| {
-                    Lightning {
-                        least: its.min_amount.map_or(1, |least| least.to_u64().max(1)),
-                        most: its.max_amount.map_or(u64::MAX, |most| most.to_u64()),
-                        describes: matches!(its.options, Some(MintMethodOptions::Bolt11 { description: true })),
-                    }
-                });
-            *self.lightning.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = lightning;
+            *self.lightning.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Lightning::of(&info);
             if self.count_first.load(Ordering::Relaxed) || self.look_ahead.load(Ordering::Relaxed) {
                 let _turn = self.turn.lock().await;
                 if self.count_first.load(Ordering::Relaxed) || self.behind().await? {
@@ -568,14 +572,18 @@ impl Mint {
     /// of the wallet's file. Where the wallet was interrupted in minting
     /// for the quote, it finishes that here.
     pub async fn quote_state(&self, quote: &str, key: Option<&str>) -> Result<Paid, String> {
-        if self.db.get_mint_quote(quote).await.map_err(said)?.is_none() {
-            let mut learnt = within(self.wallet.fetch_mint_quote(quote, Some(bolt11()))).await?;
-            if learnt.secret_key.is_none()
-                && let Some(key) = key
-            {
-                learnt.secret_key = Some(SecretKey::from_hex(key).map_err(said)?);
-                self.db.add_mint_quote(learnt).await.map_err(said)?;
-            }
+        let known = match self.db.get_mint_quote(quote).await.map_err(said)? {
+            Some(known) => known,
+            None => within(self.wallet.fetch_mint_quote(quote, Some(bolt11()))).await?,
+        };
+        // Its key, whenever the wallet's file has the quote without it: it
+        // is learnt from the mint without one, and may have been left so.
+        if known.secret_key.is_none()
+            && let Some(key) = key
+        {
+            let mut with_key = known;
+            with_key.secret_key = Some(SecretKey::from_hex(key).map_err(said)?);
+            self.db.add_mint_quote(with_key).await.map_err(said)?;
         }
         let now = within(self.wallet.check_mint_quote_status(quote)).await?;
         Ok(match now.state {
@@ -583,6 +591,15 @@ impl Mint {
             MintQuoteState::Paid => Paid::Yes,
             MintQuoteState::Issued => Paid::Minted(now.amount_issued.to_u64()),
         })
+    }
+
+    /// Have the wallet's file know `quote` without its key: as when it
+    /// learnt the quote from the mint and stopped there.
+    #[cfg(test)]
+    pub async fn forget_key(&self, quote: &str) {
+        let mut known = self.db.get_mint_quote(quote).await.unwrap().unwrap();
+        known.secret_key = None;
+        self.db.add_mint_quote(known).await.unwrap();
     }
 
     /// Mint what `quote`'s invoice paid for. What arrived, in sat. The
@@ -671,6 +688,11 @@ impl Wallets {
             }
             let wallet = Wallet::new(name, CurrencyUnit::Sat, db.clone(), seed, None)
                 .map_err(|e| format!("MINTS: {name}: {e}"))?;
+            // What the mint said of its invoices when it was last reached,
+            // as the wallet's file remembers it: so that what the exit says
+            // it sells for does not change with every start.
+            let remembered = db.get_mint(url.clone()).await.ok().flatten();
+            let lightning = remembered.as_ref().and_then(Lightning::of);
             opened.push(Arc::new(Mint {
                 name: name.clone(),
                 url,
@@ -682,7 +704,7 @@ impl Wallets {
                 marker: marker(name),
                 look_ahead: AtomicBool::new(true),
                 again: again.clone(),
-                lightning: std::sync::Mutex::new(None),
+                lightning: std::sync::Mutex::new(lightning),
                 turn: tokio::sync::Mutex::new(()),
             }));
         }

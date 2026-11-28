@@ -419,9 +419,12 @@ written down before its invoice is shown to anyone, with the quote and its
 key, so that the order alone is enough to claim what is paid whatever
 becomes of the wallet's file. It is given up only when the mint, asked ten
 minutes after the invoice has ended, says it is not paid; until then it
-waits, across restarts and while its mint is away. The mint is asked about
-one invoice at a time, at most every three seconds: first about one whose
-buyer is asking, and more seldom about one the older it is. The package an
+waits, across restarts and while its mint is away. An invoice is shown to
+its buyer only while it can be paid: not one that ends within a minute, and
+not once it has ended. The mint is asked about one invoice at a time, at
+most every three seconds: about one whose buyer is asking, every other time
+about whichever was not asked about for longest, and more seldom about one
+the older it is. The package an
 invoice buys has a key nobody was shown: its buyer, from the address that
 ordered, asks for one, and each key asked for replaces the one before.
 

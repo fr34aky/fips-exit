@@ -809,10 +809,11 @@ ok "an invoice of the exit's mint buys a package over the mesh: when it is paid,
 
 # The wallet and what was sold are kept when the service starts again, with
 # its mint away: nothing is sold then, and who paid is carried all the same.
+# (That the mint gives invoices is remembered, for what the advert says.)
 fresh=$(token 8)
 kill $mint_pid; wait $mint_pid 2>/dev/null || true
 restart_payd
-wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +24 sat +0 sat +24 sat +away +no +$MINT\$"' \
+wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +24 sat +0 sat +24 sat +away +yes +$MINT\$"' \
   || fail "the wallet after the service started again: $("$here/fips-exit" wallet 2>&1)"
 r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$fresh\"}")
 [ "$(status_of "$r")" = 503 ] && printf '%s' "$r" | grep -q '"code":"mint-away"' || fail "an order while the mint is away: $r"

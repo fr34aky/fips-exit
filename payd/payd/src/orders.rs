@@ -163,6 +163,8 @@ pub enum Fault {
     NotPaid,
     /// The order made no package of its own to give a key of.
     NoNewKey,
+    /// Another request of the caller's is under way, and did not end.
+    UnderWay,
 }
 
 impl Fault {
@@ -186,7 +188,7 @@ impl Fault {
             Fault::NotYet => StatusCode::ACCEPTED,
             Fault::NoKey => StatusCode::FORBIDDEN,
             Fault::NoOrder => StatusCode::NOT_FOUND,
-            Fault::Busy | Fault::TooMany(_) => StatusCode::TOO_MANY_REQUESTS,
+            Fault::Busy | Fault::TooMany(_) | Fault::UnderWay => StatusCode::TOO_MANY_REQUESTS,
             Fault::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -219,6 +221,7 @@ impl Fault {
             Fault::NoOrder => "no-such-order",
             Fault::NotPaid => "not-paid",
             Fault::NoNewKey => "no-key-to-give",
+            Fault::UnderWay => "under-way",
         }
     }
 
@@ -286,6 +289,9 @@ impl Fault {
             ),
             Fault::NoOrder => "There is no such order of this device's.".into(),
             Fault::NotPaid => "That order is not paid: there is no package of it yet.".into(),
+            Fault::UnderWay => {
+                "Another purchase of this device's is being made here just now: try again in a moment.".into()
+            }
             Fault::NoNewKey => {
                 "No key is given for that order here. What it paid for was added to the package it was asked for; \
                  or its package was taken back; or it was paid with a token, which has its key again by being sent \
@@ -1104,7 +1110,8 @@ pub mod testing {
         }
         let mut desk = Desk::new(wallets, control);
         desk.give_up = give_up;
-        (desk.invoices.every, desk.invoices.grace, desk.invoices.pace) = (Duration::ZERO, 0, (0, 0));
+        (desk.invoices.every, desk.invoices.grace, desk.invoices.pace, desk.invoices.life) =
+            (Duration::ZERO, 0, (0, 0), 0);
         let mut site = Site::new(config, exit, Arc::new(Store::in_memory()), Seats::default(), Arc::default());
         site.desk = Some(Arc::new(desk));
         World { site: Arc::new(site), mint: proxy.url.clone(), direct: mint, proxy, dir, seats }
@@ -1151,7 +1158,26 @@ pub mod testing {
         /// wallet's file was lost, or with a second service on its seed.
         pub fn with_wallets(&self, wallets: Wallets) -> Arc<Site> {
             let mut desk = Desk::new(Arc::new(wallets), self.dir.join("control.sock"));
-            (desk.invoices.every, desk.invoices.grace, desk.invoices.pace) = (Duration::ZERO, 0, (0, 0));
+            (desk.invoices.every, desk.invoices.grace, desk.invoices.pace, desk.invoices.life) =
+                (Duration::ZERO, 0, (0, 0), 0);
+            let mut site = Site::new(
+                self.site.config.clone(),
+                self.site.exit.clone(),
+                self.site.store.clone(),
+                Seats::default(),
+                Arc::default(),
+            );
+            site.desk = Some(Arc::new(desk));
+            Arc::new(site)
+        }
+
+        /// The same exit, with its own wallet, that gives nobody an invoice
+        /// which ends within `life` seconds.
+        pub fn with_invoice_life(&self, life: u64) -> Arc<Site> {
+            let wallets = self.site.desk.as_ref().unwrap().wallets.clone();
+            let mut desk = Desk::new(wallets, self.dir.join("control.sock"));
+            (desk.invoices.every, desk.invoices.grace, desk.invoices.pace, desk.invoices.life) =
+                (Duration::ZERO, 0, (0, 0), life);
             let mut site = Site::new(
                 self.site.config.clone(),
                 self.site.exit.clone(),

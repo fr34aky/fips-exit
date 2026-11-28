@@ -54,6 +54,8 @@ struct Paying {
     paid: Mutex<HashSet<String>>,
     /// Where the mint hears of a payment.
     tell: Mutex<Option<tokio::sync::mpsc::Sender<Event>>>,
+    /// The invoice the mint gave last.
+    last: Mutex<Option<String>>,
 }
 
 impl Paying {
@@ -95,7 +97,9 @@ impl MintPayment for Held {
         &self,
         options: IncomingPaymentOptions,
     ) -> Result<CreateIncomingPaymentResponse, Self::Err> {
-        self.backend.create_incoming_payment_request(options).await
+        let made = self.backend.create_incoming_payment_request(options).await?;
+        *self.paying.last.lock().unwrap() = Some(made.request.clone());
+        Ok(made)
     }
 
     async fn get_payment_quote(
@@ -212,8 +216,17 @@ pub async fn start_with(listen: SocketAddr, input_fee_ppk: u64, invoice_seconds:
     mint.start().await.map_err(said)?;
     let router = cdk_axum::create_mint_router(Arc::new(mint), vec!["bolt11".to_string()]).await.map_err(said)?;
     // What a test says of the mint's invoices, beside what a mint answers.
-    let (holding, payer) = (paying.clone(), paying);
+    let (holding, payer, asked) = (paying.clone(), paying.clone(), paying);
     let router = router
+        .route(
+            "/test/last",
+            axum::routing::post(move || async move {
+                match asked.last.lock().unwrap().clone() {
+                    Some(invoice) => (axum::http::StatusCode::OK, format!("{invoice}\n")),
+                    None => (axum::http::StatusCode::NOT_FOUND, "no invoice was given yet\n".to_string()),
+                }
+            }),
+        )
         .route(
             "/test/hold",
             axum::routing::post(move || async move {
@@ -237,8 +250,8 @@ pub async fn start_with(listen: SocketAddr, input_fee_ppk: u64, invoice_seconds:
 }
 
 /// `body` posted to `path` at `mint` (as [`start`] gave it): what a test
-/// says to the mint that no wallet would.
-async fn post(mint: &str, path: &str, body: &str) -> Result<(), String> {
+/// says to the mint that no wallet would. What the mint says to it.
+async fn post(mint: &str, path: &str, body: &str) -> Result<String, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let at = mint.strip_prefix("http://").unwrap_or(mint);
     let mut stream = tokio::net::TcpStream::connect(at).await.map_err(|e| format!("{mint}: {e}"))?;
@@ -251,7 +264,7 @@ async fn post(mint: &str, path: &str, body: &str) -> Result<(), String> {
     let mut answer = String::new();
     stream.read_to_string(&mut answer).await.map_err(said)?;
     if answer.starts_with("HTTP/1.1 200") {
-        Ok(())
+        Ok(answer.split("\r\n\r\n").nth(1).unwrap_or_default().trim().to_string())
     } else {
         Err(format!("{mint}{path}: {}", answer.lines().last().unwrap_or("no answer")))
     }
@@ -260,12 +273,17 @@ async fn post(mint: &str, path: &str, body: &str) -> Result<(), String> {
 /// From now on an invoice of `mint` is paid when [`pay`] says so, and not
 /// at once.
 pub async fn hold(mint: &str) -> Result<(), String> {
-    post(mint, "/test/hold", "").await
+    post(mint, "/test/hold", "").await.map(drop)
 }
 
 /// The invoice `request` of `mint` is paid.
 pub async fn pay(mint: &str, request: &str) -> Result<(), String> {
-    post(mint, "/test/pay", request).await
+    post(mint, "/test/pay", request).await.map(drop)
+}
+
+/// The invoice `mint` gave last, to whoever asked for it.
+pub async fn last(mint: &str) -> Result<String, String> {
+    post(mint, "/test/last", "").await
 }
 
 /// A wallet at `mint`, in memory, with a seed of its own.
@@ -350,22 +368,26 @@ impl Proxy {
 
     /// Pass a swap on to the mint, and lose the mint's answer.
     pub fn lose_swap_answers(&self) {
+        *self.about.lock().unwrap() = SWAP;
         self.swaps.store(LOSE_ANSWER, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Do not pass a swap on at all.
     pub fn refuse_swaps(&self) {
+        *self.about.lock().unwrap() = SWAP;
         self.swaps.store(REFUSE, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Pass the next swap on, lose the mint's answer, and be away from
     /// then on: the mint took it, and cannot be asked.
     pub fn lose_a_swap_answer_and_go_away(&self) {
+        *self.about.lock().unwrap() = SWAP;
         self.swaps.store(LOSE_ANSWER_AND_GO, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Pass nothing on: a mint that cannot be reached.
     pub fn go_away(&self) {
+        *self.about.lock().unwrap() = SWAP;
         self.swaps.store(AWAY, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -490,6 +512,7 @@ mod tests {
         wallet.mint(&held.id, SplitTarget::default(), None).await.unwrap();
         assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(34));
         // A wallet is still filled while invoices are held: it pays its own.
+        assert_eq!(last(&mint).await.unwrap(), held.request, "the invoice it gave last");
         fill(&wallet, 8).await.unwrap();
         assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(42));
         assert!(pay(&mint, "not an invoice").await.is_err());

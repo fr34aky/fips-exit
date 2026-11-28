@@ -130,9 +130,11 @@ IPv4 address derived from the client's fips address.
     an order until the invoice has ended. Taken from it: a package on
     offer, optionally a key and the name of a mint, which must be one of
     `MINTS` as the config writes it. Bounds: 3 invoices waiting for one
-    address, 512 in all, and the budget a token is taken from. The invoice
+    address, 512 in all, and the budget a token is taken from; the same
+    asked again within a minute is the order there is already. The invoice
     comes from the mint and is read before it is shown: a BOLT11 request
-    for the price exactly, or nothing is shown. It goes into the order's
+    for the price exactly that lasts a minute at least, or nothing is
+    shown; and it is shown only until it ends. It goes into the order's
     page escaped, as text, as a `lightning:` link and as a QR code that is
     SVG written here (rectangles, no script, no link). An order is named by
     64 random bits and shown to the address that made it only, so asking
@@ -283,7 +285,9 @@ IPv4 address derived from the client's fips address.
   before makes the wallet count again, once for an order, and is asked
   again after. What is paid after an invoice's end is lost to the payer,
   and the page says when that is: serious would be showing an invoice
-  whose end has passed, or a wrong end.
+  whose end has passed, or a wrong end; and an order that waits forever
+  because those who ask about theirs are always looked at first (every
+  other look goes to whichever waited longest).
 - **A token taken, and nothing granted.** The other way round: whatever the
   service refuses, it must refuse before the token is taken to the mint, and
   say that the token was not touched; an order whose token did reach the
@@ -376,8 +380,13 @@ IPv4 address derived from the client's fips address.
   long as they go on. Invoices that nobody pays also take the mint's
   attention from those that are paid: each is asked about until it has
   ended, one every three seconds in all, so with many waiting a payment is
-  seen later (an order whose buyer asks is looked at first). Members are
-  carried all the same. A token need not carry the proof (NUT-12) that
+  seen later (half the looks go to orders whose buyers ask, half to
+  whichever waited longest). Members are carried all the same.
+- **A mint taken out of `MINTS` strands its open invoices.** The service
+  keeps a wallet only for the mints it names, so an invoice of a mint that
+  was removed cannot be asked about: it is not shown to be paid any more,
+  the log says so, and the order is kept with what claims it. One paid in
+  between is granted only when the mint is named again. A token need not carry the proof (NUT-12) that
   would let the service refuse a made-up one without asking: wallets in
   use leave it out.
 - **A mint is trusted for what it holds, and for the truth.** It can keep

@@ -4,6 +4,8 @@
 use std::net::Ipv6Addr;
 
 use fips_exit_proto::{BYTES_PER_GB, Package};
+// For a person, as a client's own program shows them too.
+pub use fips_exit_proto::{bytes_shown, date};
 use serde::Serialize;
 
 use crate::config::Config;
@@ -110,36 +112,6 @@ pub fn escape(text: &str) -> String {
         }
     }
     out
-}
-
-/// A number of bytes for a person: in the decimal units a price counts in.
-pub fn bytes_shown(bytes: u64) -> String {
-    let units = [(1_000_000_000_000, "TB"), (BYTES_PER_GB, "GB"), (1_000_000, "MB"), (1_000, "kB")];
-    for (size, unit) in units {
-        if bytes >= size {
-            let whole = bytes / size;
-            let tenth = bytes % size * 10 / size;
-            return if tenth == 0 { format!("{whole} {unit}") } else { format!("{whole}.{tenth} {unit}") };
-        }
-    }
-    format!("{bytes} bytes")
-}
-
-/// A moment for a person: the date and time in UTC.
-pub fn date(unix: u64) -> String {
-    let (days, seconds) = (unix / 86_400, unix % 86_400);
-    // Days to a date in the proleptic Gregorian calendar (Howard Hinnant's
-    // civil_from_days).
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year}-{month:02}-{day:02} {:02}:{:02} UTC", seconds / 3600, seconds % 3600 / 60)
 }
 
 /// Satoshi for a person: millisatoshi rounded up to whole satoshi.

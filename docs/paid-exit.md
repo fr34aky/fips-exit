@@ -576,7 +576,7 @@ and `SECURITY-REVIEW.md`.
 | 6 | **Done.** Lightning: an invoice of the mint's for a package's price, in an order that is its buyer's alone; granted when the wallet has minted for it, and given up only on the mint's word after the invoice's end. |
 | 7 | **Done.** Paying out and sweeping: a token or a paid invoice on the operator's word, the wallet sent on to the operator's Lightning address above a threshold, a cap from which nothing is sold, and everything that leaves written down first. |
 | 8 | **Done.** On-chain: an address of the mint's in an order that is its buyer's alone; what is confirmed there buys at the package's rate as it arrives, until the order's end, which the page shows beside the address. |
-| 9 | A command-line client for Linux nodes. |
+| 9 | **Done.** `fips-exit-pay`, a command line for a Linux node that buys: the terms, a package by token, invoice or on the chain, its order and its key, and who is in it. It holds no money, keeps the orders it made and the key in a file of its user's, and shows nothing to be paid that the exit's own terms do not name. Not in it: finding exits, and the tunnel. |
 | 10 | Channels. |
 
 The tests for the payment phases run against a real Cashu mint started

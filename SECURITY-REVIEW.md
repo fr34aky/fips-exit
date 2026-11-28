@@ -35,6 +35,13 @@ root:
   is a library's (`cdk` 0.18.3, pinned exactly), which brings some 270
   crates into this one program, a TLS stack among them.
 
+- `fips-exit-pay` (`payd/client`, Rust, blocking, four dependencies and
+  none of the wallet's): not part of an exit. It is a command for a Linux
+  node that buys from somebody else's exit: it asks that exit's payment
+  service over the mesh, as its user, and keeps the orders it made and the
+  key of the package it bought in a file of that user's. It holds no
+  money and runs with no privilege. Its adversary is the exit it talks to.
+
 Clients are fips2go phones and other fips nodes. The wire contract is shared
 with fips2go (`shim/src/exit.rs`) and its exit container
 (`exit-node/exitctl.py`): plain IP-in-IPv6, next header 4 or 41, and an inner
@@ -170,6 +177,33 @@ IPv4 address derived from the client's fips address.
     held to numbers and cut of anything a terminal would act on; the terms
     that go into the advert are checked for their shape, then held to the
     advert's own bounds, and an advert that is out of them is not written.
+
+14. **What an exit answers `fips-exit-pay`.** Here the exit is the
+    untrusted side: somebody else's machine, chosen by its npub. The
+    command connects only to the address that follows from that npub
+    (SHA-256 of the key; the same derivation the service uses, from the
+    same source file), which the name `<npub>.fips` must resolve to, so
+    that fips's own authentication says who answers; `--connect` names an
+    address by hand and says on standard error when it is not that one. An
+    answer is read with a deadline, 256 KiB at the most, and is one JSON
+    object with its length or it is nothing; a body in pieces is refused.
+    Of it, text reaches the terminal only through one function (one line,
+    no control or hidden character, a length), and JSON (`--json`) only
+    written again here, with every character that is not plain ASCII as
+    an escape.
+    Nothing in it names a file: the state file's name is the npub the user
+    typed, checked as an npub, and an order's name goes into a path only
+    if it is `o` and 16 hex digits. Before an invoice or an address is
+    shown to be paid, when it is ordered and each time `order` shows it:
+    the terms' version, the exit's npub in its own terms, the order's
+    price against the one written down here when it was made (the terms'
+    then; the terms' now for an order this node did not write down), the
+    amount written in the invoice against that price, and the form of an
+    address. No key is asked for unless the user says so or the command
+    itself has just seen the payment arrive: asking replaces the key
+    before. The state file is written whole, under a lock, to a new file
+    of mode 0600 in a directory of mode 0700, and renamed; one that is
+    there and is not this program's is not written over.
 
 ## Things that would be serious in this codebase
 
@@ -392,6 +426,20 @@ IPv4 address derived from the client's fips address.
   the two places that look inside a packet. A panic here is a remote
   denial of service for every client.
 
+- **The command-line client doing more for an exit than paying it.** An
+  exit, or whoever answers in its place, making `fips-exit-pay` show
+  something to pay that is not what the exit's own terms name (an invoice
+  for more, a price raised between the terms and the order, an order paid
+  another way); a token sent to anyone before the terms said who answers
+  and that tokens are taken; text of an exit's that reaches the terminal
+  as anything but words (an escape sequence in a name, an error or a
+  package's id); an answer that makes the command read without end, write
+  outside its state directory, or ask for a path of the exit's choosing;
+  a key or a token on a command line, where another user reads it; a
+  state file that another user can read; a key of a package replaced at
+  the exit, or dropped from the state file, without the user having asked
+  for that; and a command that waits for an exit without end.
+
 ## Known gaps — real, not yet fixed
 
 - **The uplink's own public address is not blocked** when the exit is
@@ -539,6 +587,23 @@ IPv4 address derived from the client's fips address.
   `TUN` from `/etc/fips-exit/config` are placed in the nftables script as
   written. The file is root's, so this is a typo running as root rather than
   an attack, but criterion 9 of `PR-REVIEW.md` is not yet true of them.
+
+- **`fips-exit-pay` trusts the node it runs on for who the exit is.** The
+  check is that `<npub>.fips` resolves to the address derived from the
+  npub; that a connection to that address reaches the holder of the key is
+  fips's doing, on this node. Where the address is named by hand
+  (`--connect`), nothing checks it. And whom an invoice or an address
+  pays cannot be checked by a buyer at all: an exit can show one that
+  pays somebody else, and then grants nothing. What a buyer risks at an
+  exit is what they pay it, as with the page.
+- **The key of a package is in a file of its buyer's** (`fips-exit-pay`'s
+  state), in the clear, as long as the file is there: whoever reads it
+  manages the package, though they cannot take what was paid. It is also
+  printed to the terminal when it is first had.
+- **The amount of an invoice is read from its first part only.** That part
+  is under the invoice's signature, which the command does not verify: it
+  has no signature code. A wallet that pays the invoice does verify it,
+  and shows the amount again.
 
 ## Deliberate design choices — not findings
 

@@ -47,6 +47,8 @@ qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util"] }
+# The command-line client, run against this service in its tests.
+fips-exit-pay = { path = "../client" }
 # A real mint, started inside a test, with a Lightning backend that pays
 # itself; and a wallet that makes tokens there.
 fips-exit-test-mint = { path = "../test-mint" }

@@ -909,13 +909,73 @@ r=$(http_post c1 /v1/orders/$chain/key '{}')
 "$here/fips-exit" wallet | grep -Eq "^ +26 sat +0 sat +40 sat +14 sat +reached +yes +yes +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
 ok "bitcoin on the chain buys at a package's rate over the mesh: as it arrives at the mint's address, for its buyer alone"
 
+# --- the same from a Linux node's command line ----------------------------------------
+# fips-exit-pay asks the service what the page asks it, as the node it runs
+# on. (By the exit's address, named by hand: no fips answers for names here.)
+pay="$here/payd/target/debug/fips-exit-pay"
+[ -x "$pay" ] || fail "build the client first: cargo build --manifest-path payd/Cargo.toml -p fips-exit-pay"
+cli() { # netns, then what is asked: with a state directory of that node's own
+  ns=$1; shift
+  ip netns exec "$ns" "$pay" "$@" --connect "[$E]:5170" --state "$FIPS_EXIT_DIR/pay-$ns" 2>"$FIPS_EXIT_DIR/pay.err"
+}
+cli c3 terms $NPUB > "$FIPS_EXIT_DIR/pay.out" || fail "the terms from the command line: $(cat "$FIPS_EXIT_DIR/pay.err")"
+grep -q "price: 2000 sat for a GB" "$FIPS_EXIT_DIR/pay.out" && grep -Eq "^  tiny +30 kB +1 days +8 sat" "$FIPS_EXIT_DIR/pay.out" \
+  && grep -Eq "this node \($C3\): in package p[0-9a-f]{16}\$" "$FIPS_EXIT_DIR/pay.out" || fail "the terms from the command line: $(cat "$FIPS_EXIT_DIR/pay.out")"
+# A token buys a package of its own; its key is kept by the node that bought.
+token 8 > "$FIPS_EXIT_DIR/token"
+cli c3 buy $NPUB tiny --token-file "$FIPS_EXIT_DIR/token" > "$FIPS_EXIT_DIR/pay.out" \
+  || fail "a token from the command line: $(cat "$FIPS_EXIT_DIR/pay.out" "$FIPS_EXIT_DIR/pay.err")"
+grep -q "paid: 8 sat arrived" "$FIPS_EXIT_DIR/pay.out" && grep -q "this node is in it" "$FIPS_EXIT_DIR/pay.out" \
+  || fail "what a token bought from the command line: $(cat "$FIPS_EXIT_DIR/pay.out")"
+cmdline=$(sed -n 's/^package \(p[0-9a-f]\{16\}\)$/\1/p' "$FIPS_EXIT_DIR/pay.out")
+cmdkey=$(sed -n 's/^its key: \([0-9a-f]\{64\}\)$/\1/p' "$FIPS_EXIT_DIR/pay.out")
+[ -n "$cmdline" ] && [ ${#cmdkey} = 64 ] || fail "the package and its key from the command line: $(cat "$FIPS_EXIT_DIR/pay.out")"
+[ "$(stat -c %a "$FIPS_EXIT_DIR/pay-c3/$NPUB.json")" = 600 ] && grep -q "$cmdkey" "$FIPS_EXIT_DIR/pay-c3/$NPUB.json" \
+  || fail "the key is not kept as its owner's alone"
+wait_for '[ "$(ctl "check $C3")" = "ok member $cmdline v4" ]' || fail "who bought from the command line is not in its package: $(ctl "check $C3")"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "A NODE THAT BOUGHT FROM THE COMMAND LINE IS NOT CARRIED"
+# Another node is given the key, and puts itself in; the buyer takes it out.
+printf '%s\n' "$cmdkey" > "$FIPS_EXIT_DIR/key"
+cli c1 join $NPUB --key-file "$FIPS_EXIT_DIR/key" > "$FIPS_EXIT_DIR/pay.out" || fail "join: $(cat "$FIPS_EXIT_DIR/pay.err")"
+grep -q "this node is in it" "$FIPS_EXIT_DIR/pay.out" || fail "join: $(cat "$FIPS_EXIT_DIR/pay.out")"
+wait_for '[ "$(ctl "check $C1")" = "ok member $cmdline v4" ]' || fail "a node that joined from the command line: $(ctl "check $C1")"
+cli c3 package $NPUB > "$FIPS_EXIT_DIR/pay.out" || fail "package: $(cat "$FIPS_EXIT_DIR/pay.err")"
+[ "$(grep -c "^  in it: " "$FIPS_EXIT_DIR/pay.out")" = 2 ] || fail "the package from the command line: $(cat "$FIPS_EXIT_DIR/pay.out")"
+cli c3 remove $NPUB $C1 > "$FIPS_EXIT_DIR/pay.out" || fail "remove: $(cat "$FIPS_EXIT_DIR/pay.err")"
+[ "$(grep -c "^  in it: " "$FIPS_EXIT_DIR/pay.out")" = 1 ] || fail "after remove: $(cat "$FIPS_EXIT_DIR/pay.out")"
+wait_for '[ "$(ctl "check $C1")" = "ok free v4" ]' || fail "a node taken out from the command line: $(ctl "check $C1")"
+# An invoice, added to that package with its key: shown, paid, and waited for.
+cli c3 buy $NPUB tiny --invoice --add --no-wait --json > "$FIPS_EXIT_DIR/pay.out" || fail "an invoice from the command line: $(cat "$FIPS_EXIT_DIR/pay.err")"
+invoice=$(python3 -c '
+import json, sys
+d = json.loads(sys.stdin.readline())
+assert d["state"] == "waiting" and d["method"] == "bolt11" and d["sat"] == 8, d
+print(d["request"])' < "$FIPS_EXIT_DIR/pay.out") || fail "the order from the command line: $(cat "$FIPS_EXIT_DIR/pay.out")"
+rc=0; cli c3 order $NPUB > "$FIPS_EXIT_DIR/pay.out" || rc=$?
+[ $rc = 3 ] && grep -qF "$invoice" "$FIPS_EXIT_DIR/pay.out" \
+  || fail "an order that waits, from the command line: $(cat "$FIPS_EXIT_DIR/pay.out" "$FIPS_EXIT_DIR/pay.err")"
+"$mint" pay $MINT "$invoice" || fail "the test mint did not take the payment"
+cli c3 order $NPUB --wait > "$FIPS_EXIT_DIR/pay.out" || fail "waiting for an invoice from the command line: $(cat "$FIPS_EXIT_DIR/pay.out" "$FIPS_EXIT_DIR/pay.err")"
+grep -q "paid: 8 sat arrived" "$FIPS_EXIT_DIR/pay.out" && grep -q "added to package $cmdline" "$FIPS_EXIT_DIR/pay.out" \
+  || fail "what an invoice bought from the command line: $(cat "$FIPS_EXIT_DIR/pay.out")"
+"$here/fips-exit" packages | grep -Eq "^$cmdline +live +[0-9.]+ kB " || fail "the package bought from the command line: $("$here/fips-exit" packages)"
+# Another node asks about that order, and is told nothing; c1, in no package, leaves nothing.
+rc=0; cli c1 order $NPUB "$(sed -n 's/.*"order": *"\(o[0-9a-f]*\)".*/\1/p' "$FIPS_EXIT_DIR/pay-c3/$NPUB.json" | tail -1)" > /dev/null || rc=$?
+[ $rc = 1 ] && grep -q "no-such-order" "$FIPS_EXIT_DIR/pay.err" || fail "ANOTHER NODE WAS TOLD OF AN ORDER FROM THE COMMAND LINE: $(cat "$FIPS_EXIT_DIR/pay.err")"
+cli c1 leave $NPUB | grep -q "this node was in no package here" || fail "leave from the command line: $(cat "$FIPS_EXIT_DIR/pay.err")"
+# And c1 is put back in, with the key it kept when it joined: it is carried from here on.
+cli c1 join $NPUB > /dev/null || fail "join with the key that was kept: $(cat "$FIPS_EXIT_DIR/pay.err")"
+wait_for '[ "$(ctl "check $C1")" = "ok member $cmdline v4" ]' || fail "a node that joined again: $(ctl "check $C1")"
+"$here/fips-exit" wallet | grep -Eq "^ +42 sat +0 sat +56 sat +14 sat +reached +yes +yes +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
+ok "a Linux node buys from its command line, by token and by invoice, keeps the key, and manages who is in the package"
+
 # The wallet and what was sold are kept when the service starts again, with
 # its mint away: nothing is sold then, and who paid is carried all the same.
 # (That the mint gives invoices is remembered, for what the advert says.)
 fresh=$(token 8)
 kill $mint_pid; wait $mint_pid 2>/dev/null || true
 restart_payd
-wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +26 sat +0 sat +40 sat +14 sat +away +yes +yes +$MINT\$"' \
+wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +42 sat +0 sat +56 sat +14 sat +away +yes +yes +$MINT\$"' \
   || fail "the wallet after the service started again: $("$here/fips-exit" wallet 2>&1)"
 r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$fresh\"}")
 [ "$(status_of "$r")" = 503 ] && printf '%s' "$r" | grep -q '"code":"mint-away"' || fail "an order while the mint is away: $r"
@@ -931,7 +991,7 @@ wait_for '[ "$(ask c1 4 8.8.8.2 100)" = 100 ]' || fail "who paid is not carried 
 [ "$(stat -c %a "$FIPS_EXIT_DIR/state/seed")" = 600 ] && [ "$(wc -w < "$FIPS_EXIT_DIR/state/seed")" = 24 ] || fail "the wallet's seed"
 "$here/fips-exit" revoke $bought >/dev/null && "$here/fips-exit" revoke $also >/dev/null \
   && "$here/fips-exit" revoke $via >/dev/null && "$here/fips-exit" revoke $more >/dev/null \
-  && "$here/fips-exit" revoke $onchain >/dev/null || fail "revoke what was bought"
+  && "$here/fips-exit" revoke $onchain >/dev/null && "$here/fips-exit" revoke $cmdline >/dev/null || fail "revoke what was bought"
 wait_for '[ "$(ctl "check $C1") $(ctl "check $C3")" = "ok free v4 ok free v4" ]' || fail "after revoking what was bought: $(ctl "check $C1") $(ctl "check $C3")"
 sells "1gb:1GB:1500:30 5gb:5GB:6000:90" ""
 restart_payd

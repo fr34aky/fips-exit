@@ -4,7 +4,9 @@
 //!
 //! An invoice of the mint's is paid at once, by nobody. A test of someone
 //! paying one says [`hold`] first: from then on an invoice is paid when the
-//! test says [`pay`], and not before.
+//! test says [`pay`], and not before. The same holds for an address the mint
+//! gives for a payment on the chain: what arrives there, and is confirmed,
+//! is what the test says with [`deposit`].
 //!
 //! Nothing here is for use with money: the mint forgets everything when it
 //! stops, and its sats are paid by nobody.
@@ -42,6 +44,10 @@ fn said(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// What the test says of the mint's invoices: whether they are held, and
 /// which of them are paid.
 #[derive(Default)]
@@ -56,12 +62,35 @@ struct Paying {
     tell: Mutex<Option<tokio::sync::mpsc::Sender<Event>>>,
     /// The invoice the mint gave last.
     last: Mutex<Option<String>>,
+    /// The addresses the mint gave for payments on the chain, each with
+    /// what the backend knows it by, and what the test said arrived there.
+    addresses: Mutex<HashMap<String, PaymentIdentifier>>,
+    deposits: Mutex<HashMap<String, Vec<WaitPaymentResponse>>>,
 }
 
 impl Paying {
     /// Is the mint not to know of payment `id` yet?
     fn holds(&self, id: &str) -> bool {
         self.holding.load(Ordering::SeqCst) && !self.paid.lock().unwrap().contains(id)
+    }
+
+    /// `sat` arrived at `address`, which the mint gave for a payment on the
+    /// chain, and are confirmed: the mint hears of it. As often as a test
+    /// says, each time as a payment of its own.
+    async fn deposit(&self, address: &str, sat: u64) -> Result<(), String> {
+        let id = self.addresses.lock().unwrap().get(address.trim()).cloned();
+        let id = id.ok_or_else(|| format!("{address}: not an address this mint gave"))?;
+        let arrived = WaitPaymentResponse {
+            payment_identifier: id.clone(),
+            payment_amount: cdk::Amount::new(sat, CurrencyUnit::Sat),
+            payment_id: format!("deposit-{}", hex(&random::<12>())),
+        };
+        self.deposits.lock().unwrap().entry(id.to_string()).or_default().push(arrived.clone());
+        let tell = self.tell.lock().unwrap().clone();
+        match tell {
+            Some(tell) => tell.send(Event::PaymentReceived(arrived)).await.map_err(said),
+            None => Err("the mint is not listening for payments".into()),
+        }
     }
 
     /// The invoice `request` is paid: the mint hears of it.
@@ -97,8 +126,12 @@ impl MintPayment for Held {
         &self,
         options: IncomingPaymentOptions,
     ) -> Result<CreateIncomingPaymentResponse, Self::Err> {
+        let on_the_chain = matches!(options, IncomingPaymentOptions::Onchain(_));
         let made = self.backend.create_incoming_payment_request(options).await?;
         *self.paying.last.lock().unwrap() = Some(made.request.clone());
+        if on_the_chain {
+            self.paying.addresses.lock().unwrap().insert(made.request.clone(), made.request_lookup_id.clone());
+        }
         Ok(made)
     }
 
@@ -152,8 +185,11 @@ impl MintPayment for Held {
         &self,
         payment_identifier: &PaymentIdentifier,
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err> {
-        if self.paying.holds(&payment_identifier.to_string()) {
-            return Ok(Vec::new());
+        // What a test said arrived at an address is all that did, once its
+        // payments are held.
+        let id = payment_identifier.to_string();
+        if self.paying.holds(&id) {
+            return Ok(self.paying.deposits.lock().unwrap().get(&id).cloned().unwrap_or_default());
         }
         self.backend.check_incoming_payment_status(payment_identifier).await
     }
@@ -190,15 +226,18 @@ pub async fn start_with(listen: SocketAddr, input_fee_ppk: u64, invoice_seconds:
         ),
         paying: paying.clone(),
     };
-    builder
-        .add_payment_processor(
-            CurrencyUnit::Sat,
-            PaymentMethod::Known(KnownMethod::Bolt11),
-            MintMeltLimits::new(1, 1_000_000),
-            Arc::new(backend),
-        )
-        .await
-        .map_err(said)?;
+    let backend = Arc::new(backend);
+    for method in [KnownMethod::Bolt11, KnownMethod::Onchain] {
+        builder
+            .add_payment_processor(
+                CurrencyUnit::Sat,
+                PaymentMethod::Known(method),
+                MintMeltLimits::new(1, 1_000_000),
+                backend.clone(),
+            )
+            .await
+            .map_err(said)?;
+    }
     builder.set_unit_fee(&CurrencyUnit::Sat, input_fee_ppk).map_err(said)?;
     let listener = tokio::net::TcpListener::bind(listen).await.map_err(said)?;
     let at = listener.local_addr().map_err(said)?;
@@ -215,10 +254,28 @@ pub async fn start_with(listen: SocketAddr, input_fee_ppk: u64, invoice_seconds:
         .map_err(said)?;
     mint.set_quote_ttl(QuoteTTL::new(invoice_seconds, 3600)).await.map_err(said)?;
     mint.start().await.map_err(said)?;
-    let router = cdk_axum::create_mint_router(Arc::new(mint), vec!["bolt11".to_string()]).await.map_err(said)?;
+    let ways = vec!["bolt11".to_string(), "onchain".to_string()];
+    let router = cdk_axum::create_mint_router(Arc::new(mint), ways).await.map_err(said)?;
     // What a test says of the mint's invoices, beside what a mint answers.
-    let (holding, payer, asked) = (paying.clone(), paying.clone(), paying);
+    let (holding, payer, asked, chain) = (paying.clone(), paying.clone(), paying.clone(), paying);
     let router = router
+        .route(
+            "/test/deposit",
+            axum::routing::post(move |said: String| async move {
+                // "<address> <sat>"
+                let arrived = match said.split_whitespace().collect::<Vec<_>>()[..] {
+                    [address, sat] => match sat.parse() {
+                        Ok(sat) => chain.deposit(address, sat).await,
+                        Err(_) => Err(format!("{sat}: sat")),
+                    },
+                    _ => Err("an address and a number of sat".to_string()),
+                };
+                match arrived {
+                    Ok(()) => (axum::http::StatusCode::OK, "arrived\n".to_string()),
+                    Err(e) => (axum::http::StatusCode::BAD_REQUEST, format!("{e}\n")),
+                }
+            }),
+        )
         .route(
             "/test/last",
             axum::routing::post(move || async move {
@@ -280,6 +337,12 @@ pub async fn hold(mint: &str) -> Result<(), String> {
 /// The invoice `request` of `mint` is paid.
 pub async fn pay(mint: &str, request: &str) -> Result<(), String> {
     post(mint, "/test/pay", request).await.map(drop)
+}
+
+/// `sat` arrive at `address`, which `mint` gave for a payment on the chain,
+/// and are confirmed.
+pub async fn deposit(mint: &str, address: &str, sat: u64) -> Result<(), String> {
+    post(mint, "/test/deposit", &format!("{address} {sat}")).await.map(drop)
 }
 
 /// The invoice `mint` gave last, to whoever asked for it.
@@ -383,6 +446,7 @@ pub struct Proxy {
 const SWAP: &str = "/v1/swap";
 const MINT: &str = "/v1/mint/bolt11";
 const MELT: &str = "/v1/melt/bolt11";
+const MINT_ONCHAIN: &str = "/v1/mint/onchain";
 
 impl Proxy {
     /// Pass everything on: as when it began.
@@ -395,6 +459,12 @@ impl Proxy {
     /// lose the mint's answer.
     pub fn lose_mint_answers(&self) {
         *self.about.lock().unwrap() = MINT;
+        self.swaps.store(LOSE_ANSWER, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The same for what arrived on the chain.
+    pub fn lose_onchain_mint_answers(&self) {
+        *self.about.lock().unwrap() = MINT_ONCHAIN;
         self.swaps.store(LOSE_ANSWER, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -526,6 +596,51 @@ mod tests {
 
     async fn state(wallet: &Wallet, quote: &str) -> MintQuoteState {
         wallet.check_mint_quote_status(quote).await.unwrap().state
+    }
+
+    /// What arrives at an address the mint gave is what the test says, as
+    /// often as it says: the mint counts it up, and a wallet mints what was
+    /// not minted yet.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_arrives_on_the_chain_is_what_the_test_says() {
+        let mint = start("127.0.0.1:0".parse().unwrap(), 0).await.unwrap();
+        hold(&mint).await.unwrap();
+        let wallet = wallet(&mint).await.unwrap();
+        let quote = wallet.mint_quote(PaymentMethod::Known(KnownMethod::Onchain), None, None, None).await.unwrap();
+        assert!(quote.request.starts_with("bcrt1q"), "an address: {}", quote.request);
+        let now = |id: String| {
+            let wallet = &wallet;
+            async move {
+                let quote = wallet.check_mint_quote_status(&id).await.unwrap();
+                (u64::from(quote.amount_paid), u64::from(quote.amount_issued))
+            }
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(now(quote.id.clone()).await, (0, 0), "nothing arrives by itself");
+        deposit(&mint, &quote.request, 700).await.unwrap();
+        for _ in 0..50 {
+            if now(quote.id.clone()).await.0 == 700 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(now(quote.id.clone()).await, (700, 0));
+        let minted = wallet.mint(&quote.id, SplitTarget::default(), None).await.unwrap();
+        assert_eq!(minted.iter().map(|proof| u64::from(proof.amount)).sum::<u64>(), 700);
+        assert_eq!(now(quote.id.clone()).await, (700, 700));
+        // More arrives at the same address: counted up, and minted too.
+        deposit(&mint, &quote.request, 800).await.unwrap();
+        for _ in 0..50 {
+            if now(quote.id.clone()).await.0 == 1500 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(now(quote.id.clone()).await, (1500, 700));
+        wallet.mint(&quote.id, SplitTarget::default(), None).await.unwrap();
+        assert_eq!(now(quote.id.clone()).await, (1500, 1500));
+        assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(1500));
+        assert!(deposit(&mint, "bcrt1qnotanaddressofthismint", 5).await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

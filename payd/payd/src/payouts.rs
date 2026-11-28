@@ -1068,7 +1068,7 @@ mod tests {
         let w = world_with(0, GIVE_UP, 3600, "", "WALLET_CAP=100\n").await;
         w.hold().await;
         w.buy(BUYER, "small", &w.token(64).await, None).await.unwrap();
-        assert_eq!(w.site.methods(), vec!["cashu", "bolt11"], "64 of 100: there is room");
+        assert_eq!(w.site.methods(), vec!["cashu", "bolt11", "onchain"], "64 of 100: there is room");
         w.buy(OTHER, "small", &w.token(64).await, None).await.unwrap();
         assert!(w.the_mint().full() && w.site.methods().is_empty(), "128 of 100");
         let token_of_theirs = w.token(64).await;
@@ -1087,7 +1087,7 @@ mod tests {
         assert_eq!(Fault::WalletFull.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
         // Something leaves it: it sells again.
         token(&w.site, None, 100).await.unwrap();
-        assert!(!w.the_mint().full() && w.site.methods() == vec!["cashu", "bolt11"]);
+        assert!(!w.the_mint().full() && w.site.methods() == vec!["cashu", "bolt11", "onchain"]);
         w.buy("fd99::9", "small", &w.token(64).await, None).await.unwrap();
     }
 }

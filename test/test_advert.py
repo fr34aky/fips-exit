@@ -545,19 +545,20 @@ class Command(unittest.TestCase):
 
     def test_the_wallet_and_the_orders_are_shown_as_the_service_says_them(self):
         self.service({
-            "wallet": "mint https://mint.example.org reached 1564 0 2064 invoices 500 room\n"
-                      "mint https://b.example away 0 64 0 tokens 0 full\nok 2 500000 me@example.org 20000\n",
+            "wallet": "mint https://mint.example.org reached 1564 0 2064 invoices 500 room onchain\n"
+                      "mint https://b.example away 0 64 0 tokens 0 full offchain\nok 2 500000 me@example.org 20000\n",
             "orders": "order o0123456789abcdef paid 1800000000 fd77::7 1gb 1500 1500 1 p0123456789abcdef "
                       "https://mint.example.org cashu\norder o1123456789abcdef open 1800000060 npub1abc small 64 0 0 - "
                       "https://mint.example.org bolt11\norder o2123456789abcdef ended 1800000120 npub1abc small 64 0 0 - "
-                      "https://mint.example.org bolt11\nok 3\n"})
+                      "https://mint.example.org bolt11\norder o3123456789abcdef more 1800000180 npub1abc small 64 32 0 "
+                      "p1123456789abcdef https://mint.example.org onchain\nok 4\n"})
         status, out = self.run_command(x.cmd_wallet)
         self.assertEqual(status, 0)
         rows = out.splitlines()
         self.assertEqual(rows[1].split(), ["1564", "sat", "0", "sat", "2064", "sat", "500", "sat", "reached", "yes",
-                                           "https://mint.example.org"])
-        self.assertEqual(rows[2].split()[:11],
-                         ["0", "sat", "64", "sat", "0", "sat", "0", "sat", "away", "no", "https://b.example"])
+                                           "yes", "https://mint.example.org"])
+        self.assertEqual(rows[2].split()[:12],
+                         ["0", "sat", "64", "sat", "0", "sat", "0", "sat", "away", "no", "no", "https://b.example"])
         self.assertIn("FULL: nothing is sold here", rows[2])
         self.assertNotIn("FULL", rows[1])
         self.assertIn("It may hold 500000 sat at a mint", out)
@@ -572,9 +573,27 @@ class Command(unittest.TestCase):
         self.assertEqual(rows[2].split()[:3] + rows[2].split()[-3:],
                          ["o1123456789abcdef", "open", "invoice", "small", "-", "npub1abc"])
         self.assertEqual(rows[3].split()[:3], ["o2123456789abcdef", "ended", "invoice"])
+        self.assertEqual(rows[4].split()[:3], ["o3123456789abcdef", "more", "chain"])
+
+    def test_a_service_from_before_the_chain_is_still_read(self):
+        # The script is installed before the service is started again: what
+        # the older one says of a mint has no word about the chain.
+        self.service({"wallet": "mint https://mint.example.org reached 1564 0 2064 invoices 500 room\n"
+                                "ok 1 500000 - 20000\n"})
+        status, out = self.run_command(x.cmd_wallet)
+        self.assertEqual(status, 0)
+        self.assertEqual(out.splitlines()[1].split(), ["1564", "sat", "0", "sat", "2064", "sat", "500", "sat",
+                                                       "reached", "yes", "?", "https://mint.example.org"])
+
+    def test_a_mint_said_with_too_many_words_is_not_one(self):
+        self.service({"wallet": "mint https://mint.example.org reached 1564 0 2064 invoices 500 room onchain more\n"
+                                "ok 1 500000 - 20000\n"})
+        with contextlib.redirect_stderr(io.StringIO()):
+            status, _ = self.run_command(x.cmd_wallet)
+        self.assertNotEqual(status, 0)
 
     def test_what_is_not_a_mint_or_an_order_is_said_and_does_nothing_to_the_terminal(self):
-        self.service({"wallet": "mint https://m.example reached lots 0 0 invoices 0 room\nok 1 0 - 20000\n",
+        self.service({"wallet": "mint https://m.example reached lots 0 0 invoices 0 room onchain\nok 1 0 - 20000\n",
                       "orders": "order o1 paid when\x1b[2J fd77::7 1gb 1 1 0 p1 https://m.example cashu\nok 1\n"})
         for command in (x.cmd_wallet, x.cmd_orders):
             err = io.StringIO()

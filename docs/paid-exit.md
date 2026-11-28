@@ -361,7 +361,12 @@ chose.
 - **On-chain.** The same with an on-chain quote (NUT-30), offered only when
   the mint offers it. Deposits are credited as the mint confirms them. A
   deposit that arrives after the quote has expired is lost to the buyer, so
-  the page shows the expiry where it cannot be missed.
+  the page shows the expiry where it cannot be missed. An address names no
+  amount and what is sent to it cannot be refused, so the price is not a
+  condition here: what arrives buys at the package's rate, whatever part
+  or multiple of the price it is, and what arrives later at the same
+  address is added to the same package. An order ends when the mint's
+  quote does, and two days after it was made at the most.
 - **A token.** Accepted only from the operator's mints. Its value after the
   mint's fee is checked against the price before it is swapped; a token that
   is too small is given back untouched, and so is one worth over a tenth
@@ -570,7 +575,7 @@ and `SECURITY-REVIEW.md`.
 | 5 | **Done.** The wallet, and payment by token: a package of its own or added to one by its key, once for a token, and granted only when its price has arrived. Nothing pays out yet: until phase 7 the way to what was paid is the seed. |
 | 6 | **Done.** Lightning: an invoice of the mint's for a package's price, in an order that is its buyer's alone; granted when the wallet has minted for it, and given up only on the mint's word after the invoice's end. |
 | 7 | **Done.** Paying out and sweeping: a token or a paid invoice on the operator's word, the wallet sent on to the operator's Lightning address above a threshold, a cap from which nothing is sold, and everything that leaves written down first. |
-| 8 | On-chain. |
+| 8 | **Done.** On-chain: an address of the mint's in an order that is its buyer's alone; what is confirmed there buys at the package's rate as it arrives, until the order's end, which the page shows beside the address. |
 | 9 | A command-line client for Linux nodes. |
 | 10 | Channels. |
 

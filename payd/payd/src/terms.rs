@@ -70,8 +70,9 @@ pub struct Terms {
     pub mints: Vec<String>,
     /// The ways of paying that work now: `cashu`, a token of an accepted
     /// mint, while one of them is reached; `bolt11`, a Lightning invoice,
-    /// while one that is reached gives any. A client buys nothing while
-    /// this is empty.
+    /// while one that is reached gives any; `onchain`, bitcoin on the
+    /// chain, while one takes that. A client buys nothing while this is
+    /// empty.
     pub methods: Vec<String>,
     pub you: You,
 }
@@ -172,9 +173,9 @@ pub fn shell(title: &str, body: &str) -> String {
 /// The form that buys one of `offers` with a token. With `key`, what is
 /// bought is added to the package that key opens.
 pub fn buy_form(offers: &[Package], key: Option<&str>, methods: &[String]) -> String {
-    let (by_token, by_invoice) =
-        (methods.iter().any(|method| method == "cashu"), methods.iter().any(|method| method == "bolt11"));
-    if offers.is_empty() || !(by_token || by_invoice) {
+    let by = |way: &str| methods.iter().any(|method| method == way);
+    let (by_token, by_invoice, on_the_chain) = (by("cashu"), by("bolt11"), by("onchain"));
+    if offers.is_empty() || !(by_token || by_invoice || on_the_chain) {
         return String::new();
     }
     let options: String = offers
@@ -209,8 +210,22 @@ pub fn buy_form(offers: &[Package], key: Option<&str>, methods: &[String]) -> St
 "
         ));
     }
-    if by_token {
+    if on_the_chain {
         if by_invoice {
+            form.push_str("<h3>Or with bitcoin on the chain</h3>\n");
+        }
+        let chain_button = if key.is_some() { "Add it, paid on the chain" } else { "Pay on the chain" };
+        form.push_str(&format!(
+            "<form method=\"post\" action=\"/buy\">{hidden}<input type=\"hidden\" name=\"method\" value=\"onchain\">
+<p><label>Package <select name=\"package\">{options}</select></label></p>
+<button>{chain_button}</button>
+</form>
+<p class=\"you\">An address is shown, to send its price to. What arrives there buys at the package's rate once it is confirmed, whatever part or multiple of the price it is. What is paid is not given back.</p>
+"
+        ));
+    }
+    if by_token {
+        if by_invoice || on_the_chain {
             form.push_str("<h3>Or with a Cashu token</h3>\n");
         }
         form.push_str(&format!(

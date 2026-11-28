@@ -141,9 +141,12 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
                 let orders = store.orders(MAX_ORDERS).map_err(store_said)?;
                 let mut out = String::new();
                 for o in &orders {
-                    // Paid; or open, with a token or an invoice; or an
-                    // invoice that ended unpaid.
+                    // Paid; or open, with a token, an invoice or an
+                    // address; or one of those that ended unpaid. An
+                    // address something arrived at is open for more until
+                    // its end: its mint is still asked about it.
                     let state = match o {
+                        o if o.paid && o.ended == 0 && o.method == crate::store::ONCHAIN => "more",
                         o if o.paid => "paid",
                         o if o.ended > 0 => "ended",
                         _ => "open",
@@ -236,10 +239,12 @@ async fn of_the_site(site: &Site, line: &str) -> Option<String> {
                 let state = if mint.ready() { "reached" } else { "away" };
                 // Whether it gives invoices, as it said when last reached.
                 let invoices = if mint.gives_invoices(None) { "invoices" } else { "tokens" };
-                // Whether the wallet holds as much as it may there.
+                // Whether the wallet holds as much as it may there, and
+                // whether the mint takes payments on the chain.
                 let room = if mint.full() { "full" } else { "room" };
+                let chain = if mint.takes_onchain(None).is_some() { "onchain" } else { "offchain" };
                 out.push_str(&format!(
-                    "mint {} {state} {holds} {pending} {sold} {invoices} {out_of_it} {room}\n",
+                    "mint {} {state} {holds} {pending} {sold} {invoices} {out_of_it} {room} {chain}\n",
                     mint.name
                 ));
             }
@@ -328,13 +333,19 @@ async fn of_the_site(site: &Site, line: &str) -> Option<String> {
         // What the advert says of this exit's terms: what is configured,
         // whether or not its mints answer at this moment.
         ["terms"] => {
-            let invoices =
-                site.desk.as_ref().is_some_and(|desk| desk.wallets.mints.iter().any(|m| m.gives_invoices(None)));
-            let methods: &[&str] = match (&site.desk, invoices) {
-                (Some(_), true) => &["cashu", "bolt11"],
-                (Some(_), false) => &["cashu"],
-                (None, _) => &[],
-            };
+            // What each mint said when it was last reached, whether or not
+            // it answers at this moment.
+            let mints = site.desk.as_ref().map(|desk| desk.wallets.mints.as_slice());
+            let mut methods: Vec<&str> = Vec::new();
+            if let Some(mints) = mints {
+                methods.push("cashu");
+                if mints.iter().any(|mint| mint.gives_invoices(None)) {
+                    methods.push("bolt11");
+                }
+                if mints.iter().any(|mint| mint.takes_onchain(None).is_some()) {
+                    methods.push("onchain");
+                }
+            }
             let packages: Vec<serde_json::Value> = site
                 .config
                 .packages
@@ -435,13 +446,13 @@ mod tests {
         let w = crate::orders::testing::world(0, Duration::from_secs(600)).await;
         assert_eq!(
             of_the_site(&w.site, "wallet").await.unwrap(),
-            format!("mint {} reached 0 0 0 invoices 0 room\nok 1 500000 - 20000\n", w.mint)
+            format!("mint {} reached 0 0 0 invoices 0 room onchain\nok 1 500000 - 20000\n", w.mint)
         );
         assert_eq!(answer(&w.site.store, "orders", NOW), "ok 0\n");
         let bought = w.buy("fd77::7", "small", &w.token(64).await, None).await.unwrap();
         assert_eq!(
             of_the_site(&w.site, "wallet").await.unwrap(),
-            format!("mint {} reached 64 0 64 invoices 0 room\nok 1 500000 - 20000\n", w.mint)
+            format!("mint {} reached 64 0 64 invoices 0 room onchain\nok 1 500000 - 20000\n", w.mint)
         );
         let orders = answer(&w.site.store, "orders", NOW);
         let [order, id, state, _created, buyer, offer, sat, paid, fee, package, mint, method, ok, n] =
@@ -457,6 +468,34 @@ mod tests {
         assert_eq!((method, ok, n), ("cashu", "ok", "1"));
         // The package it made is among the packages, said to be bought.
         assert!(answer(&w.site.store, "packages", NOW).contains(" fd77::7 bought: small\n"));
+        // An address something arrived at is open for more until it ends.
+        let new = crate::store::NewInvoice {
+            method: crate::store::ONCHAIN,
+            buyer: "fd77::8".parse().unwrap(),
+            mint: &w.mint,
+            offer: "small",
+            bytes: 10_000_000,
+            sat: 64,
+            days: 1,
+            target: None,
+            quote: "q",
+            quote_key: None,
+            request: "bcrt1q",
+            expires: NOW + 3600,
+        };
+        w.site.store.invoice_begin("o00000000000000c1", &new, NOW).unwrap();
+        let state = |store: &Store| {
+            let said = answer(store, "orders", NOW);
+            let line = said.lines().find(|line| line.contains("o00000000000000c1")).unwrap().to_string();
+            line.split_whitespace().nth(2).unwrap().to_string()
+        };
+        assert_eq!(state(&w.site.store), "open");
+        w.site.store.order_credit("o00000000000000c1", 32, NOW).unwrap().unwrap();
+        assert_eq!(state(&w.site.store), "more");
+        w.site.store.invoice_end("o00000000000000c1", NOW + 4000).unwrap();
+        assert_eq!(state(&w.site.store), "paid");
+        w.site.store.change("DELETE FROM orders WHERE id = 'o00000000000000c1'");
+        w.site.store.change("DELETE FROM credits WHERE of_order = 'o00000000000000c1'");
         // What leaves the wallet, on the operator's word: a token, which
         // is out until somebody redeems it, and can be taken back.
         let said = of_the_site(&w.site, "token 40").await.unwrap();
@@ -489,7 +528,7 @@ mod tests {
         assert!(all.lines().any(|line| line.ends_with(&format!(" invoice 20 21 {} {invoice}", w.mint))), "{all}");
         assert_eq!(
             of_the_site(&w.site, "wallet").await.unwrap(),
-            format!("mint {} reached 43 0 64 invoices 21 room\nok 1 500000 - 20000\n", w.mint)
+            format!("mint {} reached 43 0 64 invoices 21 room onchain\nok 1 500000 - 20000\n", w.mint)
         );
         // What is not a withdrawal is said on one line, and takes nothing.
         for (asked, why) in [
@@ -511,7 +550,7 @@ mod tests {
         assert_eq!(
             said,
             serde_json::json!({
-                "price_msat_per_gb": 2000000, "methods": ["cashu", "bolt11"], "port": 5170, "mints": [w.mint],
+                "price_msat_per_gb": 2000000, "methods": ["cashu", "bolt11", "onchain"], "port": 5170, "mints": [w.mint],
                 "packages": [{"id": "small", "bytes": 10000000, "sat": 64, "days": 1},
                              {"id": "big", "bytes": 1000000000, "sat": 1500, "days": 30}],
             })

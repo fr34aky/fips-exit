@@ -5,8 +5,9 @@
 //! POST /buy         the same as a form, answered with a page
 //! ```
 //!
-//! (The same two ask for an invoice instead, with `"method": "bolt11"` and
-//! no token: see `invoices`.)
+//! (The same two ask for an invoice instead, with `"method": "bolt11"`, or
+//! for an address on the chain, with `"method": "onchain"`, and no token:
+//! see `invoices`.)
 //!
 //! With a `key`, what is bought is added to the package that key opens;
 //! without, it is a package of its own, with the device that asked in it.
@@ -88,10 +89,12 @@ pub struct Asked {
     #[serde(default)]
     pub key: Option<String>,
     /// How it is paid: `cashu`, with `token` (and so when nothing is said);
-    /// or `bolt11`, by an invoice that is asked for here.
+    /// `bolt11`, by an invoice that is asked for here; or `onchain`, to an
+    /// address that is.
     #[serde(default)]
     pub method: Option<String>,
-    /// For an invoice: the mint to ask for it, of those this exit accepts.
+    /// For an invoice or an address: the mint to ask for it, of those this
+    /// exit accepts.
     #[serde(default)]
     pub mint: Option<String>,
 }
@@ -152,10 +155,11 @@ pub enum Fault {
     Again,
     Bad(String),
     Store(String),
-    /// No invoice is to be had: no mint gives one for that much, or the
-    /// mint that was asked gave none.
+    /// No invoice is to be had, or no address: no mint gives one for that
+    /// much, or the mint that was asked gave none.
     NoInvoice(String),
-    /// The caller has this many invoices waiting to be paid already.
+    /// The caller has this many invoices waiting to be paid already, or
+    /// this many addresses.
     TooMany(usize),
     /// There is no such order, as far as the caller may know.
     NoOrder,
@@ -244,10 +248,8 @@ impl Fault {
         let untouched = if with_token { "The token was not touched." } else { "" };
         let said = match self {
             Fault::NotSold if !with_token => "Nothing can be bought here right now.".into(),
-            Fault::Busy if !with_token => {
-                "Too many invoices are being asked for just now: try again in a minute.".into()
-            }
-            Fault::Again if !with_token => "No invoice could be had just now: try again in a minute.".into(),
+            Fault::Busy if !with_token => "Too much is being ordered here just now: try again in a minute.".into(),
+            Fault::Again if !with_token => "The mint could not be asked just now: try again in a minute.".into(),
             Fault::WrongMint(mint) if !with_token => format!("{mint:.200} is not a mint this exit accepts."),
             Fault::NotSold => "Nothing can be bought here right now: no token is taken to a mint.".into(),
             Fault::NoOffer(id) => format!("No package {id:.40} is offered here. {untouched}"),
@@ -290,7 +292,7 @@ impl Fault {
             Fault::Store(e) => format!("the store: {e}"),
             Fault::NoInvoice(why) => format!("{why:.300}"),
             Fault::TooMany(waiting) => format!(
-                "This device has {waiting} invoices waiting to be paid here: pay one of them, or ask again when one \
+                "This device has {waiting} orders waiting to be paid here: pay one of them, or ask again when one \
                  has run out."
             ),
             Fault::NoOrder => "There is no such order of this device's.".into(),
@@ -938,7 +940,8 @@ pub async fn respond(
     kind: Kind,
     until: Instant,
 ) -> Response<Full<Bytes>> {
-    // Another way to pay than a token: an invoice is asked for.
+    // Another way to pay than a token: an invoice is asked for, or an
+    // address.
     if asked.method.as_deref().is_some_and(|method| method != crate::store::CASHU) {
         return crate::invoices::respond(site, caller, asked, kind, until).await;
     }
@@ -1174,8 +1177,7 @@ pub mod testing {
             fips_exit_test_mint::invoice(sat, *its_fate.lock().unwrap())
         }));
         desk.sweeping.pay_time = Duration::from_secs(3);
-        (desk.invoices.every, desk.invoices.grace, desk.invoices.pace, desk.invoices.life) =
-            (Duration::ZERO, 0, (0, 0), 0);
+        desk.invoices.at_once(0);
         let mut site = Site::new(config, exit, Arc::new(Store::in_memory()), Seats::default(), Arc::default());
         site.desk = Some(Arc::new(desk));
         World { site: Arc::new(site), mint: proxy.url.clone(), direct: mint, proxy, dir, seats, fate }
@@ -1222,8 +1224,7 @@ pub mod testing {
         /// wallet's file was lost, or with a second service on its seed.
         pub fn with_wallets(&self, wallets: Wallets) -> Arc<Site> {
             let mut desk = Desk::new(Arc::new(wallets), self.dir.join("control.sock"));
-            (desk.invoices.every, desk.invoices.grace, desk.invoices.pace, desk.invoices.life) =
-                (Duration::ZERO, 0, (0, 0), 0);
+            desk.invoices.at_once(0);
             let mut site = Site::new(
                 self.site.config.clone(),
                 self.site.exit.clone(),
@@ -1240,8 +1241,7 @@ pub mod testing {
         pub fn with_invoice_life(&self, life: u64) -> Arc<Site> {
             let wallets = self.site.desk.as_ref().unwrap().wallets.clone();
             let mut desk = Desk::new(wallets, self.dir.join("control.sock"));
-            (desk.invoices.every, desk.invoices.grace, desk.invoices.pace, desk.invoices.life) =
-                (Duration::ZERO, 0, (0, 0), life);
+            desk.invoices.at_once(life);
             let mut site = Site::new(
                 self.site.config.clone(),
                 self.site.exit.clone(),
@@ -1251,6 +1251,36 @@ pub mod testing {
             );
             site.desk = Some(Arc::new(desk));
             Arc::new(site)
+        }
+
+        /// The same exit, with its own wallet, where an address is good for
+        /// `seconds`.
+        pub fn with_chain_life(&self, seconds: u64) -> Arc<Site> {
+            self.with_waiting(|waiting| waiting.chain_life = seconds)
+        }
+
+        /// The same exit, with its own wallet, where the orders that wait
+        /// are looked at as `set` says.
+        pub fn with_waiting(&self, set: impl FnOnce(&mut crate::invoices::Waiting)) -> Arc<Site> {
+            let wallets = self.site.desk.as_ref().unwrap().wallets.clone();
+            let mut desk = Desk::new(wallets, self.dir.join("control.sock"));
+            desk.invoices.at_once(0);
+            set(&mut desk.invoices);
+            let mut site = Site::new(
+                self.site.config.clone(),
+                self.site.exit.clone(),
+                self.site.store.clone(),
+                Seats::default(),
+                Arc::default(),
+            );
+            site.desk = Some(Arc::new(desk));
+            Arc::new(site)
+        }
+
+        /// `sat` arrive at `address`, which the mint gave, and are
+        /// confirmed.
+        pub async fn deposit(&self, address: &str, sat: u64) {
+            fips_exit_test_mint::deposit(&self.direct, address, sat).await.unwrap();
         }
 
         /// From now on the mint's invoices are paid when [`World::pay`]
@@ -1308,7 +1338,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_token_buys_a_package() {
         let w = world(0, GIVE_UP).await;
-        assert_eq!(w.site.methods(), vec!["cashu", "bolt11"], "the tests' mint gives invoices too");
+        assert_eq!(w.site.methods(), vec!["cashu", "bolt11", "onchain"], "the tests' mint gives invoices too");
         let token = w.token(64).await;
         let bought = w.buy(BUYER, "small", &format!("  cashu:{token}\n"), None).await.unwrap();
         let (settled, now) = (&bought.settled, unix_now());

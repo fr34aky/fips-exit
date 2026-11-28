@@ -1007,6 +1007,7 @@ name = "fips-exit-payd"
 version = "0.1.0"
 dependencies = [
  "bip39",
+ "bitcoin",
  "bytes",
  "cdk",
  "cdk-sqlite",

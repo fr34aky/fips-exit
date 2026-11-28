@@ -5,7 +5,8 @@
 //! fips-exit-test-mint token <mint URL> <sat> [with-fee]  prints a token from that mint
 //! fips-exit-test-mint hold <mint URL>                    its invoices are paid by `pay` from now on
 //! fips-exit-test-mint pay <mint URL> <invoice>           that invoice of the mint's is paid
-//! fips-exit-test-mint last <mint URL>                    prints the invoice the mint gave last
+//! fips-exit-test-mint last <mint URL>                    prints the invoice, or the address, the mint gave last
+//! fips-exit-test-mint deposit <mint URL> <address> <sat> that much arrives at an address the mint gave, confirmed
 //! fips-exit-test-mint invoice <sat> [fails|hangs]        prints an invoice for a mint of these tests to pay
 //! fips-exit-test-mint redeem <mint URL> <token>          redeems a token of that mint: prints what it was worth
 //! ```
@@ -48,6 +49,10 @@ fn main() {
                 println!("{}", u64::from(got));
                 Ok(())
             }
+            ["deposit", mint, address, sat] => {
+                let sat = sat.parse().map_err(|_| format!("{sat}: sat"))?;
+                fips_exit_test_mint::deposit(mint, address, sat).await
+            }
             ["last", mint] => {
                 println!("{}", fips_exit_test_mint::last(mint).await?);
                 Ok(())
@@ -55,7 +60,8 @@ fn main() {
             _ => {
                 Err("usage: fips-exit-test-mint serve <[address]:port> [fee-ppk] | token <mint URL> <sat> [with-fee] \
                       | hold <mint URL> | pay <mint URL> <invoice> | last <mint URL> \
-                      | invoice <sat> [fails|hangs] | redeem <mint URL> <token>"
+                      | invoice <sat> [fails|hangs] | redeem <mint URL> <token> \
+                      | deposit <mint URL> <address> <sat>"
                     .to_string())
             }
         }

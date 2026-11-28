@@ -7,7 +7,9 @@ forwards that traffic to the legacy internet from its own addresses.
 The client side is in [fips2go](https://github.com/fr34aky/fips2go)
 (Overview → Internet route; it sends IPv4 only for now). Any Linux fips node
 can be a client too,
-with the kernel's `ip6tnl` (see `test/netns.sh` for the exact commands).
+with the kernel's `ip6tnl` (see `test/netns.sh` for the exact commands), and
+buys from a paid exit with `fips-exit-pay` (see *Buying from a Linux node*
+below).
 
 ## How it works
 
@@ -481,6 +483,70 @@ sudo fips-exit revoke <package>                       # taken back
   commands go to the service's own socket, `/run/fips-exit-payd/admin.sock`,
   which only root and the service can open.
 
+### Buying from a Linux node
+
+`fips-exit-pay` is the other side of the payment service: a command for a
+Linux node that wants to use somebody's paid exit. It asks the exit's
+service over the mesh what the exit's page asks it, as the node it runs on.
+It needs no root and holds no money: a token is yours, from a wallet of
+your own, and an invoice or an address is paid from one.
+
+```sh
+./install.sh client      # builds and installs fips-exit-pay, and nothing else
+```
+
+```sh
+fips-exit-pay terms npub1…                       # what the exit costs, and what this node has there
+fips-exit-pay buy npub1… 1gb --invoice           # a Lightning invoice, shown with a QR code; waits until it is paid
+fips-exit-pay buy npub1… 1gb --onchain           # an address on the chain, the same way
+fips-exit-pay buy npub1… 1gb --token-file t.txt  # a Cashu token of a mint the exit takes (- : from standard input)
+fips-exit-pay buy npub1… 1gb --invoice --add     # added to the package whose key is kept, not a new one
+fips-exit-pay order npub1… --wait                # what became of the last order made here (or of one that is named)
+fips-exit-pay package npub1…                     # the package: what is left, until when, who is in it
+fips-exit-pay key npub1…                         # its key, to give to another device of yours
+fips-exit-pay join npub1… --key-file key.txt     # on that device: put it into the package the key opens
+fips-exit-pay remove npub1… npub1other…          # take a member out
+fips-exit-pay leave npub1…                       # take this node out of the package it is in
+```
+
+- **The exit is named by its npub**, which is its name on the mesh
+  (`<npub>.fips`) and the way to it. The command resolves that name as
+  anything on the node does, through fips, and asks only if it comes out as
+  the address that follows from the npub: the mesh carries a connection
+  to that address to the holder of that key and to nobody else. So there
+  is no TLS, and none is missing. `--connect <address>` names the address
+  by hand instead, and then nothing but you says who answers there.
+- **What it checks before it shows you something to pay**: that the terms
+  are of the kind it knows; that who answers says it is the exit you
+  named; that the order is for the price those terms name; that an invoice
+  asks for exactly that many sat (it reads the amount out of the invoice);
+  that an address is written as one; and that the order has not ended. If
+  one of them does not hold, nothing is shown. It cannot check whom an
+  invoice or an address pays: that is the exit's word, and its mint's.
+- **A token is read from a file or from standard input**, not from the
+  command line, which other users of the machine can read. The same token
+  sent again is the same purchase, so when an answer is lost the command
+  sends it again by itself; if it still does not know, it ends with 3 and
+  running the same again is safe.
+- **What it keeps**: `~/.local/state/fips-exit-pay/<npub>.json` (or under
+  `$XDG_STATE_HOME`; `--state <dir>` for another place), a file that is
+  yours alone, with the orders made at that exit and the key of the
+  package bought there. An order paid by invoice or on the chain is found
+  again by its name only, and a package is managed by its key only: the
+  exit tells neither to a node that has lost it. Whoever reads the file
+  manages the package. The key is printed when it is first had, too.
+- A package's key is asked for by itself once an invoice or an address is
+  paid. `key --new` asks the exit for another, and the one before opens
+  nothing any more.
+- For a program: `--json` prints the exit's own answers, a line each. The
+  command ends with 0 when it is done, 1 when the exit refused or it
+  failed, 3 when it is not decided yet (an order that waits, a token whose
+  end is not known), 2 when it was asked wrongly.
+- Whatever an exit says is shown as plain words on one line: an exit's
+  name cannot move the cursor or hide what is next to it.
+- Not in it: finding exits (their adverts are on Nostr; the phone reads
+  them), and the tunnel itself, which is the kernel's.
+
 ### Accounts
 
 With `ACCESS=paid` in the config the exit also carries addresses that are
@@ -623,12 +689,12 @@ an optimisation, not a requirement.
 
 Optional paid public exits (an advert with price and country, prepaid data
 packages, pay-as-you-go) are designed in
-[`docs/paid-exit.md`](docs/paid-exit.md). Its first eight phases are here:
+[`docs/paid-exit.md`](docs/paid-exit.md). Its first nine phases are here:
 accounts and `ACCESS=paid`, the advert, the payment service, packages and
 their keys, packages sold for Cashu tokens, for Lightning invoices and for
-bitcoin on the chain, and paying out of the wallet with a limit on what it
-holds, all above. To come: a command-line client, and pay-as-you-go
-channels.
+bitcoin on the chain, paying out of the wallet with a limit on what it
+holds, and a command line for a Linux node that buys, all above. To come:
+pay-as-you-go channels.
 
 ## Test
 
@@ -639,10 +705,10 @@ cargo test --manifest-path payd/Cargo.toml   # the advert's tags, the price, the
 python3 -I -m unittest discover -s test      # the script's advert
 ```
 
-The namespace test runs the payment service too, and a mint for it, so it
-needs both built:
+The namespace test runs the payment service too, a mint for it and a
+client's command line, so it needs the three built:
 `cargo build --release --manifest-path payd/Cargo.toml -p fips-exit-payd` and
-`cargo build --manifest-path payd/Cargo.toml -p fips-exit-test-mint`.
+`cargo build --manifest-path payd/Cargo.toml -p fips-exit-test-mint -p fips-exit-pay`.
 
 The tests in `payd/` and that mint need `protoc` to be built (the package
 `protobuf-compiler`, or `protobuf`): the wallet library's mint side wants
@@ -662,7 +728,9 @@ a package with a token of a mint that runs in the test and is carried,
 another pays an invoice of that mint for one, a token and an invoice leave
 the wallet again on the operator's word, a full wallet sells nothing, half
 a package's price and then the rest arrive at an address of that mint and
-buy half of it and then the whole, and
+buy half of it and then the whole, a node buys from its command line by
+token and by invoice and another puts itself into that package with the
+key, and
 leaving the mode removes what it made, the opening for the payment service
 with it.
 
@@ -682,7 +750,12 @@ tested against it, a token spent twice, one spent elsewhere, an invoice
 paid late or never, a part of a price and more than a price arriving on
 the chain, an answer that never arrived and a service that died between a
 payment and its package among them. It is not
-installed, and nothing it gives out is worth anything.
+installed, and nothing it gives out is worth anything. `payd/client` is
+`fips-exit-pay`, with four dependencies and none of the wallet's: what it
+does with an answer that is not an exit's, an invoice that asks for another
+amount than the price, text that would write to the terminal, and a lost
+answer is tested against a stand-in, and what it buys is tested against the
+payment service itself and that mint, in the service's own tests.
 
 The fourth is the script's side of the advert: the signature against the
 vectors of BIP-340, the tags against the same file of cases, and the

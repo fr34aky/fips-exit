@@ -1003,6 +1003,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e44f110d1777dc6559a51e7d45083945ded4f1bf3305494350f693b6d20b9c8"
 
 [[package]]
+name = "fips-exit-pay"
+version = "0.1.0"
+dependencies = [
+ "fips-exit-proto",
+ "qrcode",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "fips-exit-payd"
 version = "0.1.0"
 dependencies = [
@@ -1011,6 +1021,7 @@ dependencies = [
  "bytes",
  "cdk",
  "cdk-sqlite",
+ "fips-exit-pay",
  "fips-exit-proto",
  "fips-exit-test-mint",
  "http-body-util",

@@ -1,10 +1,10 @@
 # The paid exit's own workspace, with its own lockfile: what is built here
 # brings dependencies, and fips-exitd at the top of the repository keeps its
-# one. It holds the crate both sides of the exit share (proto) and the
-# payment service (payd).
+# one. It holds the crate both sides of the exit share (proto), the payment
+# service (payd), a client's command line (client), and a mint for the tests.
 [workspace]
 resolver = "3"
-members = ["proto", "payd", "test-mint"]
+members = ["proto", "payd", "client", "test-mint"]
 
 [workspace.package]
 edition = "2024"

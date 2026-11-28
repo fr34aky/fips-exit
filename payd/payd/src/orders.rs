@@ -1262,13 +1262,18 @@ pub mod testing {
         /// The same exit, with its own wallet, where the orders that wait
         /// are looked at as `set` says.
         pub fn with_waiting(&self, set: impl FnOnce(&mut crate::invoices::Waiting)) -> Arc<Site> {
+            self.as_exit(&self.site.exit.npub, set)
+        }
+
+        /// The same exit again, under the name `npub`.
+        pub fn as_exit(&self, npub: &str, set: impl FnOnce(&mut crate::invoices::Waiting)) -> Arc<Site> {
             let wallets = self.site.desk.as_ref().unwrap().wallets.clone();
             let mut desk = Desk::new(wallets, self.dir.join("control.sock"));
             desk.invoices.at_once(0);
             set(&mut desk.invoices);
             let mut site = Site::new(
                 self.site.config.clone(),
-                self.site.exit.clone(),
+                Exit { npub: npub.to_string(), ..self.site.exit.clone() },
                 self.site.store.clone(),
                 Seats::default(),
                 Arc::default(),

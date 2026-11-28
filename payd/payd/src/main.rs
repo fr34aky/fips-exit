@@ -12,6 +12,8 @@
 //! docs/paid-exit.md.
 
 mod admin;
+#[cfg(test)]
+mod by_command_line;
 mod config;
 mod http;
 mod identity;

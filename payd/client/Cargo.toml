@@ -1,0 +1,27 @@
+[package]
+name = "fips-exit-pay"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Buying and managing packages at a paid fips exit, from a Linux node's command line"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fips-exit-pay"
+path = "src/main.rs"
+
+# Few, on purpose: this runs on a node that only wants to use an exit. No
+# wallet, no TLS, no runtime: it talks plain HTTP over the mesh, where fips
+# has encrypted and authenticated the connection already.
+[dependencies]
+fips-exit-proto = { path = "../proto" }
+# What the exit's payment service says is JSON.
+serde_json = "1"
+# The fips address of the exit's npub is SHA-256 of its key: what is talked
+# to is checked against it.
+sha2 = "0.10"
+# An invoice or an address as a QR code, drawn in the terminal.
+qrcode = { version = "0.14", default-features = false }

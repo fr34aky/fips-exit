@@ -1,8 +1,17 @@
 #!/bin/sh
 # Build the daemon and install it, the control script and the service.
 #   ./install.sh            (asks sudo for the install step)
+#   ./install.sh client     on a node that only uses exits: fips-exit-pay,
+#                           to buy and manage packages there, and nothing else
 set -eu
 cd "$(dirname "$0")"
+if [ "${1:-}" = client ]; then
+  cargo build --release --manifest-path payd/Cargo.toml -p fips-exit-pay
+  sudo install -m 755 payd/target/release/fips-exit-pay /usr/local/bin/fips-exit-pay
+  echo "installed. What an exit costs: fips-exit-pay terms <the exit's npub>"
+  exit 0
+fi
+[ $# = 0 ] || { echo "usage: ./install.sh [client]" >&2; exit 2; }
 cargo build --release
 cargo build --release --manifest-path payd/Cargo.toml -p fips-exit-payd
 # The group the payment service is in, to which the daemon opens its socket.

@@ -601,11 +601,16 @@ class Command(unittest.TestCase):
             "wallet": "ok 0 0 - 20000\n",
             "token 1000": "token w0123456789abcdef 1003 cashuBtokentext\nok\n",
             "token 5 https://b.example": "err the wallet holds 0 sat at https://b.example\n",
-            "tokens": "token 01a2-name https://mint.example.org cashuBtokentext\nok 1\n",
+            "tokens": "token 01a2-name https://mint.example.org cashuBtokentext asked\n"
+                      "token 02b3-name https://b.example cashuBothertext unasked\nok 2\n",
             "take-back 01a2-name": "back 1000\nok\n",
             f"quote {invoice}": "quote q-1 500 10 1800000000 https://mint.example.org\nok\n",
             "pay q-1 https://mint.example.org": "paid w1123456789abcdef 500 1 -\nok\n",
-            "sweep": "pending w2123456789abcdef\nnothing https://b.example\nok\n",
+            "sweep": "paid w2123456789abcdef 900 2 -\nnothing https://b.example\nok\n",
+            "sweep https://c.example": "paid w3123456789abcdef 900 2 -\nerror https://c.example is not reached\nok\n",
+            "sweep https://d.example": "pending w4123456789abcdef\nok\n",
+            "quote lnbc7fails": "quote q-7 500 10 1800000000 https://mint.example.org\nok\n",
+            "pay q-7 https://mint.example.org": "failed w5123456789abcdef no way to the payee\nok\n",
             "withdrawals": "withdrawal w1123456789abcdef done 1800000000 invoice 500 501 https://mint.example.org "
                            + invoice + "x" * 60 + "\nwithdrawal w0123456789abcdef back 1800000000 token 1000 0 "
                            "https://mint.example.org -\nok 2\n"})
@@ -617,7 +622,11 @@ class Command(unittest.TestCase):
         self.assertIn("the wallet holds 0 sat", str(status))
         for not_sat in ("0", "-5", "5.5", "many", "٥"):
             self.assertIn("a number of sat", str(self.run_wallet("token", not_sat)[0]))
-        self.assertIn("01a2-name  of https://mint.example.org\n  cashuBtokentext", self.run_wallet("tokens")[1])
+        listed = self.run_wallet("tokens")[1]
+        self.assertIn("01a2-name  of https://mint.example.org\n  cashuBtokentext", listed)
+        # One whose mint could not be asked is listed all the same: its text is what was lost.
+        self.assertIn("02b3-name  of https://b.example  (its mint could not be asked", listed)
+        self.assertIn("  cashuBothertext", listed)
         self.assertIn("1000 sat are the wallet's again", self.run_wallet("take-back", "01a2-name")[1])
         # An invoice is paid when the operator says so, and not when asked through a pipe.
         status, out, _ = self.run_wallet("pay", invoice, "--yes")
@@ -629,9 +638,22 @@ class Command(unittest.TestCase):
         self.assertIn("--yes", str(status))
         self.assertNotIn("paid:", out)
         self.assertIn("not an invoice", str(self.run_wallet("pay", "lnbc1 pay q-2", "--yes")[0]))
-        out = self.run_wallet("sweep")[1]
-        self.assertIn("under way", out)
+        status, out, _ = self.run_wallet("sweep")
+        self.assertEqual(status, 0)
+        self.assertIn("paid: 900 sat", out)
         self.assertIn("nothing to send on at https://b.example", out)
+        # What a caller goes by: paid is 0; not paid is 1, with what was paid said all the same; not
+        # known yet is 3.
+        status, out, _ = self.run_wallet("sweep", "https://c.example")
+        self.assertEqual(status, 1)
+        self.assertIn("paid: 900 sat", out)
+        self.assertIn("not sent on from https://c.example: is not reached", out)
+        status, out, _ = self.run_wallet("sweep", "https://d.example")
+        self.assertEqual(status, 3)
+        self.assertIn("under way", out)
+        status, out, _ = self.run_wallet("pay", "lnbc7fails", "--yes")
+        self.assertEqual(status, 1)
+        self.assertIn("not paid, and nothing left the wallet: no way to the payee", out)
         rows = self.run_wallet("out")[1].splitlines()
         self.assertEqual(rows[1].split()[:8], ["w1123456789abcdef", "done", rows[1].split()[2], rows[1].split()[3],
                                                "invoice", "500", "sat", "501"])

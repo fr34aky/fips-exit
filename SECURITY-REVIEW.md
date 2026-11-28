@@ -328,7 +328,11 @@ IPv4 address derived from the client's fips address.
   and not in the log); and a withdrawal that happened and is not written
   down, or is written down as failed when the money left (each is written
   before the mint is asked, and one whose end is not known counts as
-  gone).
+  gone: a token whose making was interrupted, a payment whose answer was
+  lost, a token taken back whose exchange was not heard of). And the
+  wallet taking for its own again, when it counts from its seed, a token
+  it handed out that nobody has redeemed: the mint calls that unspent, and
+  it is its holder's.
 - **A page on another site changing a package.** Through a browser on the
   mesh it could reach the exit; it must not be able to send a form the
   service takes (`Origin`), nor JSON (which a browser sends elsewhere only

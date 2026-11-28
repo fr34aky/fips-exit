@@ -332,15 +332,20 @@ sudo fips-exit wallet out                        # what left the wallet, and wha
   redeems it, as near as the mint's fee for that lets it be, and that fee
   is taken out of the exit's wallet with it. The command prints the text
   alone, so that it can be piped; what else it says goes to standard error.
-  Until somebody redeems it the wallet keeps its text (`wallet tokens`), and
-  it can be taken back, which makes that text worthless.
+  Until somebody redeems it the wallet keeps its text (`wallet tokens`,
+  also while its mint cannot be asked), and it can be taken back, which
+  makes that text worthless. A token that is out stays its holder's when
+  the wallet counts again from its seed.
 - **An invoice** is paid by the mint with what the wallet holds (a melt,
   NUT-05). The mint is asked what it takes first: the amount, and the most
   the mint may keep on top for the payment's fee (what it does not use
-  comes back). It is paid when you say so: `--yes` for a script. An invoice
-  is paid once. If the mint has not said after a minute what became of a
-  payment, it is written down as begun, counts as gone, and the mint is
-  asked about it every minute until it says.
+  comes back). It is paid when you say so: `--yes` for a script, which can
+  go by how the command ends: 0 when it is paid, 1 when it is not, 3 when
+  the mint has not said yet. An invoice is paid once: one that a
+  withdrawal paid, or is paying, is not quoted again. If the mint has not
+  said after a minute what became of a payment, it is written down as
+  begun, counts as gone, and the mint is asked about it every minute until
+  it says.
 - **`SWEEP_TO`** is a Lightning address of yours (`name@host`). Once a
   minute each mint's holdings are looked at, and what is over `SWEEP_ABOVE`
   starts a payment of all that is held there, less a fiftieth and 4 sat

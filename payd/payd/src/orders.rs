@@ -679,6 +679,29 @@ pub async fn round(site: &Site) -> usize {
     left + open.iter().filter(|order| desk.wallets.named(&order.mint).is_none()).count()
 }
 
+/// Let the wallet finish what it was interrupted in at `mint`, for
+/// something that is not an order: a token it was making, or taking back.
+/// What it asked the mint to sign for every open order is kept first, as
+/// [`decide`] keeps it: the wallet does not know that any more once it has
+/// put itself right, and an order is decided by it. Whether the wallet
+/// finished. The caller holds the mint's turn.
+pub async fn finish(site: &Site, mint: &Mint) -> bool {
+    let Ok(open) = site.store.orders_open() else { return false };
+    for order in open.iter().filter(|order| order.mint == mint.name && order.outputs.is_none()) {
+        let Ok(receipt) = <[u8; 32]>::try_from(order.receipt.as_slice()) else { continue };
+        match mint.unfinished(&receipt).await {
+            Ok(Some(wallet::Unfinished { outputs: Some(outputs) })) => {
+                if site.store.order_keep_outputs(&order.id, &outputs).is_err() {
+                    return false;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    mint.put_right().await.is_ok()
+}
+
 /// What [`decide`] came to.
 struct Decided {
     /// How many orders at the mint are still open.

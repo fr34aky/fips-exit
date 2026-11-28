@@ -32,8 +32,10 @@ above SWEEP_ABOVE sat at a mint; at WALLET_CAP sat a mint sells nothing more:
   fips-exit wallet token <sat> [mint]                    a Cashu token of that much: its text is the money
   fips-exit wallet tokens                                the tokens handed out that nobody has redeemed
   fips-exit wallet take-back <name>                      one of those, back into the wallet
-  fips-exit wallet pay <invoice> [mint] [--yes]          pay a Lightning invoice out of the wallet (asks first)
-  fips-exit wallet sweep [mint]                          send on to SWEEP_TO now, whatever is held
+  fips-exit wallet pay <invoice> [mint] [--yes]          pay a Lightning invoice out of the wallet (asks first);
+                                                         ends with 0 when it is paid, 1 when not, 3 when the
+                                                         mint has not said yet
+  fips-exit wallet sweep [mint]                          send on to SWEEP_TO now, whatever is held; ends alike
   fips-exit wallet out                                   what left the wallet, and what it cost
 
 And packages the operator gives away, without payment:
@@ -1481,7 +1483,11 @@ def word_of(text, what):
 
 
 def left_said(lines):
-    """What became of payments from the wallet, as the service says it."""
+    """What became of payments from the wallet, as the service says it.
+    The script ends with what a caller can go by: 0 when everything asked
+    was paid (or there was nothing to pay), 1 when something was not, 3
+    when the end of something is not known yet."""
+    worst = 0
     for line in lines[:-1]:
         words = line.split()
         if words[:1] == ["paid"] and len(words) == 5:
@@ -1490,12 +1496,19 @@ def left_said(lines):
         elif words[:1] == ["pending"] and len(words) == 2:
             print(f"under way: the mint has not said what became of it (withdrawal {shown(words[1], 20)}). "
                   "It counts as gone until it does: fips-exit wallet out")
+            worst = worst or 3
         elif words[:1] == ["failed"] and len(words) >= 2:
             print(f"not paid, and nothing left the wallet: {shown(' '.join(words[2:]), 300)}")
+            worst = 1
+        elif words[:1] == ["error"] and len(words) >= 2:
+            print(f"not sent on from {shown(words[1], 256)}: {shown(' '.join(words[2:]), 300)}")
+            worst = 1
         elif words[:1] == ["nothing"] and len(words) == 2:
             print(f"nothing to send on at {shown(words[1], 256)}")
         else:
             die(f"the payment service said: {shown(line, 200)}")
+    if worst:
+        sys.exit(worst)
 
 
 def wallet_token(sat, mint=None):
@@ -1517,10 +1530,12 @@ def wallet_tokens():
     lines = payd("tokens", wait=90)
     for line in lines[:-1]:
         try:
-            _, name, mint, text = line.split()
+            _, name, mint, text, asked = line.split()
         except ValueError:
             die(f"the payment service said something that is not a token: {shown(line, 200)}")
-        print(f"{shown(name, 40)}  of {shown(mint, 256)}\n  {shown(text, 1 << 16)}")
+        # A mint that could not be asked may have redeemed it meanwhile: its text is here all the same.
+        unasked = "" if asked == "asked" else "  (its mint could not be asked just now whether it was redeemed)"
+        print(f"{shown(name, 40)}  of {shown(mint, 256)}{unasked}\n  {shown(text, 1 << 16)}")
     if len(lines) == 1:
         print("(none: every token handed out was redeemed, or taken back)")
 

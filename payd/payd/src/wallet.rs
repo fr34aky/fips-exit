@@ -53,8 +53,8 @@ use cdk::nuts::{
     ProofsMethods, PublicKey, RestoreRequest, SecretKey, State, Token,
 };
 use cdk::wallet::types::{
-    KeysetLoadPolicy, OperationData, ReceiveSagaState, TransactionDirection, TransactionId, TransactionStatus,
-    WalletSagaState,
+    KeysetLoadPolicy, OperationData, ReceiveSagaState, SendSagaState, TransactionDirection, TransactionId,
+    TransactionStatus, WalletSagaState,
 };
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk_sqlite::wallet::WalletSqliteDatabase;
@@ -181,6 +181,17 @@ impl Lightning {
             describes: matches!(its.options, Some(MintMethodOptions::Bolt11 { description: true })),
         })
     }
+}
+
+/// What the wallet has of a token it was to hand out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TokenState {
+    /// Made, and not redeemed as far as the wallet knows: it is out.
+    Out,
+    /// Begun and not made: the wallet may hold something for it still.
+    Unfinished,
+    /// Nothing: it was never made, or was redeemed, or taken back.
+    Nothing,
 }
 
 /// What paying an invoice from the wallet takes, as the mint quotes it.
@@ -601,29 +612,39 @@ impl Mint {
         Ok(within(prepared.confirm(None)).await?.to_string())
     }
 
-    /// Is the token the wallet keeps as `name` made, and not redeemed as
-    /// far as the wallet knows?
-    pub async fn token_is_out(&self, name: &str) -> Result<bool, String> {
-        let Ok(name) = name.parse() else { return Ok(false) };
-        let saga = self.db.get_saga(&name).await.map_err(said)?;
-        Ok(saga.is_some_and(|saga| matches!(saga.data, OperationData::Send(data) if data.token.is_some())))
+    /// What the wallet has, at this mint, of the token it keeps as `name`.
+    pub async fn token_state(&self, name: &str) -> Result<TokenState, String> {
+        let Ok(name) = name.parse() else { return Ok(TokenState::Nothing) };
+        let saga = self.db.get_saga(&name).await.map_err(said)?.filter(|saga| saga.mint_url == self.url);
+        Ok(match saga.map(|saga| (saga.state, saga.data)) {
+            Some((WalletSagaState::Send(SendSagaState::TokenCreated), OperationData::Send(data)))
+                if data.token.is_some() =>
+            {
+                TokenState::Out
+            }
+            Some((WalletSagaState::Send(_), _)) => TokenState::Unfinished,
+            _ => TokenState::Nothing,
+        })
     }
 
-    /// The tokens handed out that nobody has redeemed, as far as the mint
-    /// says: each by its name, with its text. Those that were redeemed are
-    /// struck off the wallet's list by asking. The caller holds
-    /// [`Mint::turn`].
-    pub async fn tokens_out(&self) -> Result<Vec<(String, String)>, String> {
+    /// The tokens handed out that nobody has redeemed: each by its name,
+    /// with its text, and whether the mint could be asked about it just
+    /// now. Those the mint says were redeemed are struck off the wallet's
+    /// list by asking; one it could not be asked about is listed all the
+    /// same, since its text is here. The caller holds [`Mint::turn`].
+    pub async fn tokens_out(&self) -> Result<Vec<(String, String, bool)>, String> {
         let mut out = Vec::new();
         for name in self.wallet.get_pending_sends().await.map_err(said)? {
-            if within(self.wallet.check_send_status(name)).await? {
-                continue;
-            }
+            let asked = match within(self.wallet.check_send_status(name)).await {
+                Ok(true) => continue,
+                Ok(false) => true,
+                Err(_) => false,
+            };
             let saga = self.db.get_saga(&name).await.map_err(said)?;
             if let Some(OperationData::Send(data)) = saga.map(|saga| saga.data)
                 && let Some(token) = data.token
             {
-                out.push((name.to_string(), token));
+                out.push((name.to_string(), token, asked));
             }
         }
         Ok(out)
@@ -829,6 +850,20 @@ impl Mint {
             .await
             .map_err(|_| "the mint did not answer in time".to_string())?
             .map_err(said)?;
+        // A token that was handed out and not redeemed is unspent at the
+        // mint, and counting takes whatever is unspent for the wallet's
+        // own. It is its holder's: put back as out, so that it is not
+        // spent from under them.
+        for saga in self.db.get_incomplete_sagas().await.map_err(said)? {
+            if saga.mint_url == self.url
+                && let (WalletSagaState::Send(SendSagaState::TokenCreated), OperationData::Send(data)) =
+                    (&saga.state, &saga.data)
+                && let Some(proofs) = &data.proofs
+            {
+                let ys = proofs.ys().map_err(said)?;
+                self.db.update_proofs_state(ys, State::PendingSpent).await.map_err(said)?;
+            }
+        }
         Ok(format!("{} sat found again at the mint, {} spent, {} under way", found.unspent, found.spent, found.pending))
     }
 }

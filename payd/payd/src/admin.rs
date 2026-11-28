@@ -267,9 +267,11 @@ async fn of_the_site(site: &Site, line: &str) -> Option<String> {
         }
         ["tokens"] => Some(match payouts::tokens(site).await {
             Ok(out) => {
-                let lines: String =
-                    out.iter().map(|(mint, name, text)| format!("token {name} {mint} {text}\n")).collect();
-                format!("{lines}ok {}\n", out.len())
+                // Whether the mint could be asked if it was redeemed.
+                let line = |(mint, name, text, asked): &(String, String, String, bool)| {
+                    format!("token {name} {mint} {text} {}\n", if *asked { "asked" } else { "unasked" })
+                };
+                format!("{}ok {}\n", out.iter().map(line).collect::<String>(), out.len())
             }
             Err(e) => format!("err {}\n", one_line(&e)),
         }),
@@ -298,13 +300,23 @@ async fn of_the_site(site: &Site, line: &str) -> Option<String> {
         }
         ["sweep"] | ["sweep", _] => {
             let Some(desk) = &site.desk else { return Some("err there is no wallet\n".into()) };
+            if site.config.sweep_to.is_none() {
+                return Some("err nowhere to send it: SWEEP_TO is not set\n".into());
+            }
             let named = line.split_whitespace().nth(1);
+            if let Some(name) = named
+                && desk.wallets.named(name).is_none()
+            {
+                return Some(format!("err {} is not a mint in MINTS\n", one_line(name)));
+            }
+            // Each mint for itself: what left one is said whatever became
+            // of the next.
             let mut out = String::new();
             for mint in desk.wallets.mints.iter().filter(|mint| named.is_none_or(|name| name == mint.name)) {
                 match payouts::sweep(site, desk, mint, true).await {
                     Ok(Some((id, left))) => out.push_str(&left_line(&id, &left)),
                     Ok(None) => out.push_str(&format!("nothing {}\n", mint.name)),
-                    Err(e) => return Some(format!("err {}: {}\n", mint.name, one_line(&e))),
+                    Err(e) => out.push_str(&format!("error {} {}\n", mint.name, one_line(&e))),
                 }
             }
             Some(format!("{out}ok\n"))
@@ -451,7 +463,7 @@ mod tests {
         let ["token", id, "40", text, "ok"] = said.split_whitespace().collect::<Vec<_>>()[..] else { panic!("{said}") };
         assert!(id.starts_with('w') && text.starts_with("cashu"), "{said}");
         let out = of_the_site(&w.site, "tokens").await.unwrap();
-        let ["token", name, mint, its_text, "ok", "1"] = out.split_whitespace().collect::<Vec<_>>()[..] else {
+        let ["token", name, mint, its_text, "asked", "ok", "1"] = out.split_whitespace().collect::<Vec<_>>()[..] else {
             panic!("{out}")
         };
         assert_eq!((mint, its_text), (w.mint.as_str(), text));

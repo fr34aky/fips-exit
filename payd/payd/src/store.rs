@@ -964,13 +964,25 @@ impl Store {
         Ok(id)
     }
 
-    /// Withdrawal `id` came to an end: it is `done`, and `cost_sat` left
-    /// the wallet for it; or it failed, and nothing did.
+    /// Withdrawal `id` came to an end: it is `done`; or it failed, and
+    /// what was to leave did not. `cost_sat` is what left the wallet for it
+    /// either way: for one that failed, what the mint took for the try, if
+    /// anything.
     pub fn withdrawal_end(&self, id: &str, done: bool, cost_sat: u64, now: u64) -> Result<(), Refused> {
-        let (state, cost) = if done { ("done", cost_sat) } else { ("failed", 0) };
+        let state = if done { "done" } else { "failed" };
         self.db().execute(
             "UPDATE withdrawals SET state = ?2, cost_sat = ?3, ended = ?4 WHERE id = ?1 AND state = 'begun'",
-            params![id, state, as_i64(cost), as_i64(now)],
+            params![id, state, as_i64(cost_sat), as_i64(now)],
+        )?;
+        Ok(())
+    }
+
+    /// What left the wallet so far for withdrawal `id`, which is under way:
+    /// as it was measured, in place of the most it might be.
+    pub fn withdrawal_cost(&self, id: &str, cost_sat: u64) -> Result<(), Refused> {
+        self.db().execute(
+            "UPDATE withdrawals SET cost_sat = ?2 WHERE id = ?1 AND state = 'begun'",
+            params![id, as_i64(cost_sat)],
         )?;
         Ok(())
     }
@@ -1010,10 +1022,11 @@ impl Store {
     }
 
     /// What has left the wallet at `mint` in all, in sat, counting what is
-    /// under way as gone.
+    /// under way as gone, and what a try that failed or a token taken back
+    /// cost.
     pub fn paid_out(&self, mint: &str) -> Result<u64, Refused> {
         let sat: i64 = self.db().query_row(
-            "SELECT COALESCE(SUM(cost_sat), 0) FROM withdrawals WHERE mint = ?1 AND state IN ('begun', 'done', 'back')",
+            "SELECT COALESCE(SUM(cost_sat), 0) FROM withdrawals WHERE mint = ?1",
             [mint],
             |row| row.get(0),
         )?;

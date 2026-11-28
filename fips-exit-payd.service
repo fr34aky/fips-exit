@@ -1,12 +1,13 @@
 [Unit]
-Description=fips exit node: its payment service (what it costs, over the mesh)
+Description=fips exit node: its payment service (what it costs, and paying for it, over the mesh)
 After=fips.service fips-exit.service network-online.target
 Wants=network-online.target
 
 [Service]
 # Reads /etc/fips-exit/config (ACCESS=paid, PRICE_MSAT_PER_GB, PACKAGES,
 # MINTS, PAY_PORT) and answers on this node's fips address. Does nothing,
-# and succeeds, when ACCESS is not paid.
+# and succeeds, when ACCESS is not paid. With MINTS it keeps a Cashu wallet
+# and asks those mints, and nobody else, over the internet.
 ExecStart=/usr/local/sbin/fips-exit-payd
 # The exit opens the service's port to the mesh while it listens there, and
 # closes it when it stops: `up` looks, as root ("+"), and its failure (the
@@ -16,9 +17,10 @@ ExecStopPost=-+/usr/local/sbin/fips-exit up
 Restart=on-failure
 RestartSec=5
 
-# A user of its own, made for it. Its packages are kept in
-# /var/lib/fips-exit-payd (systemd keeps them across restarts); the
-# operator's socket is in /run/fips-exit-payd, for this user and root.
+# A user of its own, made for it. Its packages, its wallet and the wallet's
+# seed are kept in /var/lib/fips-exit-payd (systemd keeps them across
+# restarts, and from every other user); the operator's socket is in
+# /run/fips-exit-payd, for this user and root.
 DynamicUser=yes
 StateDirectory=fips-exit-payd
 RuntimeDirectory=fips-exit-payd
@@ -45,7 +47,8 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# IPv6 to listen, IPv4 for nothing yet, a Unix socket for the journal.
+# IPv6 to listen, either family to reach a mint, Unix sockets for the
+# journal, the daemon and the operator.
 RestrictAddressFamilies=AF_INET6 AF_INET AF_UNIX
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources

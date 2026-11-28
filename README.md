@@ -119,9 +119,13 @@ sudo systemctl enable --now fips-exit-advert.timer   # and every hour
 
 - The advert says that this npub is an exit, the name and the note, the
   country, and `allow-list`: that it serves whom its operator put on its
-  list. It says that with `ACCESS=paid` as well, for as long as nothing here
-  takes a payment. Anyone can read it. The country is your claim; nobody
-  checks it.
+  list. An exit that sells (`ACCESS=paid`, its payment service running, a
+  mint named) says `paid` instead, with what the service says it costs: the
+  price, the packages, the mints, the port. Anyone can read it. The country
+  is your claim; nobody checks it.
+- fips2go, as released, lists exits that say `open` or `allow-list`, and
+  passes over one that says `paid`: until it reads paid adverts, a paid
+  exit is found by its npub, not in that list.
 - It is valid for three hours and published again every hour. An exit that
   stops drops out of the lists within three hours; nothing takes the advert
   back sooner.
@@ -140,14 +144,14 @@ sudo systemctl enable --now fips-exit-advert.timer   # and every hour
 
 `fips-exit-payd` runs beside the exit, as a user of its own with no
 privilege, and answers at `http://<npub>.fips:5170/`, the exit's npub being
-its name on the mesh. It says what the exit costs, keeps the packages the
-operator gives away, and takes no payment yet:
+its name on the mesh. It says what the exit costs, sells packages for Cashu
+tokens of the mints you name, and keeps the packages you give away:
 
 ```sh
 ACCESS=paid
 PRICE_MSAT_PER_GB=2000000                   # millisatoshi a GB of 10^9 bytes: 2000 sat
 PACKAGES="1gb:1GB:1500:30 5gb:5GB:6000:90"  # optional: id:size:sat:days, sizes in bytes, MB, GB or TB
-MINTS="https://mint.example.org"            # optional: the Cashu mints that will be taken
+MINTS="https://mint.example.org"            # optional: the Cashu mints whose tokens are taken; none, nothing is sold
 PAY_PORT=5170                               # optional, the default
 ```
 
@@ -159,7 +163,8 @@ sudo systemctl enable --now fips-exit-payd
   the same as a page for a browser on the mesh: price, packages, mints, name
   and country, and who is asking, with its package if it is in one. A caller
   is known by the address its connection comes from, which fips
-  authenticates. `methods` is empty: there is no way to pay yet.
+  authenticates. `methods` says how one can pay right now: `cashu` while a
+  mint named in `MINTS` is reached, and nothing otherwise.
 - The npub is the only way to the exit: a node reaches a fips address only
   once it has resolved the npub it belongs to. The service answers requests
   for `<npub>.fips:5170` and for nothing else, not the bare address, and
@@ -172,11 +177,85 @@ sudo systemctl enable --now fips-exit-payd
   port follows it. `status` says whether it answers.
 - The service reads the config when it starts: restart it after a change.
   With `ACCESS` other than `paid` it says so and stops.
-- Only `GET`, and only so much at a time: 64 connections, 8 from one
-  address, a header of 16 KiB within 5 seconds, a minute for a connection.
+- Only so much at a time: 64 connections, 8 from one address, a header of
+  16 KiB within 5 seconds, a body of 32 KiB within 15, a minute for a
+  connection.
 
-Packages the operator gives away, for nothing, until the service sells
-them:
+#### A package for a token
+
+On the exit's page a buyer picks a package and pastes a Cashu token; a
+program sends the same as JSON:
+
+```text
+POST /v1/orders  {"package": "1gb", "token": "cashuB…"}                the package, and its key
+POST /v1/orders  {"package": "1gb", "token": "cashuB…", "key": "…"}    added to the package that key opens
+```
+
+- The token is of a mint in `MINTS`, in sat, and worth the package's price
+  after the fee its mint takes for redeeming it. One that is worth less, or
+  over a tenth more, is refused, and so is one of any other mint: such a
+  token is not touched, and the answer says so. What a token is worth over
+  the price, up to that tenth, is kept. Nothing is given back. (A tenth of
+  a price under 10 sat is nothing: such a package takes its price exactly.)
+- What is bought is a package of its own, with the device that asked in it
+  and its key in the answer, shown once. With the `key` of a package there
+  already is, the bytes and the days are added to that one, and nobody is
+  put in or taken out.
+- A token is one purchase. Sent again by the device that bought with it, it
+  is answered with that purchase again, and with a new key for the package
+  if it made one: the answer that carried the first key may not have
+  arrived. The key before it then opens nothing. Sent by anyone else, it is
+  refused.
+- A package is granted when its price has arrived in the wallet, and not
+  before. If the mint's answer was lost, the mint is asked two things, at
+  once and then every twenty seconds: what it signed for this wallet, and
+  whether the token is spent. Signed and spent, the order is paid. Spent
+  and not signed, someone else spent the token, and nothing is granted.
+  Neither, the order stays open (`202`, and the code `not-yet`) for as long
+  as the wallet's request may still arrive, ten minutes at least. Sending
+  the same token again asks what became of it and takes nothing twice; a
+  token that could not be taken to the mint at all is answered `503`,
+  `try-again`, and is not touched.
+- Not sold to: a device on the exit's own list, which is carried as it is;
+  a device that another client's inner IPv4 address clashes with (below,
+  under *Accounts*), which would be carried over IPv6 only; anyone while
+  the exit's daemon is not running. Their tokens are not touched either.
+- A mint is taken only if it says what it has signed (NUT-07 and NUT-09):
+  that is what is gone by after a lost answer.
+- At most 10 tokens in a burst and one more every six seconds are taken to
+  a mint, for all buyers together, 8 at once and one at a time for an
+  address. Past that the answer is `429`, and the token is not touched.
+  (The wallet library itself asks a mint no more than 20 things at once
+  and one every three seconds after that.)
+
+```sh
+sudo fips-exit wallet    # what the wallet holds at each mint, and what was sold there
+sudo fips-exit orders    # what was paid, by whom, for which package
+```
+
+**The wallet is money on this machine.** What is paid is ecash in a wallet
+the service keeps in `/var/lib/fips-exit-payd` (`wallet.db`), and whoever
+has its seed, 24 words in the file `seed` beside it, has all of it. Copy the
+seed somewhere safe, once: with it the wallet's contents are found again at
+the mints if the machine is lost, here (a start with the seed and no
+`wallet.db` counts again) or in any Cashu wallet that restores from a seed.
+The two belong together: the service does not start with a `wallet.db` and
+no seed, and a `wallet.db` that is older than its seed's use (an old copy
+put back) is found out when a mint is reached, and counts again before
+anything is sold. One wallet for a seed, ever: a second one running on a
+copy of it makes each ask the mint for what it signed for the other.
+Ecash is the mint's promise and nothing more: a mint that goes away takes
+what the wallet holds there with it, so name mints you would trust with
+that, or your own.
+
+**Nothing pays out yet.** There is no command so far that takes ecash out
+of the wallet, and no limit on what it holds: both are the next phases of
+[`docs/paid-exit.md`](docs/paid-exit.md). Until then what is paid stays at
+the mint, and the way to it is the seed, restored in another wallet with the
+service stopped for good (two wallets on one seed get in each other's way).
+Price a package accordingly, and try this with small amounts.
+
+Packages the operator gives away, for nothing:
 
 ```sh
 sudo fips-exit grant 5GB 30 npub1…,npub1… a friend   # 5 GB for 30 days (0: no end), for these devices
@@ -361,10 +440,11 @@ an optimisation, not a requirement.
 
 Optional paid public exits (an advert with price and country, prepaid data
 packages, pay-as-you-go) are designed in
-[`docs/paid-exit.md`](docs/paid-exit.md). Its first three phases are
-here: accounts and `ACCESS=paid`, the advert, and the payment service's
-frame, all above. Nothing yet takes a payment, so no exit says that it is a
-paid one.
+[`docs/paid-exit.md`](docs/paid-exit.md). Its first five phases are here:
+accounts and `ACCESS=paid`, the advert, the payment service, packages and
+their keys, and packages sold for Cashu tokens, all above. To come:
+Lightning invoices, paying out of the wallet and a limit on what it holds,
+on-chain payments, a command-line client, and pay-as-you-go channels.
 
 ## Test
 
@@ -375,8 +455,14 @@ cargo test --manifest-path payd/Cargo.toml   # the advert's tags, the price, the
 python3 -I -m unittest discover -s test      # the script's advert
 ```
 
-The namespace test runs the payment service too, so it needs it built:
-`cargo build --release --manifest-path payd/Cargo.toml`.
+The namespace test runs the payment service too, and a mint for it, so it
+needs both built:
+`cargo build --release --manifest-path payd/Cargo.toml -p fips-exit-payd` and
+`cargo build --manifest-path payd/Cargo.toml -p fips-exit-test-mint`.
+
+The tests in `payd/` and that mint need `protoc` to be built (the package
+`protobuf-compiler`, or `protobuf`): the wallet library's mint side wants
+it. The payment service itself does not, and neither does `install.sh`.
 
 The second runs the daemon and the script against the real kernel, without
 root and without fips: network namespaces stand in for two clients, the
@@ -387,8 +473,10 @@ the same exit with `ACCESS=paid`, behind a stand-in for fips's firewall: no
 node without an account is carried, two members share an account counted to
 the byte and are cut off at the grant, a member reaches the internet and
 neither the uplink's LAN nor port 25, the payment service tells a node that
-is no client what the exit costs and who it is, and leaving the mode removes
-what it made, the opening for the payment service with it.
+is no client what the exit costs and who it is, a node that is nobody's buys
+a package with a token of a mint that runs in the test and is carried, and
+leaving the mode removes what it made, the opening for the payment service
+with it.
 
 The third is `payd/`, a workspace with a lockfile of its own, so that the
 daemon keeps its one dependency. `payd/proto` is a crate with no
@@ -397,7 +485,13 @@ Nostr says (who it serves, where it is, and for a paid exit what it costs)
 and what a number of bytes costs at a price. It is checked against
 `payd/proto/vectors/advert.json`, and so is every other implementation of
 the same. `payd/payd` is the payment service: its config, its terms and
-page, and its HTTP server's limits, over a real socket.
+page, its HTTP server's limits over a real socket, its packages, and what
+is paid. `payd/test-mint` is a Cashu mint for the tests, in memory, with a
+Lightning backend that pays its own invoices, and a way to it on which a
+request or an answer can be lost: the payments are tested against it, a
+token spent twice, one spent elsewhere, an answer that never arrived and a
+service that died between a payment and its package among them. It is not
+installed, and nothing it gives out is worth anything.
 
 The fourth is the script's side of the advert: the signature against the
 vectors of BIP-340, the tags against the same file of cases, and the

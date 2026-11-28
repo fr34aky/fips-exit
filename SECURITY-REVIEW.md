@@ -28,8 +28,12 @@ root:
   systemd, with no capability and little of the machine, in the group
   `fips-exit` to which the daemon opens its control socket. It answers HTTP
   at the node's npub on the mesh, says what the exit costs, and keeps the
-  packages the operator gives away: it makes the daemon's accounts for
-  them. It takes no payment and holds no money.
+  packages: those the operator gives away and those it sells, for Cashu
+  tokens of the mints the operator names. It makes the daemon's accounts
+  for them. What is paid arrives in a wallet of its own, kept beside its
+  store: it holds money, and asks those mints over the internet. The wallet
+  is a library's (`cdk` 0.18.3, pinned exactly), which brings some 270
+  crates into this one program, a TLS stack among them.
 
 Clients are fips2go phones and other fips nodes. The wire contract is shared
 with fips2go (`shim/src/exit.rs`) and its exit container
@@ -90,10 +94,10 @@ IPv4 address derived from the client's fips address.
    this exit in `Host`, `<npub>.fips:port` and nothing else, or it is
    answered 421: a page elsewhere must not be able to read what this one
    says to a browser on the mesh. Three paths are `GET`/`HEAD` (the terms,
-   the page, its stylesheet) and six are `POST` (a package by its key, its
-   members, leave; each as JSON and as a form). A header has 5 seconds and
-   16 KiB, a body 8 KiB, a connection a minute; there are 64 connections at
-   once and 8 from one address.
+   the page, its stylesheet) and eight are `POST` (a package by its key, its
+   members, leave, a purchase; each as JSON and as a form). A header has 5
+   seconds and 16 KiB, a body 15 seconds and 32 KiB, a connection a minute;
+   there are 64 connections at once and 8 from one address.
    What changes something is JSON (`application/json`, from a program or
    this page, never with another site's `Origin` or `Sec-Fetch-Site`), or a
    form from this exit's own page: its `Origin`, or the browser's own
@@ -108,6 +112,26 @@ IPv4 address derived from the client's fips address.
    Lines of words, each checked: a size, a number of days up to 3660,
    npubs or fips addresses, a label of one printable line. Not hostile, but
    a package made there carries whoever is in it.
+10. **A token, from anyone on the mesh.** Text of up to 24 KiB, read by the
+    wallet library (base64, then CBOR or JSON) before anything else is known
+    of it. Of it the service takes, without asking a mint: which mint it
+    names, which must be one of `MINTS` by its whole address; its unit; its
+    proofs, 64 at most, none twice, of keys that mint has; what they add up
+    to, and the mint's fee for them. Only then is a mint asked anything, and
+    only the one the operator named: a token cannot make the service talk
+    to an address of its sender's choosing.
+11. **What a mint answers.** The operator chose it and trusts it with what
+    the wallet holds, so it is not an adversary for money. Its answers are
+    parsed by the wallet library all the same, and one of them decides a
+    grant: what it says it has signed (NUT-09), of which only the outputs
+    this wallet asked about are counted.
+12. **What the payment service tells the script.** `fips-exit wallet`,
+    `orders`, `status` and `advert` ask the service over its socket, and
+    root prints or signs what comes back: the service is another program,
+    without privilege, and its word is taken as that. What is printed is
+    held to numbers and cut of anything a terminal would act on; the terms
+    that go into the advert are checked for their shape, then held to the
+    advert's own bounds, and an advert that is out of them is not written.
 
 ## Things that would be serious in this codebase
 
@@ -200,13 +224,60 @@ IPv4 address derived from the client's fips address.
   lets a stranger put a device in a package (keeping it from the one it
   paid for, or from a grant), take it out of its own, or learn whether it
   has one, is serious.
-- **A package's key going anywhere.** It is shown once, to the operator,
-  and kept as its hash. A key holder sees the package and its members'
-  npubs; nothing in the terms or on the page of a member shows the key.
+- **A package's key going anywhere.** It is shown once, to the operator or
+  to the device that bought the package, and kept as its hash. A key holder
+  sees the package and its members' npubs; nothing in the terms or on the
+  page of a member shows the key. A buyer that sends its token again gets a
+  new key, and the one before opens nothing: that must stay with the address
+  that bought, and nobody else may learn from a token whose package it paid
+  for.
+- **Granting what did not arrive.** The one thing the payment service is
+  for. A package is made in one place (`Store::order_settle`), for an order
+  written down before its token went to the mint, and only on one of two
+  grounds: the wallet took the token without a hitch, or the mint says both
+  that it signed what this wallet asked for in exchange (NUT-09) and that
+  the token's proofs are spent (NUT-07), which one exchange does at once.
+  Never on one of the two alone. Spent and not signed is a token its sender
+  spent elsewhere first, which is what the wallet library's own conclusion
+  after a lost answer cannot tell from a payment. Signed and not spent is
+  a wallet whose file is behind its seed's use, asking for what the mint
+  signed before: so the wallet's next requests are asked about at a mint
+  before anything is sold there, a mint's "signed before" ends the order
+  and the selling until the wallet has counted again, and an order the mint
+  said that of is never paid on what is found signed later. Serious: a
+  package for a token that was spent by someone else, refused by the mint,
+  of another mint, worth less than the price, or counted twice (a credit's
+  key can exist once); and the wallet let to finish what it began before
+  what it asked the mint to sign was kept for every open order, since
+  afterwards nothing can be asked.
+- **A token taken, and nothing granted.** The other way round: whatever the
+  service refuses, it must refuse before the token is taken to the mint, and
+  say that the token was not touched; an order whose token did reach the
+  mint must stay open until the mint has said what became of it, across a
+  restart, a lost answer and a closed connection. An order is forgotten only
+  when the mint says the token is spent and not for this wallet; or when it
+  says neither signed nor spent, ten minutes have passed, and the wallet has
+  nothing of it left that it could still be asking the mint for (while it
+  has, or could not finish, a request of its own may be on its way). And a
+  token sent again is answered with what became of it before anything that
+  is asked only of a new purchase: none of those may say "not touched" of a
+  token that was taken.
+- **The wallet's seed going anywhere.** The file `seed` in the state
+  directory, for the service's user alone. It is what the wallet holds. It
+  must never be logged, printed, put in an answer or an error, or sent; a
+  seed file that holds something else is not replaced, and its contents not
+  repeated; and none is made beside a wallet's file that has lost its own,
+  where it would be taken for the one that is gone. The same for the
+  tokens: one is not written to the log.
+- **The service asking anyone but its mints.** It has the internet now, to
+  reach the mints in `MINTS` and nothing else. Anything that makes it open a
+  connection to an address from a request, a token or a page is serious.
 - **A page on another site changing a package.** Through a browser on the
   mesh it could reach the exit; it must not be able to send a form the
   service takes (`Origin`), nor JSON (which a browser sends elsewhere only
-  after asking, and the service does not answer that).
+  after asking, and the service does not answer that). A purchase comes in
+  by the same two ways and no third: a page elsewhere must not be able to
+  spend a token in a visitor's name.
 - **The node's key going anywhere.** `fips-exit advert` reads the fips
   identity's secret key. It must never be printed, logged, put in an error
   message or sent: only the signature leaves. That includes a key file that
@@ -216,7 +287,10 @@ IPv4 address derived from the client's fips address.
   Signed with a key that is not the node's own (it is compared with the
   mesh interface's address first); naming an access the exit does not give;
   or tags that are not what `payd/proto` specifies, which clients would
-  pass over or, worse, read differently. And an advert sent anywhere the
+  pass over or, worse, read differently. A paid exit's terms in the advert
+  are what its payment service says of itself, so that the two cannot
+  differ: the script, which holds the key, must hold them to the advert's
+  bounds and sign nothing that is out of them. And an advert sent anywhere the
   operator did not name: publishing is by `ADVERT_RELAYS` alone, and the
   timer is not enabled by the installer.
 - **Parsing the inner packet.** Out-of-bounds reads and length arithmetic in
@@ -246,16 +320,41 @@ IPv4 address derived from the client's fips address.
   an open advisory, RUSTSEC-2026-0459: memory disclosure on a crafted WAL
   file. Only the service's user and root can write its state directory,
   and either already holds everything in it. 0.31 because the Cashu wallet
-  library the service is to use pins it, and there can be one SQLite in a
-  build.
+  library pins it, and there can be one SQLite in a build.
+- **Nothing pays out, and nothing limits what the wallet holds.** A wallet
+  on a server is protected by holding little; this one only grows, until
+  paying out and a limit are written (the next phases). Whoever takes the
+  service over, or reads its state directory, has all that was paid since
+  the operator last emptied it by hand, with the seed.
+- **Two wallets on one seed.** A copy of the seed in a second service, or
+  in another wallet while this one runs, makes each ask the mint for what
+  it signed for the other. That is found out (the mint refuses, selling
+  stops, the wallet counts again) and it is not safe all the same: between
+  one count and the next, with an answer of the mint's lost and a sender
+  who spends the token elsewhere in that moment, what the mint signed for
+  the other wallet would pass for a payment. The README says one wallet for
+  a seed.
+- **Anyone can keep others from paying.** The mint is asked for every token
+  that passes the checks made here, and a token that will be refused there
+  costs its sender nothing to make. So there is a budget for the whole
+  service, 10 tokens and one more every six seconds, and someone who uses
+  it up keeps everyone from buying for as long as they go on. Members are
+  carried all the same. A token need not carry the proof (NUT-12) that
+  would let the service refuse a made-up one without asking: wallets in
+  use leave it out.
+- **A mint is trusted for what it holds, and for the truth.** It can keep
+  what the wallet has there, and it decides what was paid: a mint that says
+  it signed when it did not is believed. That is what choosing a mint means.
+- **The wallet library is most of the program.** Some 270 crates, pinned by
+  the lockfile and by `cdk`'s exact version, none of them read here beyond
+  what the service calls. Nothing in CI looks for advisories against them.
+- **A mint named by an IPv6 address in brackets is not reached**: the
+  library's HTTP client does not take one. A name, or an IPv4 address.
 - **An account's end is by this machine's clock.** A machine that starts
   with its clock in the past (no battery, no time yet from the network)
   carries the members of an account whose time is over, until the clock is
   right. An account that has ended is not removed: it keeps its members'
   places until whoever made it drops it.
-- **Nothing makes accounts yet.** `ACCESS=paid` serves the members of
-  accounts; what makes the accounts, a payment service, is not written. Until
-  it is, the mode is of use only to someone who writes to the socket by hand.
 - **Paid mode's check of the host looks at the main routing table only.**
   `up` refuses a host with an address, a route or a resolver in
   `100.64.0.0/10`. A route there that sits in another table, behind a policy
@@ -296,6 +395,23 @@ IPv4 address derived from the client's fips address.
   or sends its own traffic to the tunnel, where it is dropped as nobody's.
 - TCP port 25 is closed to members and open to listed clients, who are the
   operator's own.
+- A token is taken to the mint whether or not it carries the mint's proof of
+  its signature (NUT-12): what carries one is checked by the library, and
+  what does not is the mint's to refuse.
+- "Spent", said by the mint, is not taken as the end of an order by itself:
+  the wallet's own request may be what spent the token. The mint is asked
+  what it signed for this wallet, and that is the end of it either way.
+- What a token is worth over the price, up to a tenth, is kept; more than
+  that and it is not taken at all, so that a slip of a finger costs nobody
+  a large token.
+- A purchase is answered while its connection lives (a minute), with "not
+  yet" if need be, and goes on by itself: a token half taken is not left
+  because a connection closed.
+- One thing at a time at a mint: a token taken, or what was interrupted put
+  right, never both. Sales at one mint wait for each other.
+- The service says "reached" of a mint only when the mint itself answered,
+  not from what the wallet remembers of it; a mint that is away sells
+  nothing, and its tokens are not touched.
 - The exit's operator sees its clients' traffic, as any VPN endpoint does.
 - The resolver forwards and nothing more: no cache, no DNSSEC validation,
   no filtering of private addresses in answers (a client could not reach

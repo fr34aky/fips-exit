@@ -5,8 +5,10 @@
 //! address its connection comes from, which fips authenticates: no account
 //! and no login.
 //!
-//! So far it says what the exit costs (`GET /v1/terms`, and a page for a
-//! browser at `/`) and takes no payment. What is to come is in
+//! It says what the exit costs (`GET /v1/terms`, and a page for a browser
+//! at `/`), keeps the packages and tells the exit's daemon whom to carry,
+//! and sells packages for Cashu tokens of the mints the operator accepts,
+//! which arrive in a wallet of its own. What is to come is in
 //! docs/paid-exit.md.
 
 mod admin;
@@ -14,9 +16,11 @@ mod config;
 mod http;
 mod identity;
 mod manage;
+mod orders;
 mod store;
 mod sync;
 mod terms;
+mod wallet;
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -176,11 +180,15 @@ async fn run() -> Result<(), String> {
         Exit { npub, address, name: config.name.clone(), about: config.about.clone(), country: config.country.clone() };
     let listener = TcpListener::bind(listen).await.map_err(|e| format!("cannot listen on {listen}: {e}"))?;
     eprintln!(
-        "fips-exit-payd: the terms on http://{}.fips:{}/ (price {} msat a GB, {} package(s), nothing for sale yet)",
+        "fips-exit-payd: the terms on http://{}.fips:{}/ (price {} msat a GB, {} package(s), {})",
         exit.npub,
         listen.port(),
         config.price_msat_per_gb,
-        config.packages.len()
+        config.packages.len(),
+        match config.mints.len() {
+            0 => "no mint named in MINTS: nothing is sold".to_string(),
+            mints => format!("sold for tokens of {mints} mint(s)"),
+        }
     );
     // The packages, kept; the daemon kept as they say; the operator's way in.
     let store = Arc::new(store::Store::open(&args.state.join("payd.db"))?);
@@ -195,8 +203,21 @@ async fn run() -> Result<(), String> {
         args.control.display()
     );
     tokio::spawn(sync::keep(store.clone(), args.control.clone(), seats.clone(), changed.clone()));
-    tokio::spawn(admin::serve(admin, store.clone(), changed.clone()));
-    let site = Arc::new(http::Site::new(config, exit, store, seats, changed));
+    let mut site = http::Site::new(config, exit, store, seats, changed);
+    // The wallet, on an exit that names a mint: what is paid arrives there.
+    if !site.config.mints.is_empty() {
+        let wallets = Arc::new(wallet::Wallets::open(&args.state, &site.config.mints).await?);
+        eprintln!(
+            "fips-exit-payd: the wallet is kept in {}: its seed (the file `seed`) is what it holds, to be kept safe",
+            args.state.display()
+        );
+        site.desk = Some(Arc::new(orders::Desk::new(wallets.clone(), args.control.clone())));
+        tokio::spawn(wallets.keep());
+    }
+    let site = Arc::new(site);
+    // What an earlier run left open is decided before anything new.
+    tokio::spawn(orders::keep(site.clone()));
+    tokio::spawn(admin::serve(admin, site.clone()));
     // With --listen, which tests use, a peer from anywhere is talked to.
     let admit: fn(IpAddr) -> bool = if args.listen.is_some() { |_| true } else { http::on_the_mesh };
     tokio::select! {

@@ -6,6 +6,10 @@
 //! restart of either side loses nothing but the last seconds. A package
 //! has a key, given once when it is made and kept here only as its hash:
 //! whoever holds it manages the package.
+//!
+//! And what was paid: an order for each token that was taken to a mint,
+//! and a credit for each payment that arrived, which can exist once. An
+//! order becomes a package in one place, [`Store::order_settle`].
 
 use std::net::Ipv6Addr;
 use std::path::Path;
@@ -47,6 +51,55 @@ const SCHEMA: &[&str] = &[
         npub TEXT NOT NULL
     );
 ",
+    "
+    -- A payment being taken, or taken: one for a token. One that came to
+    -- nothing is not kept.
+    CREATE TABLE orders (
+        -- 'o' and 16 hex digits.
+        id TEXT PRIMARY KEY,
+        created INTEGER NOT NULL,
+        -- The address that asked, and is put in the package.
+        buyer TEXT NOT NULL,
+        mint TEXT NOT NULL,
+        -- What was offered when it was ordered.
+        offer TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        sat INTEGER NOT NULL,
+        days INTEGER NOT NULL,
+        -- The package to add to, or NULL for a new one.
+        target TEXT,
+        -- SHA-256 over the token's proofs: a token is one order.
+        receipt BLOB NOT NULL UNIQUE,
+        -- What the token said it was worth, in sat.
+        value INTEGER NOT NULL,
+        -- The token's proofs as the mint knows them: it is asked whether
+        -- they are spent.
+        inputs TEXT NOT NULL,
+        -- What the wallet asked the mint to sign in exchange, kept once an
+        -- answer of the mint's was lost: the mint is asked about these.
+        outputs TEXT,
+        paid INTEGER NOT NULL DEFAULT 0,
+        -- What arrived in the wallet, and what the mint took, in sat.
+        paid_sat INTEGER NOT NULL DEFAULT 0,
+        fee_sat INTEGER NOT NULL DEFAULT 0,
+        settled INTEGER NOT NULL DEFAULT 0,
+        -- The package it became, or was added to.
+        package TEXT
+    );
+    -- What arrived, once each: the key cannot be there twice, so nothing
+    -- is granted twice for one payment.
+    CREATE TABLE credits (
+        -- 'cashu:' and the receipt, for a token.
+        key TEXT PRIMARY KEY,
+        at INTEGER NOT NULL,
+        sat INTEGER NOT NULL,
+        mint TEXT NOT NULL,
+        of_order TEXT NOT NULL,
+        package TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        days INTEGER NOT NULL
+    );
+",
 ];
 
 /// The most a package may be granted: what the daemon takes.
@@ -66,6 +119,68 @@ pub struct Package {
     pub created: u64,
     pub revoked: bool,
     pub members: Vec<Ipv6Addr>,
+}
+
+/// A payment as it is kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Order {
+    pub id: String,
+    pub created: u64,
+    pub buyer: Ipv6Addr,
+    pub mint: String,
+    pub offer: String,
+    pub bytes: u64,
+    pub sat: u64,
+    pub days: u32,
+    pub target: Option<String>,
+    pub receipt: Vec<u8>,
+    pub value: u64,
+    pub inputs: String,
+    pub outputs: Option<String>,
+    pub paid: bool,
+    pub paid_sat: u64,
+    pub fee_sat: u64,
+    pub settled: u64,
+    pub package: Option<String>,
+}
+
+/// What is ordered: `bytes` for `days`, offered as `offer` for `sat`, by
+/// `buyer`, with a token of `mint` worth `value` whose proofs are `inputs`
+/// and hash to `receipt`; added to package `target`, or a package of its
+/// own.
+#[derive(Debug, Clone)]
+pub struct NewOrder<'a> {
+    pub buyer: Ipv6Addr,
+    pub mint: &'a str,
+    pub offer: &'a str,
+    pub bytes: u64,
+    pub sat: u64,
+    pub days: u32,
+    pub target: Option<&'a str>,
+    pub receipt: &'a [u8; 32],
+    pub value: u64,
+    pub inputs: &'a str,
+}
+
+/// An order begun: a new one, or the one there already is for that token.
+#[derive(Debug, PartialEq)]
+pub enum Begun {
+    New(String),
+    Known(Box<Order>),
+}
+
+/// An order settled: the package it became or was added to, and that
+/// package's key if it is a new one, which is not kept.
+#[derive(Debug, PartialEq)]
+pub struct Settled {
+    pub package: Package,
+    /// What was bought, as it was offered.
+    pub offer: String,
+    pub key: Option<String>,
+    /// Whether the bytes were added to a package that was there.
+    pub added: bool,
+    pub paid_sat: u64,
+    pub fee_sat: u64,
 }
 
 /// What a package is, at a moment.
@@ -127,6 +242,8 @@ pub enum Refused {
     TooMuch,
     /// Its time is over, and a top-up gave it no more days.
     Over,
+    /// No order with that id.
+    NoOrder,
     /// The database said no.
     Store(String),
 }
@@ -139,6 +256,7 @@ impl std::fmt::Display for Refused {
             Refused::Members => write!(f, "members (at most {MAX_MEMBERS}, none twice)"),
             Refused::TooMuch => f.write_str("too-much"),
             Refused::Over => f.write_str("over (its time has ended: give it days too)"),
+            Refused::NoOrder => f.write_str("no-order"),
             Refused::Store(e) => write!(f, "store {e}"),
         }
     }
@@ -150,7 +268,7 @@ impl From<rusqlite::Error> for Refused {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -305,20 +423,34 @@ impl Store {
         label: &str,
         now: u64,
     ) -> Result<(String, String), Refused> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let made = Store::grant_in(&tx, bytes, days, members, label, now, None)?;
+        tx.commit()?;
+        Ok(made)
+    }
+
+    /// The same, within a transaction; `mover` as [`Store::seat`] takes it.
+    fn grant_in(
+        db: &Connection,
+        bytes: u64,
+        days: u32,
+        members: &[Ipv6Addr],
+        label: &str,
+        now: u64,
+        mover: Option<Ipv6Addr>,
+    ) -> Result<(String, String), Refused> {
         if bytes == 0 || bytes > MAX_BYTES {
             return Err(Refused::TooMuch);
         }
         let id = format!("p{}", hex(&random(8).map_err(|e| Refused::Store(e.to_string()))?));
         let key = hex(&random(32).map_err(|e| Refused::Store(e.to_string()))?);
         let until = if days == 0 { 0 } else { now + u64::from(days) * 86_400 };
-        let mut db = self.db();
-        let tx = db.transaction()?;
-        tx.execute(
+        db.execute(
             "INSERT INTO packages (id, key_hash, label, granted, until, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, key_hash(&key), label, as_i64(bytes), as_i64(until), as_i64(now)],
         )?;
-        Store::seat(&tx, &id, members, now, None)?;
-        tx.commit()?;
+        Store::seat(db, &id, members, now, mover)?;
         Ok((id, key))
     }
 
@@ -464,6 +596,209 @@ impl Store {
             None => Ok(None),
         }
     }
+
+    // ---- what was paid ------------------------------------------------------
+
+    const ORDER: &str = "SELECT id, created, buyer, mint, offer, bytes, sat, days, target, receipt, value, outputs, \
+                         paid, paid_sat, fee_sat, settled, package, inputs FROM orders";
+
+    fn order_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Order> {
+        Ok(Order {
+            id: row.get(0)?,
+            created: as_u64(row.get(1)?),
+            buyer: row.get::<_, String>(2)?.parse().unwrap_or(Ipv6Addr::UNSPECIFIED),
+            mint: row.get(3)?,
+            offer: row.get(4)?,
+            bytes: as_u64(row.get(5)?),
+            sat: as_u64(row.get(6)?),
+            days: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+            target: row.get(8)?,
+            receipt: row.get(9)?,
+            value: as_u64(row.get(10)?),
+            outputs: row.get(11)?,
+            paid: row.get::<_, i64>(12)? != 0,
+            paid_sat: as_u64(row.get(13)?),
+            fee_sat: as_u64(row.get(14)?),
+            settled: as_u64(row.get(15)?),
+            package: row.get(16)?,
+            inputs: row.get(17)?,
+        })
+    }
+
+    fn orders_where(db: &Connection, condition: &str, values: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<Vec<Order>> {
+        let mut query = db.prepare_cached(&format!("{} {condition}", Store::ORDER))?;
+        query.query_map(values, Store::order_of)?.collect()
+    }
+
+    /// A name for an order to come: `o` and 16 hex digits.
+    pub fn order_id() -> Result<String, Refused> {
+        Ok(format!("o{}", hex(&random(8).map_err(|e| Refused::Store(e.to_string()))?)))
+    }
+
+    /// Begin order `id`: written down before its token is taken to the
+    /// mint, so that whatever happens then, it is known what was under way.
+    /// A token there is an order for already begins none: that order is
+    /// given.
+    pub fn order_begin(&self, id: &str, new: &NewOrder<'_>, now: u64) -> Result<Begun, Refused> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        if let Some(known) = Store::orders_where(&tx, "WHERE receipt = ?1", &[&new.receipt.as_slice()])?.pop() {
+            return Ok(Begun::Known(Box::new(known)));
+        }
+        tx.execute(
+            "INSERT INTO orders (id, created, buyer, mint, offer, bytes, sat, days, target, receipt, value, inputs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                id,
+                as_i64(now),
+                new.buyer.to_string(),
+                new.mint,
+                new.offer,
+                as_i64(new.bytes),
+                as_i64(new.sat),
+                i64::from(new.days),
+                new.target,
+                new.receipt.as_slice(),
+                as_i64(new.value),
+                new.inputs
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Begun::New(id.to_string()))
+    }
+
+    #[cfg(test)]
+    pub fn order(&self, id: &str) -> Result<Option<Order>, Refused> {
+        Ok(Store::orders_where(&self.db(), "WHERE id = ?1", &[&id])?.pop())
+    }
+
+    pub fn order_with_receipt(&self, receipt: &[u8; 32]) -> Result<Option<Order>, Refused> {
+        Ok(Store::orders_where(&self.db(), "WHERE receipt = ?1", &[&receipt.as_slice()])?.pop())
+    }
+
+    /// The orders whose payment is not known to have arrived, oldest first.
+    pub fn orders_open(&self) -> Result<Vec<Order>, Refused> {
+        Ok(Store::orders_where(&self.db(), "WHERE paid = 0 ORDER BY created, id", &[])?)
+    }
+
+    /// The newest orders, `most` at most.
+    pub fn orders(&self, most: usize) -> Result<Vec<Order>, Refused> {
+        let most = i64::try_from(most).unwrap_or(i64::MAX);
+        Ok(Store::orders_where(&self.db(), "ORDER BY created DESC, id LIMIT ?1", &[&most])?)
+    }
+
+    /// Keep what the wallet asked the mint to sign for order `id`.
+    pub fn order_keep_outputs(&self, id: &str, outputs: &str) -> Result<(), Refused> {
+        let changed =
+            self.db().execute("UPDATE orders SET outputs = ?2 WHERE id = ?1 AND paid = 0", params![id, outputs])?;
+        if changed == 0 { Err(Refused::NoOrder) } else { Ok(()) }
+    }
+
+    /// Forget order `id`, which came to nothing: its token was not taken.
+    /// One that is paid is not forgotten.
+    pub fn order_drop(&self, id: &str) -> Result<(), Refused> {
+        self.db().execute("DELETE FROM orders WHERE id = ?1 AND paid = 0", [id])?;
+        Ok(())
+    }
+
+    /// What has arrived at `mint` in all, in sat.
+    pub fn sold(&self, mint: &str) -> Result<u64, Refused> {
+        let sat: i64 =
+            self.db()
+                .query_row("SELECT COALESCE(SUM(sat), 0) FROM credits WHERE mint = ?1", [mint], |row| row.get(0))?;
+        Ok(as_u64(sat))
+    }
+
+    /// Order `id` is paid: `paid_sat` arrived in the wallet. The one place
+    /// where a payment becomes bytes, in one transaction: the credit, which
+    /// can be there once; the package, new with its buyer in it, or the one
+    /// that was to be added to; the order, paid. Asked again for an order
+    /// that is paid, it changes nothing and gives the package, without a
+    /// key.
+    ///
+    /// If the package to add to is gone or was taken back meanwhile, the
+    /// buyer gets a package of its own: what arrived is not kept for
+    /// nothing.
+    pub fn order_settle(&self, id: &str, paid_sat: u64, now: u64) -> Result<Settled, Refused> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let order = Store::orders_where(&tx, "WHERE id = ?1", &[&id])?.pop().ok_or(Refused::NoOrder)?;
+        if order.paid {
+            let package = match &order.package {
+                Some(package) => Store::package_in(&tx, package)?,
+                None => None,
+            };
+            let package = package.ok_or(Refused::NoPackage)?;
+            return Ok(Settled {
+                package,
+                offer: order.offer,
+                key: None,
+                added: order.target.is_some() && order.target == order.package,
+                paid_sat: order.paid_sat,
+                fee_sat: order.fee_sat,
+            });
+        }
+        let target = match &order.target {
+            Some(target) => Store::package_in(&tx, target)?.filter(|package| !package.revoked),
+            None => None,
+        };
+        let (package, key) = match target {
+            Some(package) => {
+                let granted = package.granted.saturating_add(order.bytes).min(MAX_BYTES);
+                let until = match (package.until, order.days) {
+                    (0, _) | (_, 0) => package.until,
+                    (until, days) => until.max(now) + u64::from(days) * 86_400,
+                };
+                tx.execute(
+                    "UPDATE packages SET granted = ?2, until = ?3 WHERE id = ?1",
+                    params![package.id, as_i64(granted), as_i64(until)],
+                )?;
+                (package.id, None)
+            }
+            None => {
+                let label = format!("bought: {}", order.offer);
+                let (package, key) =
+                    Store::grant_in(&tx, order.bytes, order.days, &[order.buyer], &label, now, Some(order.buyer))?;
+                (package, Some(key))
+            }
+        };
+        let fee_sat = order.value.saturating_sub(paid_sat);
+        tx.execute(
+            "INSERT INTO credits (key, at, sat, mint, of_order, package, bytes, days) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                format!("cashu:{}", hex(&order.receipt)),
+                as_i64(now),
+                as_i64(paid_sat),
+                order.mint,
+                order.id,
+                package,
+                as_i64(order.bytes),
+                i64::from(order.days)
+            ],
+        )?;
+        tx.execute(
+            "UPDATE orders SET paid = 1, paid_sat = ?2, fee_sat = ?3, settled = ?4, package = ?5, outputs = NULL WHERE id = ?1",
+            params![order.id, as_i64(paid_sat), as_i64(fee_sat), as_i64(now), package],
+        )?;
+        let settled = Store::package_in(&tx, &package)?.ok_or(Refused::NoPackage)?;
+        tx.commit()?;
+        Ok(Settled { package: settled, offer: order.offer, added: key.is_none(), key, paid_sat, fee_sat })
+    }
+
+    /// A new key for the package order `id` made, for its buyer who asks
+    /// again with the token that paid for it (the answer that carried the
+    /// first key may never have arrived). The key before it opens nothing
+    /// any more. None if the order made no package of its own (it was added
+    /// to the one it was meant for), or the package was taken back.
+    pub fn order_new_key(&self, id: &str) -> Result<Option<String>, Refused> {
+        let key = hex(&random(32).map_err(|e| Refused::Store(e.to_string()))?);
+        let changed = self.db().execute(
+            "UPDATE packages SET key_hash = ?2 WHERE revoked = 0 AND id =
+                 (SELECT package FROM orders WHERE id = ?1 AND paid = 1 AND (target IS NULL OR target <> package))",
+            params![id, key_hash(&key)],
+        )?;
+        Ok((changed == 1).then_some(key))
+    }
 }
 
 #[cfg(test)]
@@ -580,6 +915,73 @@ mod tests {
         assert_eq!(store.package_of(a(1)).unwrap(), None);
         assert_eq!(store.leave(a(1)), Ok(None));
         assert_eq!(store.package(&second).unwrap().unwrap().members, vec![a(2)]);
+    }
+
+    #[test]
+    fn an_order_becomes_a_package_once() {
+        let store = Store::in_memory();
+        fn order<'a>(receipt: &'a [u8; 32], target: Option<&'a str>) -> NewOrder<'a> {
+            NewOrder {
+                buyer: a(1),
+                mint: "https://mint.example",
+                offer: "1gb",
+                bytes: 1000,
+                sat: 10,
+                days: 1,
+                target,
+                receipt,
+                value: 11,
+                inputs: "[]",
+            }
+        }
+        assert_eq!(store.order_begin("o1", &order(&[1; 32], None), NOW), Ok(Begun::New("o1".into())));
+        // The same token again begins nothing: the order there is.
+        let Ok(Begun::Known(known)) = store.order_begin("o2", &order(&[1; 32], None), NOW) else { panic!() };
+        assert_eq!((known.id.as_str(), known.paid, known.value), ("o1", false, 11));
+        assert_eq!(store.orders_open().unwrap().len(), 1);
+        let settled = store.order_settle("o1", 10, NOW).unwrap();
+        assert_eq!((settled.paid_sat, settled.fee_sat, settled.added, settled.offer.as_str()), (10, 1, false, "1gb"));
+        assert_eq!((settled.package.granted, settled.package.members.clone()), (1000, vec![a(1)]));
+        let key = settled.key.clone().unwrap();
+        assert_eq!(store.package_with_key(&key).unwrap().unwrap().id, settled.package.id);
+        // Settled again, nothing is added and no key is given.
+        let again = store.order_settle("o1", 10, NOW).unwrap();
+        assert_eq!(
+            (again.key.clone(), again.package.granted, store.sold("https://mint.example")),
+            (None, 1000, Ok(10))
+        );
+        assert_eq!(store.packages().unwrap().len(), 1);
+        assert!(store.orders_open().unwrap().is_empty());
+        store.order_drop("o1").unwrap();
+        assert!(store.order("o1").unwrap().unwrap().paid, "a paid order is not forgotten");
+        // A new key for its buyer; the one before opens nothing.
+        let new_key = store.order_new_key("o1").unwrap().unwrap();
+        assert_eq!(store.package_with_key(&key).unwrap(), None);
+        assert_eq!(store.package_with_key(&new_key).unwrap().unwrap().id, settled.package.id);
+        // Added to a package: its bytes and days, and no key.
+        let (target, _) = store.grant(500, 2, &[a(2)], "", NOW).unwrap();
+        store.order_begin("o3", &order(&[3; 32], Some(&target)), NOW).unwrap();
+        let added = store.order_settle("o3", 10, NOW).unwrap();
+        assert!(added.added && added.key.is_none());
+        assert_eq!((added.package.granted, added.package.until), (1500, NOW + 3 * 86_400));
+        assert_eq!(store.order_new_key("o3"), Ok(None), "it made no package of its own");
+        // The package to add to was taken back meanwhile: what arrived is
+        // not kept for nothing, and its buyer can get that package's key.
+        store.order_begin("o4", &order(&[4; 32], Some(&target)), NOW).unwrap();
+        store.revoke(&target).unwrap();
+        let own = store.order_settle("o4", 10, NOW).unwrap();
+        assert!(!own.added && own.package.id != target && own.key.is_some());
+        let again = store.order_new_key("o4").unwrap().unwrap();
+        assert_eq!(store.package_with_key(&again).unwrap().unwrap().id, own.package.id);
+        // An order that is not there, and one that came to nothing.
+        assert_eq!(store.order_settle("o9", 10, NOW), Err(Refused::NoOrder));
+        store.order_begin("o5", &order(&[5; 32], None), NOW).unwrap();
+        store.order_keep_outputs("o5", "[1]").unwrap();
+        assert_eq!(store.orders_open().unwrap()[0].outputs.as_deref(), Some("[1]"));
+        store.order_drop("o5").unwrap();
+        assert_eq!(store.order("o5").unwrap(), None);
+        assert_eq!(store.order_keep_outputs("o5", "[1]"), Err(Refused::NoOrder));
+        assert_eq!(store.orders(2).unwrap().len(), 2);
     }
 
     #[test]

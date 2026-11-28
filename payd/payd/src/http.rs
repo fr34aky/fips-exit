@@ -28,6 +28,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::config::Config;
+use crate::orders::{self, Desk, Kind};
 use crate::store::Store;
 use crate::sync::{Seats, unix_now};
 use crate::terms::{self, Exit, YourPackage};
@@ -38,9 +39,10 @@ pub struct Limits {
     /// Connections at once, in all and from one address.
     pub connections: usize,
     pub per_peer: usize,
-    /// The time a request's header has to arrive, and a connection's whole
-    /// life.
+    /// The time a request's header has to arrive, then its body, and a
+    /// connection's whole life.
     pub header_time: Duration,
+    pub body_time: Duration,
     pub lifetime: Duration,
     /// The most a request's header may be, in bytes, and its body.
     pub header_bytes: usize,
@@ -53,9 +55,11 @@ impl Default for Limits {
             connections: 64,
             per_peer: 8,
             header_time: Duration::from_secs(5),
+            body_time: Duration::from_secs(15),
             lifetime: Duration::from_secs(60),
             header_bytes: 16 * 1024,
-            body_bytes: 8 * 1024,
+            // A token of many proofs, as a form sends it.
+            body_bytes: 32 * 1024,
         }
     }
 }
@@ -72,6 +76,8 @@ pub struct Site {
     pub seats: Seats,
     /// Told when a package changed, so that the daemon is told at once.
     pub changed: Arc<Notify>,
+    /// Where tokens are taken, on an exit that names a mint.
+    pub desk: Option<Arc<Desk>>,
 }
 
 impl Site {
@@ -80,7 +86,15 @@ impl Site {
         // only by way of that name, which a browser then sends.
         let name = format!("{}.fips:{}", exit.npub, config.port).to_ascii_lowercase();
         let origin = format!("http://{name}");
-        Site { config, exit, hosts: vec![name], origin, store, seats, changed }
+        Site { config, exit, hosts: vec![name], origin, store, seats, changed, desk: None }
+    }
+
+    /// The ways of paying that work now.
+    pub fn methods(&self) -> Vec<String> {
+        match &self.desk {
+            Some(desk) if desk.wallets.ready() => vec!["cashu".to_string()],
+            _ => Vec::new(),
+        }
     }
 
     /// The package `caller` is in, as the caller may see it.
@@ -160,24 +174,41 @@ fn not_from_elsewhere<B>(site: &Site, request: &Request<B>) -> bool {
         && said("sec-fetch-site").is_none_or(|site| site == "same-origin" || site == "none")
 }
 
-/// One request, from `peer`, with its body.
+/// What a request comes to: an answer, or a purchase, which takes asking a
+/// mint and is answered by [`orders::respond`].
+pub enum Answer {
+    Now(Response<Full<Bytes>>),
+    Buy(orders::Asked, Kind),
+}
+
+/// One request, from `peer`, with its body: its answer, when that needs
+/// nothing asked of anyone else.
+#[cfg(test)]
 pub fn respond<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>, body: &[u8]) -> Response<Full<Bytes>> {
+    match route(site, peer, request, body) {
+        Answer::Now(response) => response,
+        Answer::Buy(..) => plain(StatusCode::NOT_IMPLEMENTED, "a purchase: orders::respond answers it"),
+    }
+}
+
+/// One request, from `peer`, with its body.
+pub fn route<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>, body: &[u8]) -> Answer {
     let host = request.headers().get(header::HOST).and_then(|host| host.to_str().ok()).map(str::to_ascii_lowercase);
     match host {
         Some(host) if site.hosts.contains(&host) => {}
-        _ => return plain(StatusCode::MISDIRECTED_REQUEST, "not this exit's name"),
+        _ => return Answer::Now(plain(StatusCode::MISDIRECTED_REQUEST, "not this exit's name")),
     }
     let path = request.uri().path();
     let method = request.method();
     let reading = method == Method::GET || method == Method::HEAD;
-    let terms = || terms::terms(&site.config, &site.exit, peer, site.package_of(peer));
+    let terms = || terms::terms(&site.config, &site.exit, peer, site.package_of(peer), site.methods());
     let refused = |allow: &'static str| {
         let mut refused = plain(StatusCode::METHOD_NOT_ALLOWED, &format!("only {allow} here"));
         refused.headers_mut().insert(header::ALLOW, HeaderValue::from_static(allow));
         refused
     };
     // A HEAD is answered as a GET; hyper sends the head of it and not the body.
-    match path {
+    Answer::Now(match path {
         "/v1/terms" | "/" | "/style.css" if !reading => refused("GET, HEAD"),
         "/v1/terms" => match serde_json::to_vec(&terms()) {
             Ok(json) => answer(StatusCode::OK, "application/json", json),
@@ -185,10 +216,39 @@ pub fn respond<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>, body: &[u8]
         },
         "/" => answer(StatusCode::OK, "text/html; charset=utf-8", terms::page(&terms())),
         "/style.css" => answer(StatusCode::OK, "text/css; charset=utf-8", terms::STYLE),
-        "/v1/package" | "/v1/package/members" | "/v1/leave" | "/package" | "/package/members" | "/leave"
+        "/v1/package"
+        | "/v1/package/members"
+        | "/v1/leave"
+        | "/package"
+        | "/package/members"
+        | "/leave"
+        | "/v1/orders"
+        | "/buy"
             if method != Method::POST =>
         {
             refused("POST")
+        }
+        // A purchase: the same two ways in, and then the mint is asked.
+        "/v1/orders" => {
+            if media_type(request) != "application/json" {
+                plain(StatusCode::UNSUPPORTED_MEDIA_TYPE, "JSON, as application/json")
+            } else if !not_from_elsewhere(site, request) {
+                plain(StatusCode::FORBIDDEN, "not from another site")
+            } else {
+                match orders::asked_json(body) {
+                    Ok(asked) => return Answer::Buy(asked, Kind::Json),
+                    Err(fault) => orders::refuse(Kind::Json, &fault),
+                }
+            }
+        }
+        "/buy" => {
+            if media_type(request) != "application/x-www-form-urlencoded" {
+                plain(StatusCode::UNSUPPORTED_MEDIA_TYPE, "a form")
+            } else if !from_this_page(site, request) {
+                plain(StatusCode::FORBIDDEN, "only from this exit's page")
+            } else {
+                return Answer::Buy(orders::asked_form(body), Kind::Form);
+            }
         }
         "/v1/package" | "/v1/package/members" | "/v1/leave" => {
             if media_type(request) != "application/json" {
@@ -209,7 +269,7 @@ pub fn respond<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>, body: &[u8]
             }
         }
         _ => plain(StatusCode::NOT_FOUND, "nothing here"),
-    }
+    })
 }
 
 /// A request's body: at most `most` bytes, within `time`. None for one that
@@ -278,12 +338,18 @@ pub async fn serve(listener: TcpListener, site: Arc<Site>, limits: Limits, admit
         let site = site.clone();
         tokio::spawn(async move {
             let _places = (place, peer_place);
+            // What takes long is answered before the connection's life is
+            // over, with a little left to send the answer in.
+            let until = tokio::time::Instant::now() + limits.lifetime.saturating_sub(Duration::from_secs(3));
             let service = service_fn(move |request: Request<Incoming>| {
                 let site = site.clone();
                 async move {
                     let (parts, body) = request.into_parts();
-                    let response = match body_of(body, limits.body_bytes, limits.header_time).await {
-                        Some(body) => respond(&site, mesh_peer, &Request::from_parts(parts, ()), &body),
+                    let response = match body_of(body, limits.body_bytes, limits.body_time).await {
+                        Some(body) => match route(&site, mesh_peer, &Request::from_parts(parts, ()), &body) {
+                            Answer::Now(response) => response,
+                            Answer::Buy(asked, kind) => orders::respond(&site, mesh_peer, &asked, kind, until).await,
+                        },
                         None => plain(StatusCode::PAYLOAD_TOO_LARGE, "a body too large, or too slow"),
                     };
                     Ok::<_, Infallible>(response)
@@ -363,7 +429,7 @@ mod tests {
         assert_eq!(page.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
         assert!(page.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().starts_with("default-src 'none'"));
         assert_eq!(respond(&site, peer, &get("/style.css", host), b"").status(), StatusCode::OK);
-        for path in ["/v1/terms/", "/v2/terms", "/index.html", "/../etc/passwd", "/v1/orders"] {
+        for path in ["/v1/terms/", "/v2/terms", "/index.html", "/../etc/passwd", "/v1/orders/o1", "/v1/wallet"] {
             assert_eq!(respond(&site, peer, &get(path, host), b"").status(), StatusCode::NOT_FOUND, "{path}");
         }
         for method in [Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS] {
@@ -448,6 +514,59 @@ mod tests {
         // The ways in are POST only; the terms are GET only.
         assert_eq!(status(get("/leave", "npub1example.fips:5170"), b""), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(status(get("/v1/package", "npub1example.fips:5170"), b""), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(status(get("/v1/orders", "npub1example.fips:5170"), b""), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(status(get("/buy", "npub1example.fips:5170"), b""), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// A purchase comes in by the same two ways as any change, and is told
+    /// apart from one before a mint is asked anything.
+    #[test]
+    fn a_purchase_comes_from_here_or_from_a_program() {
+        let (site, peer) = (site(), "fd99::2".parse().unwrap());
+        let ours = "http://npub1example.fips:5170";
+        let form = "application/x-www-form-urlencoded";
+        let buys = |request: Request<()>, body: &[u8]| match route(&site, peer, &request, body) {
+            Answer::Buy(asked, kind) => Ok((asked.package, asked.token, asked.key, kind)),
+            Answer::Now(response) => Err(response.status()),
+        };
+        let json = br#"{"package":"1gb","token":"cashuBabc"}"#;
+        assert_eq!(
+            buys(post("/v1/orders", "application/json", &[]), json),
+            Ok(("1gb".into(), "cashuBabc".into(), None, Kind::Json))
+        );
+        assert_eq!(
+            buys(post("/v1/orders", "application/json", &[]), br#"{"package":"1gb","token":"t","key":"k"}"#),
+            Ok(("1gb".into(), "t".into(), Some("k".into()), Kind::Json))
+        );
+        assert_eq!(
+            buys(post("/v1/orders", "application/json", &[("origin", "http://evil.example")]), json),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(buys(post("/v1/orders", "text/plain", &[]), json), Err(StatusCode::UNSUPPORTED_MEDIA_TYPE));
+        for not_it in
+            [&b"[\"1gb\",\"t\"]"[..], b"{}", br#"{"package":"1gb"}"#, br#"{"package":"1gb","token":"t","more":1}"#]
+        {
+            assert_eq!(buys(post("/v1/orders", "application/json", &[]), not_it), Err(StatusCode::BAD_REQUEST));
+        }
+        assert_eq!(
+            buys(post("/buy", form, &[("origin", ours)]), b"package=1gb&token=cashuB+abc%0D%0Adef&key="),
+            Ok(("1gb".into(), "cashuB abc\r\ndef".into(), None, Kind::Form))
+        );
+        assert_eq!(
+            buys(post("/buy", form, &[("sec-fetch-site", "same-origin")]), b"package=1gb&token=t&key=abc"),
+            Ok(("1gb".into(), "t".into(), Some("abc".into()), Kind::Form))
+        );
+        assert_eq!(buys(post("/buy", form, &[]), b"package=1gb&token=t"), Err(StatusCode::FORBIDDEN));
+        assert_eq!(
+            buys(post("/buy", form, &[("origin", "http://evil.example")]), b"package=1gb&token=t"),
+            Err(StatusCode::FORBIDDEN)
+        );
+        // And on an exit that names no mint, it is answered at once.
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let asked = orders::asked_json(json).unwrap();
+        let soon = tokio::time::Instant::now() + Duration::from_secs(30);
+        let answer = runtime.block_on(orders::respond(&site, peer, &asked, Kind::Json, soon));
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -455,9 +574,9 @@ mod tests {
         let at = server(Limits::default(), |_| true).await;
         let mut request =
             b"POST /v1/package HTTP/1.1\r\nHost: npub1example.fips:5170\r\nContent-Type: application/json\r\n\
-            Content-Length: 20000\r\nConnection: close\r\n\r\n"
+            Content-Length: 40000\r\nConnection: close\r\n\r\n"
                 .to_vec();
-        request.extend(std::iter::repeat_n(b' ', 20_000));
+        request.extend(std::iter::repeat_n(b' ', 40_000));
         let answer = exchange(at, &request).await;
         assert!(answer.starts_with("HTTP/1.1 413"), "{answer:.60}");
     }

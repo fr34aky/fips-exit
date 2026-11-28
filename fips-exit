@@ -18,7 +18,13 @@ NAT to the uplink, and the firewall.
   fips-exit advert [show]                  say on Nostr that this exit exists; or show what would be said
 
 With ACCESS=paid and the payment service running (fips-exit-payd), packages
-the operator gives away, without payment:
+are sold for Cashu tokens of the mints in MINTS, which arrive in a wallet of
+the service's own:
+
+  fips-exit wallet                                       what the wallet holds at each mint, and what was sold
+  fips-exit orders                                       what was paid, by whom, for what
+
+And packages the operator gives away, without payment:
 
   fips-exit grant <size> <days> <who>[,<who>…] [label]   a package: size like 1GB, days 0 for no end,
                                                          who an npub or an fd address; prints its key
@@ -1238,16 +1244,17 @@ def cmd_advert(what="publish"):
             raise AdvertError(f"the key in {key_path} is not this node's: it is {signer}'s, "
                               f"and {config['MESH_IF']} has {here}")
         now = int(time.time())
-        # allow-list in both modes, for now: with ACCESS=paid nothing here
-        # takes a payment yet, so who is served is still who the operator
-        # put there, on the list or in an account.
+        # A paid exit is one that sells: its payment service runs, and
+        # names a way to pay. Until then who is served is who the operator
+        # put there, on the list or in a package, and that is what is said.
+        terms = offered() if paid(config) else None
         tags = advert_tags({
-            "access": "allow-list",
+            "access": "paid" if terms else "allow-list",
             "name": " ".join(config.get("ADVERT_NAME", "").split()),
             "about": " ".join(config.get("ADVERT_ABOUT", "").split()),
             "country": config.get("COUNTRY") or None,
             "expires": now + ADVERT_TTL,
-            "terms": None,
+            "terms": terms,
         }, now)
         event = build_event(key, tags, now)
     except AdvertError as error:
@@ -1371,12 +1378,24 @@ def cmd_status():
                     print(f"  /etc/fips/fips.pub ({npub}) is not this node: the service will not start")
             except (OSError, ValueError):
                 print("  /etc/fips/fips.pub has no npub: the service will not start")
+            # What it sells for: the mints it takes tokens of, as it says.
+            if listening:
+                mints = [line.split() for line in (payd("wallet", fatal=False) or [])[:-1]]
+                for mint in mints:
+                    if len(mint) == 6:
+                        print(f"  tokens of {shown(mint[1], 256)}: {shown(mint[2], 8)}, holds {shown(mint[3], 20)} sat")
+                if not mints:
+                    print("  nothing is sold: no mint is named (MINTS), or the service says nothing of its wallet")
 
 
-def payd(line):
+def payd(line, fatal=True):
     """One command to the payment service's socket for the operator; the
     lines of its answer, the last beginning `ok`, or the script stops with
-    what was said."""
+    what was said. With `fatal` false, None in place of stopping."""
+    def stop(why):
+        if fatal:
+            die(why)
+
     peer = socket.socket(socket.AF_UNIX)
     peer.settimeout(10)
     try:
@@ -1389,15 +1408,81 @@ def payd(line):
             if not data:
                 break
             answer += data
+            if len(answer) > 4 << 20:
+                raise OSError("an answer without end")
     except OSError as error:
-        die(f"the payment service does not answer on {PAYD_ADMIN} ({error.strerror or error}): "
-            "is it running? (systemctl start fips-exit-payd)")
+        return stop(f"the payment service does not answer on {PAYD_ADMIN} ({error.strerror or error}): "
+                    "is it running? (systemctl start fips-exit-payd)")
     finally:
         peer.close()
     lines = answer.decode(errors="replace").splitlines()
     if not lines or not lines[-1].startswith("ok"):
-        die(lines[-1][4:] if lines and lines[-1].startswith("err ") else f"the payment service said: {lines}")
+        return stop(lines[-1][4:] if lines and lines[-1].startswith("err ") else f"the payment service said: {lines}")
     return lines
+
+
+def offered():
+    """What the payment service sells, as it says so itself (its `terms`):
+    the price, the ways of paying it is set up for, its port, the mints and
+    the packages. None when it sells nothing: it does not run, or names no
+    mint. What it says is another program's word, and is taken as that:
+    its shape is checked here, its bounds where the advert is written."""
+    lines = payd("terms", fatal=False)
+    if not lines or not lines[0].startswith("terms "):
+        return None
+    try:
+        said = json.loads(lines[0][len("terms "):])
+    except (ValueError, RecursionError):
+        return None
+    texts = lambda value: isinstance(value, list) and all(isinstance(item, str) for item in value)
+    in_shape = (
+        isinstance(said, dict) and texts(said.get("methods")) and texts(said.get("mints"))
+        and isinstance(said.get("packages"), list)
+        and all(isinstance(package, dict) and isinstance(package.get("id"), str)
+                and all(key in package for key in ("bytes", "sat", "days")) for package in said["packages"])
+    )
+    if not in_shape or not said["methods"]:
+        return None
+    return {"price_msat_per_gb": said.get("price_msat_per_gb"), "methods": said["methods"],
+            "port": said.get("port"), "mints": said["mints"],
+            "packages": [{key: package[key] for key in ("id", "bytes", "sat", "days")} for package in said["packages"]]}
+
+
+def cmd_wallet():
+    """What the payment service's wallet holds at each mint."""
+    lines = payd("wallet")
+    print(f"{'holds':>12} {'under way':>12} {'sold':>12}  {'mint':<8} url")
+    for line in lines[:-1]:
+        try:
+            _, url, state, holds, pending, sold = line.split()
+            holds, pending, sold = int(holds), int(pending), int(sold)
+        except ValueError:
+            die(f"the payment service said something that is not a mint: {shown(line, 200)}")
+        print(f"{f'{holds} sat':>12} {f'{pending} sat':>12} {f'{sold} sat':>12}  {shown(state, 8):<8} {shown(url, 256)}")
+    if len(lines) == 1:
+        print(f"(no mint is named: MINTS in {CONFIG})")
+    print("What the wallet holds is whoever's has its seed: the file `seed` in the service's state directory\n"
+          "(/var/lib/fips-exit-payd, or /var/lib/private/fips-exit-payd). Keep a copy of it, and keep it safe.\n"
+          "Nothing here pays out yet: what is held stays at the mint until it does, or until its seed is\n"
+          "restored in another Cashu wallet.")
+
+
+def cmd_orders():
+    """What was paid: the newest orders."""
+    lines = payd("orders")
+    print(f"{'order':<18} {'state':<5} {'when':<16} {'price':>10} {'arrived':>10} {'fee':>6}  "
+          f"{'offer':<20} {'package':<18} buyer")
+    for line in lines[:-1]:
+        try:
+            _, order, state, created, buyer, offer, sat, paid_sat, fee, package, _mint = line.split()
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(created)))
+            sat, paid_sat, fee = int(sat), int(paid_sat), int(fee)
+        except (ValueError, OverflowError, OSError):
+            die(f"the payment service said something that is not an order: {shown(line, 200)}")
+        print(f"{shown(order, 18):<18} {shown(state, 5):<5} {when:<16} {f'{sat} sat':>10} {f'{paid_sat} sat':>10} "
+              f"{fee:>6}  {shown(offer, 20):<20} {shown(package, 18):<18} {shown(buyer, 80)}")
+    if len(lines) == 1:
+        print("(none)")
 
 
 def who_list(text):
@@ -1486,7 +1571,7 @@ def main(argv):
     commands = {"up": cmd_up, "down": cmd_down, "add": cmd_add, "remove": cmd_remove,
                 "list": cmd_list, "status": cmd_status, "accounts": cmd_accounts, "advert": cmd_advert,
                 "grant": cmd_grant, "packages": cmd_packages, "top-up": cmd_top_up, "members": cmd_members,
-                "revoke": cmd_revoke}
+                "revoke": cmd_revoke, "wallet": cmd_wallet, "orders": cmd_orders}
     if len(argv) < 2 or argv[1] not in commands:
         sys.exit(__doc__)
     try:

@@ -360,7 +360,8 @@ chose.
   the page shows the expiry where it cannot be missed.
 - **A token.** Accepted only from the operator's mints. Its value after the
   mint's fee is checked against the price before it is swapped; a token that
-  is too small is given back untouched.
+  is too small is given back untouched, and so is one worth over a tenth
+  more than the price, since nothing is given back afterwards.
 
 A way of paying is offered only when the mint's own description
 (`/v1/info`) says it can do it.
@@ -378,7 +379,7 @@ key on the same disk would protect nothing.
 Two SQLite files, the wallet's and the service's. Nothing assumes that a
 change to both happens at once.
 
-- `orders`: one per quote at a mint.
+- `orders`: one per quote at a mint, or per token.
 - `credits`: one row for every receipt that was realised, with a key that
   can exist once: the quote, the hash of a token's proofs, or a channel and
   its balance.
@@ -389,6 +390,29 @@ what is in the wallet. If the process dies after an invoice was paid and
 before the ecash was minted, the next start mints it and grants it. The
 service is the truth about accounts, and pushes them to the daemon whenever
 the daemon's epoch has changed.
+
+For a token, "in the wallet" has two grounds and no third. Either the wallet
+took the token without a hitch; or, after an answer of the mint's was lost,
+the mint says both that it signed what this wallet asked for in exchange
+(NUT-09) and that the token's proofs are spent (NUT-07): one exchange does
+both at once. Neither alone will do. Spent and not signed is a token its
+sender spent elsewhere first, which is all the wallet library can find
+after a lost answer, and why its conclusion is not gone by. Signed and not
+spent is a wallet whose file is behind its seed's use, asking for what the
+mint signed before. So an order is written down before its token goes to
+the mint, what the wallet asked the mint to sign is kept before the wallet
+is let to finish anything, and a mint is accepted only if it offers NUT-07
+and NUT-09. An order that is neither signed nor spent is asked about for
+ten minutes, and for as long after that as the wallet may still be asking
+the mint itself, and then forgotten.
+
+The wallet's seed is 24 words (BIP-39) in a file of the service's own. What
+the wallet asks a mint to sign follows from the seed and a counter in the
+wallet's file, so the two belong together: a start that finds the seed and
+no wallet file counts again at the mints what the seed has there (NUT-13),
+a wallet's file with no seed is not started on, and a wallet's next requests
+are asked about at a mint before anything is sold there, in case its file
+is an old one.
 
 ### What it has to hold against
 
@@ -501,7 +525,7 @@ and `SECURITY-REVIEW.md`.
 | 2 | **Done.** `fips-exit-proto` and its vectors; `fips-exit advert` and its timer. Free exits gain an advert and a country by this alone. |
 | 3 | **Done.** The payment service's frame: configuration, terms, the page, the unit, a CI job. The schema waits for phase 4, which is the first to keep anything. |
 | 4 | **Done.** Accounts without money: the service on the socket, a grant by hand, members, usage, pushing again after a restart, and a package's members managed with its key over the mesh. |
-| 5 | The wallet, and payment by token. |
+| 5 | **Done.** The wallet, and payment by token: a package of its own or added to one by its key, once for a token, and granted only when its price has arrived. Nothing pays out yet: until phase 7 the way to what was paid is the seed. |
 | 6 | Lightning. |
 | 7 | Paying out and sweeping. Before on-chain: a wallet with no way out is the larger risk. |
 | 8 | On-chain. |
@@ -509,8 +533,9 @@ and `SECURITY-REVIEW.md`.
 | 10 | Channels. |
 
 The tests for the payment phases run against a real Cashu mint started
-inside the test, with a Lightning backend that pays itself. fips-exit-gate's
-fake mint is a stub a real wallet cannot talk to.
+inside the test, with a Lightning backend that pays itself
+(`payd/test-mint`), reached by a way on which a request or an answer can be
+lost. fips-exit-gate's fake mint is a stub a real wallet cannot talk to.
 
 ## Open questions
 

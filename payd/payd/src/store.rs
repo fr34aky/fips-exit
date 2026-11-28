@@ -89,7 +89,8 @@ const SCHEMA: &[&str] = &[
     -- What arrived, once each: the key cannot be there twice, so nothing
     -- is granted twice for one payment.
     CREATE TABLE credits (
-        -- 'cashu:' and the receipt, for a token.
+        -- 'cashu:' and the receipt, for a token; the order's method and
+        -- its receipt, for whatever else pays.
         key TEXT PRIMARY KEY,
         at INTEGER NOT NULL,
         sat INTEGER NOT NULL,
@@ -99,6 +100,20 @@ const SCHEMA: &[&str] = &[
         bytes INTEGER NOT NULL,
         days INTEGER NOT NULL
     );
+",
+    "
+    -- How an order is paid: 'cashu', with a token; 'bolt11', by an invoice
+    -- of the mint's. A credit's key begins with the same word.
+    ALTER TABLE orders ADD COLUMN method TEXT NOT NULL DEFAULT 'cashu';
+    -- For an invoice: the mint's quote; the key that quote is locked to,
+    -- which is the wallet's, kept here too so that this row is enough to
+    -- claim what was paid whatever becomes of the wallet's file; the invoice;
+    -- when it ends; and when the order was given up as unpaid, if it was.
+    ALTER TABLE orders ADD COLUMN quote TEXT;
+    ALTER TABLE orders ADD COLUMN quote_key TEXT;
+    ALTER TABLE orders ADD COLUMN request TEXT;
+    ALTER TABLE orders ADD COLUMN expires INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE orders ADD COLUMN ended INTEGER NOT NULL DEFAULT 0;
 ",
 ];
 
@@ -142,6 +157,38 @@ pub struct Order {
     pub fee_sat: u64,
     pub settled: u64,
     pub package: Option<String>,
+    /// How it is paid: [`CASHU`] or [`BOLT11`].
+    pub method: String,
+    /// For an invoice: the mint's quote, the key it is locked to, the
+    /// invoice, when that ends, and when the order was given up.
+    pub quote: Option<String>,
+    pub quote_key: Option<String>,
+    pub request: Option<String>,
+    pub expires: u64,
+    pub ended: u64,
+}
+
+/// The ways an order is paid, as they are kept.
+pub const CASHU: &str = "cashu";
+pub const BOLT11: &str = "bolt11";
+
+/// What is ordered by invoice: `bytes` for `days`, offered as `offer` for
+/// `sat`, by `buyer`; `mint` gave `request` for it under `quote`, which is
+/// locked to `quote_key` and ends at `expires`. Added to package `target`,
+/// or a package of its own.
+#[derive(Debug, Clone)]
+pub struct NewInvoice<'a> {
+    pub buyer: Ipv6Addr,
+    pub mint: &'a str,
+    pub offer: &'a str,
+    pub bytes: u64,
+    pub sat: u64,
+    pub days: u32,
+    pub target: Option<&'a str>,
+    pub quote: &'a str,
+    pub quote_key: Option<&'a str>,
+    pub request: &'a str,
+    pub expires: u64,
 }
 
 /// What is ordered: `bytes` for `days`, offered as `offer` for `sat`, by
@@ -366,7 +413,6 @@ impl Store {
         }
     }
 
-    #[cfg(test)]
     pub fn package(&self, id: &str) -> Result<Option<Package>, Refused> {
         Ok(Store::package_in(&self.db(), id)?)
     }
@@ -600,7 +646,8 @@ impl Store {
     // ---- what was paid ------------------------------------------------------
 
     const ORDER: &str = "SELECT id, created, buyer, mint, offer, bytes, sat, days, target, receipt, value, outputs, \
-                         paid, paid_sat, fee_sat, settled, package, inputs FROM orders";
+                         paid, paid_sat, fee_sat, settled, package, inputs, method, quote, quote_key, request, \
+                         expires, ended FROM orders";
 
     fn order_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Order> {
         Ok(Order {
@@ -622,6 +669,12 @@ impl Store {
             settled: as_u64(row.get(15)?),
             package: row.get(16)?,
             inputs: row.get(17)?,
+            method: row.get(18)?,
+            quote: row.get(19)?,
+            quote_key: row.get(20)?,
+            request: row.get(21)?,
+            expires: as_u64(row.get(22)?),
+            ended: as_u64(row.get(23)?),
         })
     }
 
@@ -667,7 +720,6 @@ impl Store {
         Ok(Begun::New(id.to_string()))
     }
 
-    #[cfg(test)]
     pub fn order(&self, id: &str) -> Result<Option<Order>, Refused> {
         Ok(Store::orders_where(&self.db(), "WHERE id = ?1", &[&id])?.pop())
     }
@@ -676,9 +728,83 @@ impl Store {
         Ok(Store::orders_where(&self.db(), "WHERE receipt = ?1", &[&receipt.as_slice()])?.pop())
     }
 
-    /// The orders whose payment is not known to have arrived, oldest first.
+    /// The orders whose token is not known to have arrived, oldest first.
     pub fn orders_open(&self) -> Result<Vec<Order>, Refused> {
-        Ok(Store::orders_where(&self.db(), "WHERE paid = 0 ORDER BY created, id", &[])?)
+        Ok(Store::orders_where(&self.db(), "WHERE paid = 0 AND method = 'cashu' ORDER BY created, id", &[])?)
+    }
+
+    /// Begin order `id`, which is paid by an invoice: written down before
+    /// the invoice is shown to anyone, so that no invoice can be paid that
+    /// this exit does not know of. An order is a quote of a mint's, once.
+    pub fn invoice_begin(&self, id: &str, new: &NewInvoice<'_>, now: u64) -> Result<(), Refused> {
+        let mut receipt = Sha256::new();
+        for part in [BOLT11, new.mint, new.quote] {
+            receipt.update(part.as_bytes());
+            receipt.update([0]);
+        }
+        self.db().execute(
+            "INSERT INTO orders (id, created, buyer, mint, offer, bytes, sat, days, target, receipt, value, inputs,
+                                 method, quote, quote_key, request, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?7, '', 'bolt11', ?11, ?12, ?13, ?14)",
+            params![
+                id,
+                as_i64(now),
+                new.buyer.to_string(),
+                new.mint,
+                new.offer,
+                as_i64(new.bytes),
+                as_i64(new.sat),
+                i64::from(new.days),
+                new.target,
+                receipt.finalize().as_slice(),
+                new.quote,
+                new.quote_key,
+                new.request,
+                as_i64(new.expires)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The invoices that are neither paid nor given up, oldest first.
+    pub fn invoices_open(&self) -> Result<Vec<Order>, Refused> {
+        Ok(Store::orders_where(
+            &self.db(),
+            "WHERE paid = 0 AND ended = 0 AND method = 'bolt11' ORDER BY created, id",
+            &[],
+        )?)
+    }
+
+    /// How many invoices wait to be paid that can still be: of `buyer`, and
+    /// in all.
+    pub fn invoices_waiting(&self, buyer: Ipv6Addr, now: u64) -> Result<(usize, usize), Refused> {
+        let db = self.db();
+        let count = |more: &str, values: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<usize> {
+            let sql = format!(
+                "SELECT COUNT(*) FROM orders WHERE paid = 0 AND ended = 0 AND method = 'bolt11' AND expires > ?1 {more}"
+            );
+            db.query_row(&sql, values, |row| row.get::<_, i64>(0)).map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+        };
+        let now = as_i64(now);
+        Ok((count("AND buyer = ?2", &[&now, &buyer.to_string()])?, count("", &[&now])?))
+    }
+
+    /// Order `id`'s invoice ended unpaid: given up. One that is paid is not.
+    pub fn invoice_end(&self, id: &str, now: u64) -> Result<(), Refused> {
+        self.db().execute(
+            "UPDATE orders SET ended = ?2 WHERE id = ?1 AND paid = 0 AND method = 'bolt11'",
+            params![id, as_i64(now.max(1))],
+        )?;
+        Ok(())
+    }
+
+    /// Forget the invoices that were given up before `before`: nobody asks
+    /// what became of them any more.
+    pub fn invoices_forget(&self, before: u64) -> Result<usize, Refused> {
+        Ok(self.db().execute(
+            "DELETE FROM orders WHERE paid = 0 AND method = 'bolt11' AND ended > 0 AND ended < ?1",
+            [as_i64(before)],
+        )?)
     }
 
     /// The newest orders, `most` at most.
@@ -766,7 +892,7 @@ impl Store {
         tx.execute(
             "INSERT INTO credits (key, at, sat, mint, of_order, package, bytes, days) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                format!("cashu:{}", hex(&order.receipt)),
+                format!("{}:{}", order.method, hex(&order.receipt)),
                 as_i64(now),
                 as_i64(paid_sat),
                 order.mint,

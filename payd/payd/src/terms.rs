@@ -69,8 +69,9 @@ pub struct Terms {
     /// Mints accepted.
     pub mints: Vec<String>,
     /// The ways of paying that work now: `cashu`, a token of an accepted
-    /// mint, while one of them is reached. A client buys nothing while this
-    /// is empty.
+    /// mint, while one of them is reached; `bolt11`, a Lightning invoice,
+    /// while one that is reached gives any. A client buys nothing while
+    /// this is empty.
     pub methods: Vec<String>,
     pub you: You,
 }
@@ -170,8 +171,10 @@ pub fn shell(title: &str, body: &str) -> String {
 
 /// The form that buys one of `offers` with a token. With `key`, what is
 /// bought is added to the package that key opens.
-pub fn buy_form(offers: &[Package], key: Option<&str>) -> String {
-    if offers.is_empty() {
+pub fn buy_form(offers: &[Package], key: Option<&str>, methods: &[String]) -> String {
+    let (by_token, by_invoice) =
+        (methods.iter().any(|method| method == "cashu"), methods.iter().any(|method| method == "bolt11"));
+    if offers.is_empty() || !(by_token || by_invoice) {
         return String::new();
     }
     let options: String = offers
@@ -186,16 +189,32 @@ pub fn buy_form(offers: &[Package], key: Option<&str>) -> String {
             )
         })
         .collect();
-    let (heading, hidden, button) = match key {
+    let (heading, hidden, invoice_button, button) = match key {
         Some(key) => (
             "<h2>Add to this package</h2>\n",
             format!("<input type=\"hidden\" name=\"key\" value=\"{}\">", escape(key)),
+            "Add it, paid with Lightning",
             "Add it, paid with this token",
         ),
-        None => ("<h2>Buy a package</h2>\n", String::new(), "Pay with this token"),
+        None => ("<h2>Buy a package</h2>\n", String::new(), "Pay with Lightning", "Pay with this token"),
     };
-    format!(
-        "{heading}<form method=\"post\" action=\"/buy\">{hidden}
+    let mut form = heading.to_string();
+    if by_invoice {
+        form.push_str(&format!(
+            "<form method=\"post\" action=\"/buy\">{hidden}<input type=\"hidden\" name=\"method\" value=\"bolt11\">
+<p><label>Package <select name=\"package\">{options}</select></label></p>
+<button>{invoice_button}</button>
+</form>
+<p class=\"you\">An invoice for its price is shown, to pay from a Lightning wallet: on this device, or with another from its code. What is paid is not given back.</p>
+"
+        ));
+    }
+    if by_token {
+        if by_invoice {
+            form.push_str("<h3>Or with a Cashu token</h3>\n");
+        }
+        form.push_str(&format!(
+            "<form method=\"post\" action=\"/buy\">{hidden}
 <p><label>Package <select name=\"package\">{options}</select></label></p>
 <p><label>A Cashu token for its price, of a mint this exit accepts<br>
 <textarea name=\"token\" rows=\"5\" required autocomplete=\"off\" autocapitalize=\"off\" spellcheck=\"false\"></textarea></label></p>
@@ -203,7 +222,9 @@ pub fn buy_form(offers: &[Package], key: Option<&str>) -> String {
 </form>
 <p class=\"you\">The token must be worth the price after the fee its mint takes for redeeming it. One worth less, or over a tenth more, is not touched. What is paid is not given back.</p>
 "
-    )
+        ));
+    }
+    form
 }
 
 /// The page: the same terms, for a browser. No script, no font or file from
@@ -290,13 +311,13 @@ pub fn page(terms: &Terms) -> String {
 ",
         per_gb = sat_shown(terms.price_msat_per_gb),
         you = terms.you.address,
-        buy = if terms.methods.iter().any(|method| method == "cashu") {
+        buy = if !terms.methods.is_empty() {
             let offers: Vec<Package> = terms
                 .packages
                 .iter()
                 .map(|p| Package { id: p.id.clone(), bytes: p.bytes, sat: p.sat, days: p.days })
                 .collect();
-            buy_form(&offers, None)
+            buy_form(&offers, None, &terms.methods)
         } else {
             "<p class=\"note\">Nothing can be bought here right now: this exit takes no payment at the moment.</p>\n"
                 .to_string()
@@ -311,6 +332,8 @@ body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
 main { max-width: 42rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
 h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
 h2 { font-size: 1.1rem; margin: 1.75rem 0 .5rem; }
+h3 { font-size: 1rem; margin: 1.25rem 0 .5rem; }
+.qr { display: block; width: 18rem; max-width: 100%; height: auto; }
 code { font-size: .85rem; overflow-wrap: anywhere; }
 .who { margin-top: 0; opacity: .75; }
 table { border-collapse: collapse; width: 100%; }
@@ -408,10 +431,31 @@ mod tests {
         assert!(page.contains("<textarea name=\"token\"") && !page.contains("Nothing can be bought"));
         assert!(!page.contains("name=\"key\" value="), "a package of its own: no key goes with it");
         // Added to a package: the key goes with the form, and is not markup.
-        let add = buy_form(&config().packages, Some("ab\"><x"));
+        let token = ["cashu".to_string()];
+        let add = buy_form(&config().packages, Some("ab\"><x"), &token);
         assert!(add.contains("<h2>Add to this package</h2>"));
         assert!(add.contains("name=\"key\" value=\"ab&quot;&gt;&lt;x\""));
-        assert_eq!(buy_form(&[], None), "", "nothing offered, nothing to buy");
+        assert!(!add.contains("Lightning") && !page.contains("Lightning"), "no invoice where no mint gives one");
+        assert_eq!(buy_form(&[], None, &token), "", "nothing offered, nothing to buy");
+        assert_eq!(buy_form(&config().packages, None, &[]), "", "no way to pay, nothing to buy");
+        // Where a mint gives invoices, the form that asks for one comes
+        // first; the one for a token is there as before.
+        let both = ["cashu".to_string(), "bolt11".to_string()];
+        let selling = terms(&config(), &exit(), "fd99::2".parse().unwrap(), None, both.to_vec());
+        let page = super::page(&selling);
+        let invoice = page.find("<input type=\"hidden\" name=\"method\" value=\"bolt11\">").expect("an invoice form");
+        assert!(invoice < page.find("<textarea name=\"token\"").unwrap(), "{page}");
+        assert!(
+            page.contains("<button>Pay with Lightning</button>")
+                && page.contains("<button>Pay with this token</button>")
+        );
+        assert!(page.contains("<h3>Or with a Cashu token</h3>"));
+        let add = buy_form(&config().packages, Some("abcd"), &both);
+        assert_eq!(add.matches("name=\"key\" value=\"abcd\"").count(), 2, "the key goes with both forms");
+        assert!(add.contains("<button>Add it, paid with Lightning</button>"));
+        // An invoice alone: no token is asked for.
+        let invoice_only = buy_form(&config().packages, None, &["bolt11".to_string()]);
+        assert!(invoice_only.contains("Pay with Lightning") && !invoice_only.contains("textarea"));
         let shell = shell("A title", "<p>the body</p>\n");
         assert!(
             shell.contains("<title>A title</title>") && shell.contains("<h1>A title</h1>\n<p>the body</p>\n</main>")

@@ -125,7 +125,23 @@ IPv4 address derived from the client's fips address.
     parsed by the wallet library all the same, and one of them decides a
     grant: what it says it has signed (NUT-09), of which only the outputs
     this wallet asked about are counted.
-12. **What the payment service tells the script.** `fips-exit wallet`,
+12. **A request for an invoice, from anyone on the mesh.** It costs its
+    asker nothing, and makes the service ask a mint (for a quote) and keep
+    an order until the invoice has ended. Taken from it: a package on
+    offer, optionally a key and the name of a mint, which must be one of
+    `MINTS` as the config writes it. Bounds: 3 invoices waiting for one
+    address, 512 in all, and the budget a token is taken from. The invoice
+    comes from the mint and is read before it is shown: a BOLT11 request
+    for the price exactly, or nothing is shown. It goes into the order's
+    page escaped, as text, as a `lightning:` link and as a QR code that is
+    SVG written here (rectangles, no script, no link). An order is named by
+    64 random bits and shown to the address that made it only, so asking
+    for one that is another's says nothing but "no such order". Asking
+    about an order changes nothing but when the mint is next asked, which
+    has a bound of its own (one invoice every three seconds). The one
+    request there that changes something, a new key for the package an
+    order made, is a POST held to the same rules as every other change.
+13. **What the payment service tells the script.** `fips-exit wallet`,
     `orders`, `status` and `advert` ask the service over its socket, and
     root prints or signs what comes back: the service is another program,
     without privilege, and its word is taken as that. What is printed is
@@ -250,6 +266,24 @@ IPv4 address derived from the client's fips address.
   key can exist once); and the wallet let to finish what it began before
   what it asked the mint to sign was kept for every open order, since
   afterwards nothing can be asked.
+  For an invoice the grounds are two as well: the wallet minted for the
+  quote without a hitch, after the mint said the invoice is paid; or the
+  mint says the quote is minted, which it does for the wallet that knows
+  the quote and holds the key it is locked to. Serious: a package for an
+  invoice that is not paid, for another order's quote, or twice for one
+  quote (an order is one quote of one mint, and a credit's key can exist
+  once); and an order given up while its invoice could still be paid, or
+  without the mint's word.
+- **An invoice paid, and nothing granted.** An order is written down before
+  its invoice is shown to anyone; it is given up only when the mint, asked
+  after the invoice's end and a while more, says it is not paid; and
+  neither a restart, a lost answer, a mint that is away nor a wallet's file
+  that was lost may end it otherwise (the quote and its key are kept with
+  the order). A mint that refuses to mint for a paid quote as signed
+  before makes the wallet count again, once for an order, and is asked
+  again after. What is paid after an invoice's end is lost to the payer,
+  and the page says when that is: serious would be showing an invoice
+  whose end has passed, or a wrong end.
 - **A token taken, and nothing granted.** The other way round: whatever the
   service refuses, it must refuse before the token is taken to the mint, and
   say that the token was not touched; an order whose token did reach the
@@ -336,15 +370,27 @@ IPv4 address derived from the client's fips address.
   a seed.
 - **Anyone can keep others from paying.** The mint is asked for every token
   that passes the checks made here, and a token that will be refused there
-  costs its sender nothing to make. So there is a budget for the whole
-  service, 10 tokens and one more every six seconds, and someone who uses
-  it up keeps everyone from buying for as long as they go on. Members are
+  costs its sender nothing to make; nor does asking for an invoice. So
+  there is a budget for the whole service, 10 of either and one more every
+  six seconds, and someone who uses it up keeps everyone from buying for as
+  long as they go on. Invoices that nobody pays also take the mint's
+  attention from those that are paid: each is asked about until it has
+  ended, one every three seconds in all, so with many waiting a payment is
+  seen later (an order whose buyer asks is looked at first). Members are
   carried all the same. A token need not carry the proof (NUT-12) that
   would let the service refuse a made-up one without asking: wallets in
   use leave it out.
 - **A mint is trusted for what it holds, and for the truth.** It can keep
   what the wallet has there, and it decides what was paid: a mint that says
-  it signed when it did not is believed. That is what choosing a mint means.
+  it signed when it did not is believed, and so is one that says an invoice
+  is paid. The invoice is the mint's too: its amount is checked here, and
+  who it pays is not, so a mint could have a buyer pay someone else. That
+  is what choosing a mint means.
+- **What is paid after an invoice has ended is lost.** To the payer, at the
+  mint; the exit does not know of it, having given the order up on the
+  mint's word ten minutes after the end. A Lightning wallet does not pay an
+  invoice that has ended, so this takes a payment that was under way for
+  longer than that.
 - **The wallet library is most of the program.** Some 270 crates, pinned by
   the lockfile and by `cdk`'s exact version, none of them read here beyond
   what the service calls. Nothing in CI looks for advisories against them.

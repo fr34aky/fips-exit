@@ -5,6 +5,9 @@
 //! POST /buy         the same as a form, answered with a page
 //! ```
 //!
+//! (The same two ask for an invoice instead, with `"method": "bolt11"` and
+//! no token: see `invoices`.)
+//!
 //! With a `key`, what is bought is added to the package that key opens;
 //! without, it is a package of its own, with the device that asked in it.
 //!
@@ -73,15 +76,24 @@ const GIVE_UP: Duration = Duration::from_secs(600);
 const AGAIN: Duration = Duration::from_secs(20);
 
 /// What a purchase asks for.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Asked {
     /// The id of a package on offer.
     pub package: String,
+    /// The token that pays for it, when a token does.
+    #[serde(default)]
     pub token: String,
     /// The key of a package to add to.
     #[serde(default)]
     pub key: Option<String>,
+    /// How it is paid: `cashu`, with `token` (and so when nothing is said);
+    /// or `bolt11`, by an invoice that is asked for here.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// For an invoice: the mint to ask for it, of those this exit accepts.
+    #[serde(default)]
+    pub mint: Option<String>,
 }
 
 /// How a purchase is asked, and so how it is answered.
@@ -140,22 +152,41 @@ pub enum Fault {
     Again,
     Bad(String),
     Store(String),
+    /// No invoice is to be had: no mint gives one for that much, or the
+    /// mint that was asked gave none.
+    NoInvoice(String),
+    /// The caller has this many invoices waiting to be paid already.
+    TooMany(usize),
+    /// There is no such order, as far as the caller may know.
+    NoOrder,
+    /// The order is not paid, so there is no package of it to have a key.
+    NotPaid,
+    /// The order made no package of its own to give a key of.
+    NoNewKey,
 }
 
 impl Fault {
     pub fn status(&self) -> StatusCode {
         match self {
-            Fault::NotSold | Fault::MintAway(_) | Fault::ExitDown | Fault::Again => StatusCode::SERVICE_UNAVAILABLE,
+            Fault::NotSold | Fault::MintAway(_) | Fault::ExitDown | Fault::Again | Fault::NoInvoice(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Fault::NoOffer(_) | Fault::Token(_) | Fault::WrongMint(_) | Fault::TooMuch { .. } | Fault::Bad(_) => {
                 StatusCode::BAD_REQUEST
             }
             Fault::TooLittle { .. } => StatusCode::PAYMENT_REQUIRED,
-            Fault::Used | Fault::TakenBack | Fault::Full | Fault::Listed | Fault::NoIpv4 | Fault::Refused(_) => {
-                StatusCode::CONFLICT
-            }
+            Fault::Used
+            | Fault::TakenBack
+            | Fault::Full
+            | Fault::Listed
+            | Fault::NoIpv4
+            | Fault::Refused(_)
+            | Fault::NotPaid
+            | Fault::NoNewKey => StatusCode::CONFLICT,
             Fault::NotYet => StatusCode::ACCEPTED,
             Fault::NoKey => StatusCode::FORBIDDEN,
-            Fault::Busy => StatusCode::TOO_MANY_REQUESTS,
+            Fault::NoOrder => StatusCode::NOT_FOUND,
+            Fault::Busy | Fault::TooMany(_) => StatusCode::TOO_MANY_REQUESTS,
             Fault::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -183,28 +214,46 @@ impl Fault {
             Fault::Again => "try-again",
             Fault::Bad(_) => "bad-request",
             Fault::Store(_) => "store",
+            Fault::NoInvoice(_) => "no-invoice",
+            Fault::TooMany(_) => "too-many",
+            Fault::NoOrder => "no-such-order",
+            Fault::NotPaid => "not-paid",
+            Fault::NoNewKey => "no-key-to-give",
         }
     }
 
     /// And words for a person. Whenever the token was not touched, they say
     /// so.
+    #[cfg(test)]
     pub fn said(&self) -> String {
-        const UNTOUCHED: &str = "The token was not touched.";
-        match self {
-            Fault::NotSold => "Nothing can be bought here right now: no token is taken to a mint.".into(),
-            Fault::NoOffer(id) => format!("No package {id:.40} is offered here. {UNTOUCHED}"),
-            Fault::Token(why) => format!("{why}. {UNTOUCHED}"),
-            Fault::WrongMint(mint) => {
-                format!("The token is of {mint:.200}, which is not a mint this exit accepts. {UNTOUCHED}")
+        self.words(true)
+    }
+
+    /// The same for a purchase that sent a token (`with_token`), or one
+    /// that asked for an invoice and so sent none.
+    pub fn words(&self, with_token: bool) -> String {
+        let untouched = if with_token { "The token was not touched." } else { "" };
+        let said = match self {
+            Fault::NotSold if !with_token => "Nothing can be bought here right now.".into(),
+            Fault::Busy if !with_token => {
+                "Too many invoices are being asked for just now: try again in a minute.".into()
             }
-            Fault::MintAway(mint) => format!("The mint {mint} cannot be reached right now. {UNTOUCHED}"),
+            Fault::Again if !with_token => "No invoice could be had just now: try again in a minute.".into(),
+            Fault::WrongMint(mint) if !with_token => format!("{mint:.200} is not a mint this exit accepts."),
+            Fault::NotSold => "Nothing can be bought here right now: no token is taken to a mint.".into(),
+            Fault::NoOffer(id) => format!("No package {id:.40} is offered here. {untouched}"),
+            Fault::Token(why) => format!("{why}. {untouched}"),
+            Fault::WrongMint(mint) => {
+                format!("The token is of {mint:.200}, which is not a mint this exit accepts. {untouched}")
+            }
+            Fault::MintAway(mint) => format!("The mint {mint} cannot be reached right now. {untouched}"),
             Fault::TooLittle { value, fee, price } => format!(
                 "The token is worth {value} sat, and its mint takes {fee} sat for redeeming it: that is less than \
-                 the price of {price} sat. {UNTOUCHED}"
+                 the price of {price} sat. {untouched}"
             ),
             Fault::TooMuch { net, price } => format!(
                 "The token is worth {net} sat after its mint's fee, and the price is {price} sat: what is over is \
-                 not given back, so one that is worth this much more is not taken. {UNTOUCHED}"
+                 not given back, so one that is worth this much more is not taken. {untouched}"
             ),
             Fault::Used => "That token has been used here already.".into(),
             Fault::NotYet => {
@@ -212,25 +261,39 @@ impl Fault {
                  in a moment: it is not taken twice."
                     .into()
             }
-            Fault::NoKey => format!("No package has that key. {UNTOUCHED}"),
-            Fault::TakenBack => format!("That package was taken back by the operator. {UNTOUCHED}"),
-            Fault::Full => format!("That package cannot hold more. {UNTOUCHED}"),
+            Fault::NoKey => format!("No package has that key. {untouched}"),
+            Fault::TakenBack => format!("That package was taken back by the operator. {untouched}"),
+            Fault::Full => format!("That package cannot hold more. {untouched}"),
             Fault::Listed => {
-                format!("This device is on the exit's own list, and is carried without a package. {UNTOUCHED}")
+                format!("This device is on the exit's own list, and is carried without a package. {untouched}")
             }
             Fault::NoIpv4 => format!(
                 "Another client of this exit has the inner IPv4 address this device would get, so it would be \
-                 carried over IPv6 only: no package is sold to it for now. {UNTOUCHED}"
+                 carried over IPv6 only: no package is sold to it for now. {untouched}"
             ),
-            Fault::ExitDown => format!("The exit is not running. {UNTOUCHED}"),
-            Fault::Busy => format!("Too many tokens are being redeemed just now: try again in a minute. {UNTOUCHED}"),
+            Fault::ExitDown => format!("The exit is not running. {untouched}"),
+            Fault::Busy => format!("Too many tokens are being redeemed just now: try again in a minute. {untouched}"),
             Fault::Refused(why) => format!("The mint did not take the token: {why:.200}. Nothing was bought."),
             Fault::Again => {
-                format!("The token could not be taken to its mint just now: send it again in a minute. {UNTOUCHED}")
+                format!("The token could not be taken to its mint just now: send it again in a minute. {untouched}")
             }
             Fault::Bad(what) => what.clone(),
             Fault::Store(e) => format!("the store: {e}"),
-        }
+            Fault::NoInvoice(why) => format!("{why:.300}"),
+            Fault::TooMany(waiting) => format!(
+                "This device has {waiting} invoices waiting to be paid here: pay one of them, or ask again when one \
+                 has run out."
+            ),
+            Fault::NoOrder => "There is no such order of this device's.".into(),
+            Fault::NotPaid => "That order is not paid: there is no package of it yet.".into(),
+            Fault::NoNewKey => {
+                "No key is given for that order here. What it paid for was added to the package it was asked for; \
+                 or its package was taken back; or it was paid with a token, which has its key again by being sent \
+                 again."
+                    .into()
+            }
+        };
+        said.trim_end().to_string()
     }
 }
 
@@ -267,10 +330,12 @@ pub struct Desk {
     /// Told when an order is left open, so that it is looked at soon.
     pub wake: Notify,
     pub give_up: Duration,
+    /// What is kept of the invoices that wait to be paid.
+    pub invoices: crate::invoices::Waiting,
 }
 
 /// An order being worked on by a request, until this is dropped.
-struct AtWork {
+pub struct AtWork {
     desk: Arc<Desk>,
     order: String,
     buyer: Ipv6Addr,
@@ -295,11 +360,13 @@ impl Desk {
             budget: Mutex::new((BURST, Instant::now())),
             wake: Notify::new(),
             give_up: GIVE_UP,
+            invoices: crate::invoices::Waiting::default(),
         }
     }
 
-    /// One token's worth of the budget, if there is any.
-    fn spend(&self) -> bool {
+    /// One token's worth of the budget, if there is any. An invoice asked
+    /// of a mint is paid for from the same.
+    pub fn spend(&self) -> bool {
         let mut budget = self.budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Instant::now();
         let left = (budget.0 + now.duration_since(budget.1).as_secs_f64() * PER_SECOND).min(BURST);
@@ -309,7 +376,7 @@ impl Desk {
 
     /// Begin work on `order` for `buyer`: one order at a time for an
     /// address.
-    fn enter(self: &Arc<Self>, order: &str, buyer: Ipv6Addr) -> Option<AtWork> {
+    pub fn enter(self: &Arc<Self>, order: &str, buyer: Ipv6Addr) -> Option<AtWork> {
         let mut at_work = self.at_work.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if !at_work.1.insert(buyer) {
             return None;
@@ -343,7 +410,7 @@ impl Desk {
 }
 
 /// The key the purchase names, if it names one: as a key is written.
-fn key_asked(asked: &Asked) -> Result<Option<String>, Fault> {
+pub fn key_asked(asked: &Asked) -> Result<Option<String>, Fault> {
     match asked.key.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
         Some(key) => manage::key_of(key).map(Some).ok_or(Fault::NoKey),
         None => Ok(None),
@@ -370,7 +437,7 @@ fn known(site: &Site, caller: Ipv6Addr, order: &Order) -> Result<Bought, Fault> 
 }
 
 /// Order `id` is paid: `paid` sat arrived.
-fn settle(site: &Site, mint: &Mint, id: &str, paid: u64) -> Result<Bought, Fault> {
+pub fn settle(site: &Site, mint: &Mint, id: &str, paid: u64) -> Result<Bought, Fault> {
     match site.store.order_settle(id, paid, unix_now()) {
         Ok(settled) => {
             eprintln!(
@@ -467,6 +534,19 @@ async fn fits(
     if net > offer.sat + offer.sat / 10 {
         return Err(Fault::TooMuch { net, price: offer.sat });
     }
+    whose(site, desk, caller, offer, key).await
+}
+
+/// Whose package a purchase of `offer` by `caller` is to be: the package
+/// `key` opens, if it can take it, or (None) one of the caller's own, if
+/// the caller can be served.
+pub async fn whose(
+    site: &Site,
+    desk: &Desk,
+    caller: Ipv6Addr,
+    offer: &fips_exit_proto::Package,
+    key: Option<&str>,
+) -> Result<Option<String>, Fault> {
     let target = match key {
         Some(key) => {
             let package = site.store.package_with_key(key)?.ok_or(Fault::NoKey)?;
@@ -718,18 +798,7 @@ async fn decide(site: &Site, desk: &Desk, mint: &Mint, mine: Option<Mine<'_>>) -
             Verdict::Paid(sat) => {
                 let settled = settle(site, mint, &order.id, sat);
                 if settled.is_ok() && order.outputs.is_some() {
-                    // Settled on the mint's word. If the wallet does not
-                    // hold it, it is found again from the seed.
-                    let (holds, sold) = (mint.balance().await.map(|b| b.0), site.store.sold(&mint.name));
-                    if let (Ok(holds), Ok(sold)) = (holds, sold)
-                        && holds < sold
-                    {
-                        let found = mint.count_again().await.unwrap_or_else(|e| format!("not counted again: {e}"));
-                        eprintln!(
-                            "fips-exit-payd: {}: the wallet held {holds} sat of {sold} sat sold: {found}",
-                            mint.name
-                        );
-                    }
+                    found_again(site, mint).await;
                 }
                 settled
             }
@@ -742,6 +811,19 @@ async fn decide(site: &Site, desk: &Desk, mint: &Mint, mine: Option<Mine<'_>>) -
         }
     }
     decided
+}
+
+/// An order was settled on the mint's word, and not because the wallet took
+/// what was paid without a hitch: if the wallet does not hold it, it is
+/// found again from the seed. The caller holds the mint's turn.
+pub async fn found_again(site: &Site, mint: &Mint) {
+    let (holds, sold) = (mint.balance().await.map(|b| b.0), site.store.sold(&mint.name));
+    if let (Ok(holds), Ok(sold)) = (holds, sold)
+        && holds < sold
+    {
+        let found = mint.count_again().await.unwrap_or_else(|e| format!("not counted again: {e}"));
+        eprintln!("fips-exit-payd: {}: the wallet held {holds} sat of {sold} sat sold: {found}", mint.name);
+    }
 }
 
 /// Look at the open orders for as long as the service runs: at its start,
@@ -771,11 +853,11 @@ fn holds_key(site: &Site, asked: &Asked, bought: &Bought) -> Option<String> {
     (opens.id == bought.settled.package.id).then_some(key)
 }
 
-fn json(status: StatusCode, value: &serde_json::Value) -> Response<Full<Bytes>> {
+pub fn json(status: StatusCode, value: &serde_json::Value) -> Response<Full<Bytes>> {
     answer(status, "application/json", serde_json::to_vec(value).unwrap_or_default())
 }
 
-fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
+pub fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
     answer(status, "text/html; charset=utf-8", shell(title, body))
 }
 
@@ -804,6 +886,10 @@ pub async fn respond(
     kind: Kind,
     until: Instant,
 ) -> Response<Full<Bytes>> {
+    // Another way to pay than a token: an invoice is asked for.
+    if asked.method.as_deref().is_some_and(|method| method != crate::store::CASHU) {
+        return crate::invoices::respond(site, caller, asked, kind, until).await;
+    }
     let outcome = buy(site, caller, asked, until).await;
     match (kind, outcome) {
         (Kind::Json, Err(fault)) => refuse(Kind::Json, &fault),
@@ -888,17 +974,31 @@ pub fn asked_form(body: &[u8]) -> Asked {
         package: field("package").unwrap_or_default(),
         token: field("token").unwrap_or_default(),
         key: field("key").filter(|key| !key.is_empty()),
+        method: field("method").filter(|method| !method.is_empty()),
+        mint: field("mint").filter(|mint| !mint.is_empty()),
     }
 }
 
 /// A request that is not a purchase, said as `kind` is answered.
 pub fn refuse(kind: Kind, fault: &Fault) -> Response<Full<Bytes>> {
+    refuse_as(kind, fault, true)
+}
+
+/// The same, for a purchase that sent a token or (`with_token` false) one
+/// that sent none.
+pub fn refuse_as(kind: Kind, fault: &Fault, with_token: bool) -> Response<Full<Bytes>> {
+    let said = fault.words(with_token);
     match kind {
-        Kind::Json => json(fault.status(), &serde_json::json!({ "error": fault.said(), "code": fault.code() })),
+        Kind::Json => json(fault.status(), &serde_json::json!({ "error": said, "code": fault.code() })),
         Kind::Form => page(
             fault.status(),
-            if *fault == Fault::NotYet { "Not known yet" } else { "Not bought" },
-            &format!("<p class=\"note\">{}</p>\n<p><a href=\"/\">Back</a></p>\n", escape(&fault.said())),
+            match fault {
+                Fault::NotYet => "Not known yet",
+                Fault::NoOrder => "No such order",
+                Fault::NotPaid | Fault::NoNewKey => "No key",
+                _ => "Not bought",
+            },
+            &format!("<p class=\"note\">{}</p>\n<p><a href=\"/\">Back</a></p>\n", escape(&said)),
         ),
     }
 }
@@ -922,6 +1022,8 @@ pub mod testing {
         pub site: Arc<Site>,
         /// The mint as the exit names it: by way of `proxy`.
         pub mint: String,
+        /// The mint itself: where a test says what becomes of its invoices.
+        pub direct: String,
         pub proxy: Proxy,
         pub dir: PathBuf,
         /// What the daemon says an address is, when it is not `free v4`.
@@ -964,16 +1066,24 @@ pub mod testing {
     /// 1500 sat, 30 days) for tokens of a mint of its own, which takes
     /// `fee_ppk` for a proof; an open order is given up after `give_up`.
     pub async fn world(fee_ppk: u64, give_up: Duration) -> World {
+        world_with(fee_ppk, give_up, 3600, "").await
+    }
+
+    /// The same, with invoices that end after `invoice_seconds`, and
+    /// `more` packages on offer. An invoice that waits is looked at
+    /// whenever a test says so, and given up as soon as it has ended.
+    pub async fn world_with(fee_ppk: u64, give_up: Duration, invoice_seconds: u64, more: &str) -> World {
         let dir = std::env::temp_dir().join(format!(
             "fips-exit-payd-orders-{}-{}",
             std::process::id(),
             WORLDS.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mint = fips_exit_test_mint::start("127.0.0.1:0".parse().unwrap(), fee_ppk).await.unwrap();
+        let mint =
+            fips_exit_test_mint::start_with("127.0.0.1:0".parse().unwrap(), fee_ppk, invoice_seconds).await.unwrap();
         let proxy = fips_exit_test_mint::proxy(&mint).await.unwrap();
         let config = Config::from_settings(&settings(&format!(
-            "ACCESS=paid\nPRICE_MSAT_PER_GB=2000000\nPACKAGES=\"small:10MB:64:1 big:1GB:1500:30\"\nMINTS={}\n",
+            "ACCESS=paid\nPRICE_MSAT_PER_GB=2000000\nPACKAGES=\"small:10MB:64:1 big:1GB:1500:30{more}\"\nMINTS={}\n",
             proxy.url
         )))
         .unwrap()
@@ -994,9 +1104,10 @@ pub mod testing {
         }
         let mut desk = Desk::new(wallets, control);
         desk.give_up = give_up;
+        (desk.invoices.every, desk.invoices.grace, desk.invoices.pace) = (Duration::ZERO, 0, (0, 0));
         let mut site = Site::new(config, exit, Arc::new(Store::in_memory()), Seats::default(), Arc::default());
         site.desk = Some(Arc::new(desk));
-        World { site: Arc::new(site), mint: proxy.url.clone(), proxy, dir, seats }
+        World { site: Arc::new(site), mint: proxy.url.clone(), direct: mint, proxy, dir, seats }
     }
 
     impl World {
@@ -1015,7 +1126,12 @@ pub mod testing {
         }
 
         pub async fn buy(&self, caller: &str, package: &str, token: &str, key: Option<&str>) -> Result<Bought, Fault> {
-            let asked = Asked { package: package.into(), token: token.into(), key: key.map(str::to_string) };
+            let asked = Asked {
+                package: package.into(),
+                token: token.into(),
+                key: key.map(str::to_string),
+                ..Asked::default()
+            };
             buy(&self.site, caller.parse().unwrap(), &asked, Instant::now() + Duration::from_secs(60)).await
         }
 
@@ -1029,6 +1145,33 @@ pub mod testing {
             let wallets = Wallets::open(&dir, std::slice::from_ref(&self.mint)).await.unwrap();
             wallets.mints[0].reach().await.unwrap();
             wallets
+        }
+
+        /// The same exit with `wallets` in place of its own: as after its
+        /// wallet's file was lost, or with a second service on its seed.
+        pub fn with_wallets(&self, wallets: Wallets) -> Arc<Site> {
+            let mut desk = Desk::new(Arc::new(wallets), self.dir.join("control.sock"));
+            (desk.invoices.every, desk.invoices.grace, desk.invoices.pace) = (Duration::ZERO, 0, (0, 0));
+            let mut site = Site::new(
+                self.site.config.clone(),
+                self.site.exit.clone(),
+                self.site.store.clone(),
+                Seats::default(),
+                Arc::default(),
+            );
+            site.desk = Some(Arc::new(desk));
+            Arc::new(site)
+        }
+
+        /// From now on the mint's invoices are paid when [`World::pay`]
+        /// says so.
+        pub async fn hold(&self) {
+            fips_exit_test_mint::hold(&self.direct).await.unwrap();
+        }
+
+        /// Somebody pays the invoice `request`.
+        pub async fn pay(&self, request: &str) {
+            fips_exit_test_mint::pay(&self.direct, request).await.unwrap();
         }
 
         /// Is `token` still good: can a wallet of somebody's redeem it?
@@ -1066,7 +1209,8 @@ mod tests {
         key: Option<&str>,
         kind: Kind,
     ) -> (StatusCode, String) {
-        let asked = Asked { package: package.into(), token: token.into(), key: key.map(str::to_string) };
+        let asked =
+            Asked { package: package.into(), token: token.into(), key: key.map(str::to_string), ..Asked::default() };
         let response = respond(&w.site, a(caller), &asked, kind, Instant::now() + Duration::from_secs(60)).await;
         (response.status(), body(response).await)
     }
@@ -1074,7 +1218,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_token_buys_a_package() {
         let w = world(0, GIVE_UP).await;
-        assert_eq!(w.site.methods(), vec!["cashu"]);
+        assert_eq!(w.site.methods(), vec!["cashu", "bolt11"], "the tests' mint gives invoices too");
         let token = w.token(64).await;
         let bought = w.buy(BUYER, "small", &format!("  cashu:{token}\n"), None).await.unwrap();
         let (settled, now) = (&bought.settled, unix_now());
@@ -1479,7 +1623,7 @@ mod tests {
         assert_eq!(w.buy(BUYER, "small", &token, None).await, Err(Fault::Busy));
         // And a connection that has no time left for an answer asks for
         // nothing.
-        let asked = Asked { package: "small".into(), token: token.clone(), key: None };
+        let asked = Asked { package: "small".into(), token: token.clone(), ..Asked::default() };
         assert_eq!(buy(&w.site, a(BUYER), &asked, Instant::now()).await, Err(Fault::Again));
         assert!(w.site.store.orders(10).unwrap().is_empty());
         assert!(w.still_good(&token).await);

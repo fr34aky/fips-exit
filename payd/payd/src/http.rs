@@ -28,8 +28,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::config::Config;
+use crate::invoices;
 use crate::orders::{self, Desk, Kind};
-use crate::store::Store;
+use crate::store::{BOLT11, CASHU, Store};
 use crate::sync::{Seats, unix_now};
 use crate::terms::{self, Exit, YourPackage};
 
@@ -89,10 +90,12 @@ impl Site {
         Site { config, exit, hosts: vec![name], origin, store, seats, changed, desk: None }
     }
 
-    /// The ways of paying that work now.
+    /// The ways of paying that work now: a token of a mint that is
+    /// reached, and an invoice where one of those gives any.
     pub fn methods(&self) -> Vec<String> {
         match &self.desk {
-            Some(desk) if desk.wallets.ready() => vec!["cashu".to_string()],
+            Some(desk) if desk.wallets.invoicing() => vec![CASHU.to_string(), BOLT11.to_string()],
+            Some(desk) if desk.wallets.ready() => vec![CASHU.to_string()],
             _ => Vec::new(),
         }
     }
@@ -207,6 +210,30 @@ pub fn route<B>(site: &Site, peer: Ipv6Addr, request: &Request<B>, body: &[u8]) 
         refused.headers_mut().insert(header::ALLOW, HeaderValue::from_static(allow));
         refused
     };
+    // An order, by its name: what became of it, and a key for what it made.
+    let of_an_order = [("/v1/orders/", Kind::Json), ("/order/", Kind::Form)]
+        .into_iter()
+        .find_map(|(under, kind)| Some((path.strip_prefix(under)?, kind)));
+    if let Some((rest, kind)) = of_an_order {
+        return Answer::Now(match (rest.strip_suffix("/key"), kind) {
+            (None, _) if !reading => refused("GET, HEAD"),
+            (None, kind) => invoices::read(site, peer, rest, kind),
+            (Some(_), _) if method != Method::POST => refused("POST"),
+            (Some(_), Kind::Json) if media_type(request) != "application/json" => {
+                plain(StatusCode::UNSUPPORTED_MEDIA_TYPE, "JSON, as application/json")
+            }
+            (Some(_), Kind::Json) if !not_from_elsewhere(site, request) => {
+                plain(StatusCode::FORBIDDEN, "not from another site")
+            }
+            (Some(_), Kind::Form) if media_type(request) != "application/x-www-form-urlencoded" => {
+                plain(StatusCode::UNSUPPORTED_MEDIA_TYPE, "a form")
+            }
+            (Some(_), Kind::Form) if !from_this_page(site, request) => {
+                plain(StatusCode::FORBIDDEN, "only from this exit's page")
+            }
+            (Some(id), kind) => invoices::key(site, peer, id, kind),
+        });
+    }
     // A HEAD is answered as a GET; hyper sends the head of it and not the body.
     Answer::Now(match path {
         "/v1/terms" | "/" | "/style.css" if !reading => refused("GET, HEAD"),
@@ -544,10 +571,31 @@ mod tests {
         );
         assert_eq!(buys(post("/v1/orders", "text/plain", &[]), json), Err(StatusCode::UNSUPPORTED_MEDIA_TYPE));
         for not_it in
-            [&b"[\"1gb\",\"t\"]"[..], b"{}", br#"{"package":"1gb"}"#, br#"{"package":"1gb","token":"t","more":1}"#]
+            [&b"[\"1gb\",\"t\"]"[..], b"{}", br#"{"token":"t"}"#, br#"{"package":"1gb","token":"t","more":1}"#]
         {
             assert_eq!(buys(post("/v1/orders", "application/json", &[]), not_it), Err(StatusCode::BAD_REQUEST));
         }
+        // No token: one is asked for by what answers a purchase, or an
+        // invoice is, when the request says so.
+        let ways = |request: Request<()>, body: &[u8]| match route(&site, peer, &request, body) {
+            Answer::Buy(asked, _) => Ok((asked.token, asked.method, asked.mint)),
+            Answer::Now(response) => Err(response.status()),
+        };
+        assert_eq!(
+            ways(post("/v1/orders", "application/json", &[]), br#"{"package":"1gb"}"#),
+            Ok((String::new(), None, None))
+        );
+        assert_eq!(
+            ways(
+                post("/v1/orders", "application/json", &[]),
+                br#"{"package":"1gb","method":"bolt11","mint":"https://mint.example"}"#
+            ),
+            Ok((String::new(), Some("bolt11".into()), Some("https://mint.example".into())))
+        );
+        assert_eq!(
+            ways(post("/buy", form, &[("origin", ours)]), b"package=1gb&method=bolt11"),
+            Ok((String::new(), Some("bolt11".into()), None))
+        );
         assert_eq!(
             buys(post("/buy", form, &[("origin", ours)]), b"package=1gb&token=cashuB+abc%0D%0Adef&key="),
             Ok(("1gb".into(), "cashuB abc\r\ndef".into(), None, Kind::Form))

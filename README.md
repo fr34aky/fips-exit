@@ -145,7 +145,8 @@ sudo systemctl enable --now fips-exit-advert.timer   # and every hour
 `fips-exit-payd` runs beside the exit, as a user of its own with no
 privilege, and answers at `http://<npub>.fips:5170/`, the exit's npub being
 its name on the mesh. It says what the exit costs, sells packages for Cashu
-tokens of the mints you name, and keeps the packages you give away:
+tokens of the mints you name and for Lightning invoices those mints give,
+and keeps the packages you give away:
 
 ```sh
 ACCESS=paid
@@ -228,9 +229,60 @@ POST /v1/orders  {"package": "1gb", "token": "cashuB…", "key": "…"}    added
   (The wallet library itself asks a mint no more than 20 things at once
   and one every three seconds after that.)
 
+#### A package for a Lightning invoice
+
+Where a mint in `MINTS` gives invoices (it says so of itself: NUT-04, for
+`bolt11` in sat), the page has a second button, "Pay with Lightning", and a
+program asks the same way, without a token:
+
+```text
+POST /v1/orders              {"package": "1gb", "method": "bolt11"}               201: the order, with its invoice
+POST /v1/orders              {"package": "1gb", "method": "bolt11", "key": "…"}   to be added to the package that key opens
+GET  /v1/orders/<order>                                                         what became of it: waiting, paid, expired
+POST /v1/orders/<order>/key  {}                                                 a key for the package it made
+```
+
+- The exit runs no Lightning node. The invoice is the mint's (a quote,
+  NUT-23), for the package's price exactly; it is read here before anyone
+  sees it, and one that is not for that price is not shown. When it is paid
+  the wallet mints ecash for it, so what is paid arrives in the wallet as a
+  token's worth does. The package is granted then, and not before.
+- An order is its buyer's. The device that asked sees it, by its name;
+  nobody else is told that it is there. Its page shows the invoice as text,
+  as a `lightning:` link and as a QR code (drawn by the service: no script,
+  nothing fetched), and looks again by itself every few seconds.
+- The package is there once the payment has arrived, with the device that
+  asked in it, whether or not anyone is looking at the page. Nobody was
+  shown its key. Its buyer asks for one (the last line above, or "Show a
+  key for it" on the order's page), and each key asked for takes the place
+  of the one before, so a key that did not arrive is no loss. With the
+  `key` of a package there already is, the bytes and the days are added to
+  that one instead.
+- **What is paid after an invoice has ended is lost to whoever paid it.**
+  The page says when that is. The mint is asked what became of an invoice,
+  one at a time and at most every three seconds: at once for an order whose
+  buyer is asking, more seldom the older an order is. An order is given up
+  only when the mint, asked ten minutes after the invoice has ended, says
+  it is not paid. One paid while the service was not running is found when
+  it starts again. An order that was given up can be asked about for a day.
+- If the mint minted and its answer did not arrive, the mint says so of the
+  quote, and that is the payment: a quote is minted for the wallet that
+  knows it and holds its key (NUT-20, where the mint has it), and what was
+  minted is found again from the seed. If the wallet's file is lost while
+  an invoice waits, the order is enough to claim what is paid: the quote
+  and its key are kept with it.
+- Not sold to: whoever a token would not buy for either (above). At most 3
+  invoices wait to be paid for one address. An invoice is asked of a mint
+  from the same budget as a token is taken there, 10 in a burst and one
+  more every six seconds for everyone together. Past either the answer is
+  `429`.
+- The mint asked is the first in `MINTS` that is reached and gives an
+  invoice for that price. A program may name another of them
+  (`"mint": "https://…"`).
+
 ```sh
-sudo fips-exit wallet    # what the wallet holds at each mint, and what was sold there
-sudo fips-exit orders    # what was paid, by whom, for which package
+sudo fips-exit wallet    # what the wallet holds at each mint, what was sold there, whether it gives invoices
+sudo fips-exit orders    # what was paid, with a token or by invoice, by whom, for which package
 ```
 
 **The wallet is money on this machine.** What is paid is ecash in a wallet
@@ -440,10 +492,10 @@ an optimisation, not a requirement.
 
 Optional paid public exits (an advert with price and country, prepaid data
 packages, pay-as-you-go) are designed in
-[`docs/paid-exit.md`](docs/paid-exit.md). Its first five phases are here:
+[`docs/paid-exit.md`](docs/paid-exit.md). Its first six phases are here:
 accounts and `ACCESS=paid`, the advert, the payment service, packages and
-their keys, and packages sold for Cashu tokens, all above. To come:
-Lightning invoices, paying out of the wallet and a limit on what it holds,
+their keys, and packages sold for Cashu tokens and for Lightning invoices,
+all above. To come: paying out of the wallet and a limit on what it holds,
 on-chain payments, a command-line client, and pay-as-you-go channels.
 
 ## Test
@@ -474,9 +526,9 @@ node without an account is carried, two members share an account counted to
 the byte and are cut off at the grant, a member reaches the internet and
 neither the uplink's LAN nor port 25, the payment service tells a node that
 is no client what the exit costs and who it is, a node that is nobody's buys
-a package with a token of a mint that runs in the test and is carried, and
-leaving the mode removes what it made, the opening for the payment service
-with it.
+a package with a token of a mint that runs in the test and is carried,
+another pays an invoice of that mint for one, and leaving the mode removes
+what it made, the opening for the payment service with it.
 
 The third is `payd/`, a workspace with a lockfile of its own, so that the
 daemon keeps its one dependency. `payd/proto` is a crate with no
@@ -487,10 +539,11 @@ and what a number of bytes costs at a price. It is checked against
 the same. `payd/payd` is the payment service: its config, its terms and
 page, its HTTP server's limits over a real socket, its packages, and what
 is paid. `payd/test-mint` is a Cashu mint for the tests, in memory, with a
-Lightning backend that pays its own invoices, and a way to it on which a
-request or an answer can be lost: the payments are tested against it, a
-token spent twice, one spent elsewhere, an answer that never arrived and a
-service that died between a payment and its package among them. It is not
+Lightning backend that pays its own invoices (at once, or when a test says
+so), and a way to it on which a request or an answer can be lost: the
+payments are tested against it, a token spent twice, one spent elsewhere,
+an invoice paid late or never, an answer that never arrived and a service
+that died between a payment and its package among them. It is not
 installed, and nothing it gives out is worth anything.
 
 The fourth is the script's side of the advert: the signature against the

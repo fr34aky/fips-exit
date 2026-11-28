@@ -273,7 +273,7 @@ pub fn page(site: &Site, package: &Package, key: &str, caller: Ipv6Addr, notice:
     let add = if site.methods().is_empty() || v.standing == "revoked" {
         String::new()
     } else {
-        crate::terms::buy_form(&site.config.packages, Some(key))
+        crate::terms::buy_form(&site.config.packages, Some(key), &site.methods())
     };
     let key = escape(key);
     let mut rows = String::new();

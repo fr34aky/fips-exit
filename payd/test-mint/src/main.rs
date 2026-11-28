@@ -3,6 +3,8 @@
 //! ```text
 //! fips-exit-test-mint serve <[address]:port> [fee-ppk]   prints its URL, serves until killed
 //! fips-exit-test-mint token <mint URL> <sat> [with-fee]  prints a token from that mint
+//! fips-exit-test-mint hold <mint URL>                    its invoices are paid by `pay` from now on
+//! fips-exit-test-mint pay <mint URL> <invoice>           that invoice of the mint's is paid
 //! ```
 
 fn main() {
@@ -24,8 +26,13 @@ fn main() {
                 println!("{token}");
                 Ok(())
             }
-            _ => Err("usage: fips-exit-test-mint serve <[address]:port> [fee-ppk] | token <mint URL> <sat> [with-fee]"
-                .to_string()),
+            ["hold", mint] => fips_exit_test_mint::hold(mint).await,
+            ["pay", mint, invoice] => fips_exit_test_mint::pay(mint, invoice).await,
+            _ => {
+                Err("usage: fips-exit-test-mint serve <[address]:port> [fee-ppk] | token <mint URL> <sat> [with-fee] \
+                      | hold <mint URL> | pay <mint URL> <invoice>"
+                    .to_string())
+            }
         }
     });
     if let Err(e) = done {

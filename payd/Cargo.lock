@@ -1015,6 +1015,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "qrcode",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1033,12 +1034,15 @@ dependencies = [
 name = "fips-exit-test-mint"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "cdk",
  "cdk-axum",
  "cdk-fake-wallet",
  "cdk-sqlite",
+ "futures",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -1133,10 +1137,13 @@ version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
+ "futures-channel",
  "futures-core",
+ "futures-io",
  "futures-macro",
  "futures-sink",
  "futures-task",
+ "memchr",
  "pin-project-lite",
  "slab",
 ]
@@ -2245,6 +2252,12 @@ checksum = "84bbb29c624230c4bd1047bbdb2aa47e41c860e9665ce62ba9504eebe91bf867"
 dependencies = [
  "pulldown-cmark",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quote"

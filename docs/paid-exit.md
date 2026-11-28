@@ -325,7 +325,9 @@ unit and listens on the exit's mesh address only.
 - `POST /v1/orders` and `GET /v1/orders/{id}`: buy a package. The answer is a
   Lightning invoice, an on-chain address, or a request for a token.
 - The members of a package: added and removed by whoever holds the package's
-  key, which the buyer receives with the order.
+  key, which the buyer receives with the order: in the answer to a token,
+  and for an invoice by asking for it once that is paid
+  (`POST /v1/orders/{id}/key`).
 - Later, `POST /v1/channel`: open a channel, send an update, close it.
 
 The same service renders the shop page: plain HTML made on the server, no
@@ -352,8 +354,10 @@ All of it arrives as ecash in the exit's own wallet, at a mint the operator
 chose.
 
 - **Lightning.** The service asks the mint for a quote (NUT-23) and shows the
-  invoice. When the mint says it is paid, the service mints the ecash and
-  only then grants the bytes.
+  invoice, once it has read it and found it to be for the price exactly.
+  When the mint says it is paid, the service mints the ecash and only then
+  grants the bytes. What is paid after the invoice has ended is lost to
+  the payer, so the page shows the end where it cannot be missed.
 - **On-chain.** The same with an on-chain quote (NUT-30), offered only when
   the mint offers it. Deposits are credited as the mint confirms them. A
   deposit that arrives after the quote has expired is lost to the buyer, so
@@ -405,6 +409,21 @@ is let to finish anything, and a mint is accepted only if it offers NUT-07
 and NUT-09. An order that is neither signed nor spent is asked about for
 ten minutes, and for as long after that as the wallet may still be asking
 the mint itself, and then forgotten.
+
+For an invoice there are two grounds as well. Either the mint said the
+invoice is paid and the wallet then minted for its quote without a hitch;
+or the mint says the quote is minted, which it does only for the wallet
+that knows the quote and holds the key it is locked to (NUT-20), so what
+was minted is this wallet's and is found again from the seed. An order is
+written down before its invoice is shown to anyone, with the quote and its
+key, so that the order alone is enough to claim what is paid whatever
+becomes of the wallet's file. It is given up only when the mint, asked ten
+minutes after the invoice has ended, says it is not paid; until then it
+waits, across restarts and while its mint is away. The mint is asked about
+one invoice at a time, at most every three seconds: first about one whose
+buyer is asking, and more seldom about one the older it is. The package an
+invoice buys has a key nobody was shown: its buyer, from the address that
+ordered, asks for one, and each key asked for replaces the one before.
 
 The wallet's seed is 24 words (BIP-39) in a file of the service's own. What
 the wallet asks a mint to sign follows from the seed and a counter in the
@@ -526,7 +545,7 @@ and `SECURITY-REVIEW.md`.
 | 3 | **Done.** The payment service's frame: configuration, terms, the page, the unit, a CI job. The schema waits for phase 4, which is the first to keep anything. |
 | 4 | **Done.** Accounts without money: the service on the socket, a grant by hand, members, usage, pushing again after a restart, and a package's members managed with its key over the mesh. |
 | 5 | **Done.** The wallet, and payment by token: a package of its own or added to one by its key, once for a token, and granted only when its price has arrived. Nothing pays out yet: until phase 7 the way to what was paid is the seed. |
-| 6 | Lightning. |
+| 6 | **Done.** Lightning: an invoice of the mint's for a package's price, in an order that is its buyer's alone; granted when the wallet has minted for it, and given up only on the mint's word after the invoice's end. |
 | 7 | Paying out and sweeping. Before on-chain: a wallet with no way out is the larger risk. |
 | 8 | On-chain. |
 | 9 | A command-line client for Linux nodes. |

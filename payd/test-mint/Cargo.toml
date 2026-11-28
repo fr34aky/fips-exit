@@ -13,3 +13,6 @@ cdk-fake-wallet = { version = "=0.18.3" }
 cdk-axum = { version = "=0.18.3", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-util"] }
 axum = "0.8"
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tokio-stream = { version = "0.1", default-features = false }

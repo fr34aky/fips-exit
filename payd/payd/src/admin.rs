@@ -139,10 +139,16 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
                 let orders = store.orders(MAX_ORDERS).map_err(store_said)?;
                 let mut out = String::new();
                 for o in &orders {
+                    // Paid; or open, with a token or an invoice; or an
+                    // invoice that ended unpaid.
+                    let state = match o {
+                        o if o.paid => "paid",
+                        o if o.ended > 0 => "ended",
+                        _ => "open",
+                    };
                     out.push_str(&format!(
-                        "order {} {} {} {} {} {} {} {} {} {}\n",
+                        "order {} {state} {} {} {} {} {} {} {} {} {}\n",
                         o.id,
-                        if o.paid { "paid" } else { "open" },
                         o.created,
                         store.name_of(o.buyer),
                         o.offer,
@@ -150,7 +156,8 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
                         o.paid_sat,
                         o.fee_sat,
                         o.package.as_deref().unwrap_or("-"),
-                        o.mint
+                        o.mint,
+                        o.method
                     ));
                 }
                 out.push_str(&format!("ok {}\n", orders.len()));
@@ -202,7 +209,9 @@ async fn of_the_site(site: &Site, line: &str) -> Option<String> {
                     Err(e) => return Some(format!("err {e}\n")),
                 };
                 let state = if mint.ready() { "reached" } else { "away" };
-                out.push_str(&format!("mint {} {state} {holds} {pending} {sold}\n", mint.name));
+                // Whether it gives invoices, as it said when last reached.
+                let invoices = if mint.gives_invoices(None) { "invoices" } else { "tokens" };
+                out.push_str(&format!("mint {} {state} {holds} {pending} {sold} {invoices}\n", mint.name));
             }
             out.push_str(&format!("ok {}\n", mints.len()));
             Some(out)
@@ -210,7 +219,13 @@ async fn of_the_site(site: &Site, line: &str) -> Option<String> {
         // What the advert says of this exit's terms: what is configured,
         // whether or not its mints answer at this moment.
         ["terms"] => {
-            let methods: &[&str] = if site.desk.is_some() { &["cashu"] } else { &[] };
+            let invoices =
+                site.desk.as_ref().is_some_and(|desk| desk.wallets.mints.iter().any(|m| m.gives_invoices(None)));
+            let methods: &[&str] = match (&site.desk, invoices) {
+                (Some(_), true) => &["cashu", "bolt11"],
+                (Some(_), false) => &["cashu"],
+                (None, _) => &[],
+            };
             let packages: Vec<serde_json::Value> = site
                 .config
                 .packages
@@ -309,12 +324,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_operator_sees_what_was_paid() {
         let w = crate::orders::testing::world(0, Duration::from_secs(600)).await;
-        assert_eq!(of_the_site(&w.site, "wallet").await.unwrap(), format!("mint {} reached 0 0 0\nok 1\n", w.mint));
+        assert_eq!(
+            of_the_site(&w.site, "wallet").await.unwrap(),
+            format!("mint {} reached 0 0 0 invoices\nok 1\n", w.mint)
+        );
         assert_eq!(answer(&w.site.store, "orders", NOW), "ok 0\n");
         let bought = w.buy("fd77::7", "small", &w.token(64).await, None).await.unwrap();
-        assert_eq!(of_the_site(&w.site, "wallet").await.unwrap(), format!("mint {} reached 64 0 64\nok 1\n", w.mint));
+        assert_eq!(
+            of_the_site(&w.site, "wallet").await.unwrap(),
+            format!("mint {} reached 64 0 64 invoices\nok 1\n", w.mint)
+        );
         let orders = answer(&w.site.store, "orders", NOW);
-        let [order, id, state, _created, buyer, offer, sat, paid, fee, package, mint, ok, n] =
+        let [order, id, state, _created, buyer, offer, sat, paid, fee, package, mint, method, ok, n] =
             orders.split_whitespace().collect::<Vec<_>>()[..]
         else {
             panic!("{orders}")
@@ -324,7 +345,7 @@ mod tests {
             (sat, paid, fee, package, mint),
             ("64", "64", "0", bought.settled.package.id.as_str(), w.mint.as_str())
         );
-        assert_eq!((ok, n), ("ok", "1"));
+        assert_eq!((method, ok, n), ("cashu", "ok", "1"));
         // The package it made is among the packages, said to be bought.
         assert!(answer(&w.site.store, "packages", NOW).contains(" fd77::7 bought: small\n"));
         let terms = of_the_site(&w.site, "terms").await.unwrap();
@@ -333,7 +354,7 @@ mod tests {
         assert_eq!(
             said,
             serde_json::json!({
-                "price_msat_per_gb": 2000000, "methods": ["cashu"], "port": 5170, "mints": [w.mint],
+                "price_msat_per_gb": 2000000, "methods": ["cashu", "bolt11"], "port": 5170, "mints": [w.mint],
                 "packages": [{"id": "small", "bytes": 10000000, "sat": 64, "days": 1},
                              {"id": "big", "bytes": 1000000000, "sat": 1500, "days": 30}],
             })

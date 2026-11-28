@@ -111,7 +111,12 @@ IPv4 address derived from the client's fips address.
    `/run/fips-exit-payd`, which only the service's user and root can open.
    Lines of words, each checked: a size, a number of days up to 3660,
    npubs or fips addresses, a label of one printable line. Not hostile, but
-   a package made there carries whoever is in it.
+   a package made there carries whoever is in it. The same socket takes
+   what leaves the wallet: a number of sat for a token, an invoice to pay
+   (one word, read by the wallet library and quoted by the mint before
+   anything is paid), a token's name to take back, a mint's name. Whoever
+   can write there can empty the wallet, which is why nobody but root and
+   the service can; a token's text is printed to root's terminal.
 10. **A token, from anyone on the mesh.** Text of up to 24 KiB, read by the
     wallet library (base64, then CBOR or JSON) before anything else is known
     of it. Of it the service takes, without asking a mint: which mint it
@@ -308,8 +313,22 @@ IPv4 address derived from the client's fips address.
   where it would be taken for the one that is gone. The same for the
   tokens: one is not written to the log.
 - **The service asking anyone but its mints.** It has the internet now, to
-  reach the mints in `MINTS` and nothing else. Anything that makes it open a
-  connection to an address from a request, a token or a page is serious.
+  reach the mints in `MINTS`, and the host of the Lightning address in
+  `SWEEP_TO` when the wallet is sent on; both come from root's config.
+  Anything that makes it open a connection to an address from a request, a
+  token or a page is serious.
+- **Anything leaving the wallet that the operator did not say.** Nothing
+  reached from the mesh takes anything out of it. What leaves does so by a
+  command on the operator's socket, or to `SWEEP_TO` above `SWEEP_ABOVE`.
+  Serious: a way from an HTTP request to a withdrawal; the wallet sent on
+  to anything but the address in the config, or for a fee the operator did
+  not agree to (a mint that asks more than a twentieth and 20 sat is not
+  paid by itself); an invoice paid twice; a token's text written anywhere
+  but to the operator (it is kept in the wallet's file while it is out,
+  and not in the log); and a withdrawal that happened and is not written
+  down, or is written down as failed when the money left (each is written
+  before the mint is asked, and one whose end is not known counts as
+  gone).
 - **A page on another site changing a package.** Through a browser on the
   mesh it could reach the exit; it must not be able to send a form the
   service takes (`Origin`), nor JSON (which a browser sends elsewhere only
@@ -359,11 +378,22 @@ IPv4 address derived from the client's fips address.
   file. Only the service's user and root can write its state directory,
   and either already holds everything in it. 0.31 because the Cashu wallet
   library pins it, and there can be one SQLite in a build.
-- **Nothing pays out, and nothing limits what the wallet holds.** A wallet
-  on a server is protected by holding little; this one only grows, until
-  paying out and a limit are written (the next phases). Whoever takes the
-  service over, or reads its state directory, has all that was paid since
-  the operator last emptied it by hand, with the seed.
+- **What the wallet holds is there to be taken by whoever takes the
+  service.** A wallet on a server is protected by holding little: there is
+  a limit (`WALLET_CAP`, half a million sat unless the config says
+  otherwise) and a way to send it on by itself (`SWEEP_TO`), and whoever
+  takes the service over, or reads its state directory, has what is held
+  at that moment, with the seed. The limit is not exact: invoices given
+  before it was reached are honoured after.
+- **Sending on to a Lightning address trusts that address's host**, as
+  paying one always does: it gives the invoice. The wallet library checks
+  the invoice against the amount asked and the address's own description,
+  and not who is paid by it. That step is the one part of paying out that
+  the tests here do not reach: the library takes only a public host over
+  HTTPS, so the tests send the wallet on to invoices of their own making.
+- **A token that was handed out and lost** can be taken back only while
+  nobody has redeemed it, and its text is in the wallet's file until then:
+  whoever reads that file has it, as they have the seed.
 - **Two wallets on one seed.** A copy of the seed in a second service, or
   in another wallet while this one runs, makes each ask the mint for what
   it signed for the other. That is found out (the mint refuses, selling

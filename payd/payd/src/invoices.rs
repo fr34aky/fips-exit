@@ -132,16 +132,20 @@ fn mint_for<'a>(desk: &'a Desk, named: Option<&str>, sat: u64) -> Result<&'a Arc
         if !mint.ready() {
             return Err(Fault::MintAway(mint.name.clone()));
         }
+        if mint.full() {
+            return Err(Fault::WalletFull);
+        }
         if !mint.gives_invoices(Some(sat)) {
             return Err(Fault::NoInvoice(format!("The mint {} gives no invoice for {sat} sat.", mint.name)));
         }
         return Ok(mint);
     }
-    if let Some(mint) = mints.iter().find(|mint| mint.ready() && mint.gives_invoices(Some(sat))) {
+    if let Some(mint) = mints.iter().find(|mint| mint.sells() && mint.gives_invoices(Some(sat))) {
         return Ok(mint);
     }
     match mints.first() {
-        Some(away) if !desk.wallets.ready() => Err(Fault::MintAway(away.name.clone())),
+        Some(away) if !mints.iter().any(|mint| mint.ready()) => Err(Fault::MintAway(away.name.clone())),
+        Some(_) if !desk.wallets.ready() => Err(Fault::WalletFull),
         _ => Err(Fault::NoInvoice(format!("No mint this exit accepts gives an invoice for {sat} sat."))),
     }
 }
@@ -820,7 +824,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_invoice_that_is_not_paid_ends() {
-        let w = world_with(0, GIVE_UP, 2, "").await;
+        let w = world_with(0, GIVE_UP, 2, "", "").await;
         w.hold().await;
         let ordered = ask(&w.site, BUYER, "small", None).await.unwrap();
         let mut looks = Looks::default();
@@ -1069,7 +1073,7 @@ mod tests {
     /// next.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_invoice_that_ends_too_soon_is_not_given() {
-        let w = world_with(0, GIVE_UP, 30, "").await;
+        let w = world_with(0, GIVE_UP, 30, "", "").await;
         w.hold().await;
         let strict = w.with_invoice_life(LIFE);
         let Err(Fault::NoInvoice(why)) = ask(&strict, BUYER, "small", None).await else { panic!("an invoice") };
@@ -1084,7 +1088,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn who_is_not_given_an_invoice() {
-        let w = world_with(0, GIVE_UP, 3600, " huge:10GB:2000000:90").await;
+        let w = world_with(0, GIVE_UP, 3600, " huge:10GB:2000000:90", "").await;
         w.hold().await;
         assert_eq!(ask(&w.site, BUYER, "none", None).await, Err(Fault::NoOffer("none".into())));
         // The mint gives none for that much, and says so of itself.

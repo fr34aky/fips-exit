@@ -17,10 +17,12 @@ import json
 import os
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _loader = importlib.machinery.SourceFileLoader("fips_exit", os.path.join(HERE, "..", "fips-exit"))
@@ -543,8 +545,8 @@ class Command(unittest.TestCase):
 
     def test_the_wallet_and_the_orders_are_shown_as_the_service_says_them(self):
         self.service({
-            "wallet": "mint https://mint.example.org reached 1564 0 1564 invoices\n"
-                      "mint https://b.example away 0 64 0 tokens\nok 2\n",
+            "wallet": "mint https://mint.example.org reached 1564 0 2064 invoices 500 room\n"
+                      "mint https://b.example away 0 64 0 tokens 0 full\nok 2 500000 me@example.org 20000\n",
             "orders": "order o0123456789abcdef paid 1800000000 fd77::7 1gb 1500 1500 1 p0123456789abcdef "
                       "https://mint.example.org cashu\norder o1123456789abcdef open 1800000060 npub1abc small 64 0 0 - "
                       "https://mint.example.org bolt11\norder o2123456789abcdef ended 1800000120 npub1abc small 64 0 0 - "
@@ -552,9 +554,14 @@ class Command(unittest.TestCase):
         status, out = self.run_command(x.cmd_wallet)
         self.assertEqual(status, 0)
         rows = out.splitlines()
-        self.assertEqual(rows[1].split(),
-                         ["1564", "sat", "0", "sat", "1564", "sat", "reached", "yes", "https://mint.example.org"])
-        self.assertEqual(rows[2].split(), ["0", "sat", "64", "sat", "0", "sat", "away", "no", "https://b.example"])
+        self.assertEqual(rows[1].split(), ["1564", "sat", "0", "sat", "2064", "sat", "500", "sat", "reached", "yes",
+                                           "https://mint.example.org"])
+        self.assertEqual(rows[2].split()[:11],
+                         ["0", "sat", "64", "sat", "0", "sat", "0", "sat", "away", "no", "https://b.example"])
+        self.assertIn("FULL: nothing is sold here", rows[2])
+        self.assertNotIn("FULL", rows[1])
+        self.assertIn("It may hold 500000 sat at a mint", out)
+        self.assertIn("Above 20000 sat at a mint it is sent on to me@example.org", out)
         self.assertIn("its seed", out)
         status, out = self.run_command(x.cmd_orders)
         self.assertEqual(status, 0)
@@ -567,7 +574,7 @@ class Command(unittest.TestCase):
         self.assertEqual(rows[3].split()[:3], ["o2123456789abcdef", "ended", "invoice"])
 
     def test_what_is_not_a_mint_or_an_order_is_said_and_does_nothing_to_the_terminal(self):
-        self.service({"wallet": "mint https://m.example reached lots 0 0 invoices\nok 1\n",
+        self.service({"wallet": "mint https://m.example reached lots 0 0 invoices 0 room\nok 1 0 - 20000\n",
                       "orders": "order o1 paid when\x1b[2J fd77::7 1gb 1 1 0 p1 https://m.example cashu\nok 1\n"})
         for command in (x.cmd_wallet, x.cmd_orders):
             err = io.StringIO()
@@ -575,6 +582,65 @@ class Command(unittest.TestCase):
                 status, _ = self.run_command(command)
             self.assertNotEqual(status, 0)
             self.assertNotIn("\x1b", str(status) + err.getvalue())
+
+    def run_wallet(self, *args, stdin=""):
+        """`fips-exit wallet …`: its status, what it printed, and what it said beside."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                unittest.mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+            try:
+                x.cmd_wallet(*args)
+                status = 0
+            except SystemExit as stopped:
+                status = stopped.code
+        return status, out.getvalue(), err.getvalue()
+
+    def test_what_leaves_the_wallet_is_asked_for_and_said(self):
+        invoice = "lnbc5u1p0example"
+        self.service({
+            "wallet": "ok 0 0 - 20000\n",
+            "token 1000": "token w0123456789abcdef 1003 cashuBtokentext\nok\n",
+            "token 5 https://b.example": "err the wallet holds 0 sat at https://b.example\n",
+            "tokens": "token 01a2-name https://mint.example.org cashuBtokentext\nok 1\n",
+            "take-back 01a2-name": "back 1000\nok\n",
+            f"quote {invoice}": "quote q-1 500 10 1800000000 https://mint.example.org\nok\n",
+            "pay q-1 https://mint.example.org": "paid w1123456789abcdef 500 1 -\nok\n",
+            "sweep": "pending w2123456789abcdef\nnothing https://b.example\nok\n",
+            "withdrawals": "withdrawal w1123456789abcdef done 1800000000 invoice 500 501 https://mint.example.org "
+                           + invoice + "x" * 60 + "\nwithdrawal w0123456789abcdef back 1800000000 token 1000 0 "
+                           "https://mint.example.org -\nok 2\n"})
+        # A token: its text alone is what is printed, so that it can be piped.
+        status, out, err = self.run_wallet("token", "1000")
+        self.assertEqual((status, out), (0, "cashuBtokentext\n"))
+        self.assertIn("took 1003 sat out of the wallet", err)
+        status, _, _ = self.run_wallet("token", "5", "https://b.example")
+        self.assertIn("the wallet holds 0 sat", str(status))
+        for not_sat in ("0", "-5", "5.5", "many", "٥"):
+            self.assertIn("a number of sat", str(self.run_wallet("token", not_sat)[0]))
+        self.assertIn("01a2-name  of https://mint.example.org\n  cashuBtokentext", self.run_wallet("tokens")[1])
+        self.assertIn("1000 sat are the wallet's again", self.run_wallet("take-back", "01a2-name")[1])
+        # An invoice is paid when the operator says so, and not when asked through a pipe.
+        status, out, _ = self.run_wallet("pay", invoice, "--yes")
+        self.assertEqual(status, 0)
+        self.assertIn("This pays 500 sat out of the wallet at https://mint.example.org", out)
+        self.assertIn("up to 10 sat", out)
+        self.assertIn("paid: 500 sat, for a fee of 1 sat", out)
+        status, out, _ = self.run_wallet("pay", "lightning:" + invoice)
+        self.assertIn("--yes", str(status))
+        self.assertNotIn("paid:", out)
+        self.assertIn("not an invoice", str(self.run_wallet("pay", "lnbc1 pay q-2", "--yes")[0]))
+        out = self.run_wallet("sweep")[1]
+        self.assertIn("under way", out)
+        self.assertIn("nothing to send on at https://b.example", out)
+        rows = self.run_wallet("out")[1].splitlines()
+        self.assertEqual(rows[1].split()[:8], ["w1123456789abcdef", "done", rows[1].split()[2], rows[1].split()[3],
+                                               "invoice", "500", "sat", "501"])
+        self.assertIn("…", rows[1])
+        self.assertLess(len(rows[1]), 160)
+        self.assertEqual(rows[2].split()[:2], ["w0123456789abcdef", "back"])
+        # A word that is no command of the wallet's is the usage, not a line to the service.
+        with self.assertRaises(TypeError):
+            x.cmd_wallet("empty")
 
     def test_no_service_is_said(self):
         err = io.StringIO()

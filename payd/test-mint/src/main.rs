@@ -6,6 +6,7 @@
 //! fips-exit-test-mint hold <mint URL>                    its invoices are paid by `pay` from now on
 //! fips-exit-test-mint pay <mint URL> <invoice>           that invoice of the mint's is paid
 //! fips-exit-test-mint last <mint URL>                    prints the invoice the mint gave last
+//! fips-exit-test-mint invoice <sat> [fails|hangs]        prints an invoice for a mint of these tests to pay
 //! ```
 
 fn main() {
@@ -29,13 +30,25 @@ fn main() {
             }
             ["hold", mint] => fips_exit_test_mint::hold(mint).await,
             ["pay", mint, invoice] => fips_exit_test_mint::pay(mint, invoice).await,
+            ["invoice", sat, ref fate @ ..] => {
+                let sat = sat.parse().map_err(|_| format!("{sat}: sat"))?;
+                let fate = match fate {
+                    [] | ["paid"] => fips_exit_test_mint::Fate::Paid,
+                    ["fails"] => fips_exit_test_mint::Fate::Fails,
+                    ["hangs"] => fips_exit_test_mint::Fate::Hangs,
+                    _ => return Err("an invoice that is paid, that fails, or that hangs".to_string()),
+                };
+                println!("{}", fips_exit_test_mint::invoice(sat, fate));
+                Ok(())
+            }
             ["last", mint] => {
                 println!("{}", fips_exit_test_mint::last(mint).await?);
                 Ok(())
             }
             _ => {
                 Err("usage: fips-exit-test-mint serve <[address]:port> [fee-ppk] | token <mint URL> <sat> [with-fee] \
-                      | hold <mint URL> | pay <mint URL> <invoice> | last <mint URL>"
+                      | hold <mint URL> | pay <mint URL> <invoice> | last <mint URL> \
+                      | invoice <sat> [fails|hangs]"
                     .to_string())
             }
         }

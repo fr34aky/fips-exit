@@ -242,6 +242,7 @@ pub struct NewWithdrawal<'a> {
 /// The ways an order is paid, as they are kept.
 pub const CASHU: &str = "cashu";
 pub const BOLT11: &str = "bolt11";
+pub const ONCHAIN: &str = "onchain";
 
 /// What is ordered by invoice: `bytes` for `days`, offered as `offer` for
 /// `sat`, by `buyer`; `mint` gave `request` for it under `quote`, which is
@@ -249,6 +250,9 @@ pub const BOLT11: &str = "bolt11";
 /// or a package of its own.
 #[derive(Debug, Clone)]
 pub struct NewInvoice<'a> {
+    /// [`BOLT11`], an invoice; or [`ONCHAIN`], an address, to which any
+    /// amount may come, more than once.
+    pub method: &'a str,
     pub buyer: Ipv6Addr,
     pub mint: &'a str,
     pub offer: &'a str,
@@ -285,6 +289,20 @@ pub struct NewOrder<'a> {
 pub enum Begun {
     New(String),
     Known(Box<Order>),
+}
+
+/// What came to an address was credited: to which package, how much of
+/// what was offered as `offer`, and whether it was the first to arrive.
+#[derive(Debug, PartialEq)]
+pub struct Credited {
+    pub package: Package,
+    pub offer: String,
+    pub first: bool,
+    /// What arrived this time, in sat, and the bytes it bought.
+    pub sat: u64,
+    pub bytes: u64,
+    /// What has arrived in all.
+    pub arrived: u64,
 }
 
 /// An order settled: the package it became or was added to, and that
@@ -445,6 +463,13 @@ impl Store {
         Ok(Store { db: Mutex::new(db) })
     }
 
+    /// For a test: change the store as no request does (an order made
+    /// earlier than it was, or at another price).
+    #[cfg(test)]
+    pub fn change(&self, sql: &str) {
+        self.db().execute(sql, []).unwrap();
+    }
+
     fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -542,16 +567,18 @@ impl Store {
     ) -> Result<(String, String), Refused> {
         let mut db = self.db();
         let tx = db.transaction()?;
-        let made = Store::grant_in(&tx, bytes, days, members, label, now, None)?;
+        let until = if days == 0 { 0 } else { now + u64::from(days) * 86_400 };
+        let made = Store::grant_in(&tx, bytes, until, members, label, now, None)?;
         tx.commit()?;
         Ok(made)
     }
 
-    /// The same, within a transaction; `mover` as [`Store::seat`] takes it.
+    /// The same, within a transaction, until `until` (0 for no end);
+    /// `mover` as [`Store::seat`] takes it.
     fn grant_in(
         db: &Connection,
         bytes: u64,
-        days: u32,
+        until: u64,
         members: &[Ipv6Addr],
         label: &str,
         now: u64,
@@ -562,7 +589,6 @@ impl Store {
         }
         let id = format!("p{}", hex(&random(8).map_err(|e| Refused::Store(e.to_string()))?));
         let key = hex(&random(32).map_err(|e| Refused::Store(e.to_string()))?);
-        let until = if days == 0 { 0 } else { now + u64::from(days) * 86_400 };
         db.execute(
             "INSERT INTO packages (id, key_hash, label, granted, until, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, key_hash(&key), label, as_i64(bytes), as_i64(until), as_i64(now)],
@@ -809,14 +835,14 @@ impl Store {
     /// this exit does not know of. An order is a quote of a mint's, once.
     pub fn invoice_begin(&self, id: &str, new: &NewInvoice<'_>, now: u64) -> Result<(), Refused> {
         let mut receipt = Sha256::new();
-        for part in [BOLT11, new.mint, new.quote] {
+        for part in [new.method, new.mint, new.quote] {
             receipt.update(part.as_bytes());
             receipt.update([0]);
         }
         self.db().execute(
             "INSERT INTO orders (id, created, buyer, mint, offer, bytes, sat, days, target, receipt, value, inputs,
                                  method, quote, quote_key, request, expires)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?7, '', 'bolt11', ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?7, '', ?15, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 as_i64(now),
@@ -831,72 +857,88 @@ impl Store {
                 new.quote,
                 new.quote_key,
                 new.request,
-                as_i64(new.expires)
+                as_i64(new.expires),
+                new.method
             ],
         )?;
         Ok(())
     }
 
-    /// The invoices that are neither paid nor given up, oldest first.
+    /// The orders a mint is still asked about, oldest first: an invoice
+    /// that is neither paid nor given up; and an address until its order
+    /// has ended, paid or not, since more may come to it.
     pub fn invoices_open(&self) -> Result<Vec<Order>, Refused> {
         Ok(Store::orders_where(
             &self.db(),
-            "WHERE paid = 0 AND ended = 0 AND method = 'bolt11' ORDER BY created, id",
+            "WHERE ended = 0 AND ((method = 'bolt11' AND paid = 0) OR method = 'onchain') ORDER BY created, id",
             &[],
         )?)
     }
 
-    /// How many invoices wait to be paid that can still be: of `buyer`, and
-    /// in all.
-    pub fn invoices_waiting(&self, buyer: Ipv6Addr, now: u64) -> Result<(usize, usize), Refused> {
+    /// How many orders paid by `method` (invoices, or addresses) wait to be
+    /// paid that can still be, and that nothing was paid for: of `buyer`,
+    /// and in all.
+    pub fn invoices_waiting(&self, buyer: Ipv6Addr, method: &str, now: u64) -> Result<(usize, usize), Refused> {
         let db = self.db();
         let count = |more: &str, values: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<usize> {
             let sql = format!(
-                "SELECT COUNT(*) FROM orders WHERE paid = 0 AND ended = 0 AND method = 'bolt11' AND expires > ?1 {more}"
+                "SELECT COUNT(*) FROM orders WHERE paid = 0 AND ended = 0 AND method = ?2 AND expires > ?1 {more}"
             );
             db.query_row(&sql, values, |row| row.get::<_, i64>(0)).map(|n| usize::try_from(n).unwrap_or(usize::MAX))
         };
         let now = as_i64(now);
-        Ok((count("AND buyer = ?2", &[&now, &buyer.to_string()])?, count("", &[&now])?))
+        Ok((count("AND buyer = ?3", &[&now, &method, &buyer.to_string()])?, count("", &[&now, &method])?))
     }
 
-    /// The newest invoice of `buyer`'s that waits for just this (`offer`
-    /// from `mint`, for `target` or a package of its own), was asked for at
-    /// `since` or after, and does not end before `lasts`: what the same
-    /// request, sent again, is answered with.
-    pub fn invoice_recent(
-        &self,
-        buyer: Ipv6Addr,
-        mint: &str,
-        offer: &str,
-        target: Option<&str>,
-        since: u64,
-        lasts: u64,
-    ) -> Result<Option<Order>, Refused> {
+    /// The newest order of this kind (by invoice, or by address) that
+    /// waits for just what `asked` asks, at the price and for the bytes
+    /// and days it is offered at now, was asked for at `since` or after,
+    /// and does not end before `lasts`: what the same request, sent again,
+    /// is answered with.
+    pub fn invoice_recent(&self, asked: &NewInvoice<'_>, since: u64, lasts: u64) -> Result<Option<Order>, Refused> {
         Ok(Store::orders_where(
             &self.db(),
-            "WHERE paid = 0 AND ended = 0 AND method = 'bolt11' AND buyer = ?1 AND mint = ?2 AND offer = ?3
-               AND target IS ?4 AND created >= ?5 AND expires >= ?6 ORDER BY created DESC, id LIMIT 1",
-            &[&buyer.to_string(), &mint, &offer, &target, &as_i64(since), &as_i64(lasts)],
+            "WHERE paid = 0 AND ended = 0 AND method = ?7 AND buyer = ?1 AND mint = ?2 AND offer = ?3
+               AND target IS ?4 AND created >= ?5 AND expires >= ?6 AND sat = ?8 AND bytes = ?9 AND days = ?10
+             ORDER BY created DESC, id LIMIT 1",
+            &[
+                &asked.buyer.to_string(),
+                &asked.mint,
+                &asked.offer,
+                &asked.target,
+                &as_i64(since),
+                &as_i64(lasts),
+                &asked.method,
+                &as_i64(asked.sat),
+                &as_i64(asked.bytes),
+                &i64::from(asked.days),
+            ],
         )?
         .pop())
     }
 
-    /// Order `id`'s invoice ended unpaid: given up. One that is paid is not.
+    /// Order `id` has ended: an invoice unpaid, and given up; an address,
+    /// paid to or not, at which nothing more is looked for. An invoice that
+    /// is paid is not ended.
     pub fn invoice_end(&self, id: &str, now: u64) -> Result<(), Refused> {
         self.db().execute(
-            "UPDATE orders SET ended = ?2 WHERE id = ?1 AND paid = 0 AND method = 'bolt11'",
+            "UPDATE orders SET ended = ?2
+             WHERE id = ?1 AND ((method = 'bolt11' AND paid = 0) OR method = 'onchain')",
             params![id, as_i64(now.max(1))],
         )?;
         Ok(())
     }
 
     /// Forget the invoices that were given up before `before`: nobody asks
-    /// what became of them any more.
-    pub fn invoices_forget(&self, before: u64) -> Result<usize, Refused> {
+    /// what became of them any more. And the orders by address that ended
+    /// before `addresses_before` with nothing arrived: kept for longer,
+    /// since what is sent to an address may be confirmed long after, and
+    /// the order is what claims it.
+    pub fn invoices_forget(&self, before: u64, addresses_before: u64) -> Result<usize, Refused> {
         Ok(self.db().execute(
-            "DELETE FROM orders WHERE paid = 0 AND method = 'bolt11' AND ended > 0 AND ended < ?1",
-            [as_i64(before)],
+            "DELETE FROM orders WHERE paid = 0 AND ended > 0
+               AND ((method = 'bolt11' AND ended < ?1) OR (method = 'onchain' AND ended < ?2))",
+            [as_i64(before), as_i64(addresses_before)],
         )?)
     }
 
@@ -1126,8 +1168,9 @@ impl Store {
             }
             None => {
                 let label = format!("bought: {}", order.offer);
+                let until = if order.days == 0 { 0 } else { now + u64::from(order.days) * 86_400 };
                 let (package, key) =
-                    Store::grant_in(&tx, order.bytes, order.days, &[order.buyer], &label, now, Some(order.buyer))?;
+                    Store::grant_in(&tx, order.bytes, until, &[order.buyer], &label, now, Some(order.buyer))?;
                 (package, Some(key))
             }
         };
@@ -1152,6 +1195,88 @@ impl Store {
         let settled = Store::package_in(&tx, &package)?.ok_or(Refused::NoPackage)?;
         tx.commit()?;
         Ok(Settled { package: settled, offer: order.offer, added: key.is_none(), key, paid_sat, fee_sat })
+    }
+
+    /// `arrived` sat have come, in all, to the address of order `id`, which
+    /// is paid on the chain, and are in the wallet. What arrives buys at
+    /// the rate of what was ordered, whatever part or multiple of its price
+    /// it is: so much of its bytes, and so much of its time. The first that
+    /// arrives makes the package, with its buyer in it, or goes to the one
+    /// that was to be added to; what arrives after is added to the same.
+    /// One transaction for each arrival, with a credit whose key can exist
+    /// once. None when `arrived` is no more than was credited already.
+    pub fn order_credit(&self, id: &str, arrived: u64, now: u64) -> Result<Option<Credited>, Refused> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let order = Store::orders_where(&tx, "WHERE id = ?1 AND method = 'onchain'", &[&id])?.pop();
+        let order = order.ok_or(Refused::NoOrder)?;
+        if arrived <= order.paid_sat {
+            return Ok(None);
+        }
+        // Of the whole that has arrived, less what was credited of it: so
+        // that parts add up to what the whole buys, to the byte.
+        let part = |of: u64, sat: u64| -> u64 {
+            let part = u128::from(of) * u128::from(sat) / u128::from(order.sat.max(1));
+            u64::try_from(part).unwrap_or(u64::MAX).min(MAX_BYTES)
+        };
+        let seconds = u64::from(order.days) * 86_400;
+        let bytes = part(order.bytes, arrived) - part(order.bytes, order.paid_sat);
+        let time = part(seconds, arrived) - part(seconds, order.paid_sat);
+        // The package it went to before; or the one it was to be added to;
+        // or, where that is gone or taken back, one of its own.
+        let before = match order.package.as_ref().or(order.target.as_ref()) {
+            Some(package) => Store::package_in(&tx, package)?.filter(|package| !package.revoked),
+            None => None,
+        };
+        let package = match before {
+            Some(package) => {
+                let granted = package.granted.saturating_add(bytes).min(MAX_BYTES);
+                // As an invoice's order: one without an end keeps none.
+                let until = match (package.until, order.days) {
+                    (0, _) | (_, 0) => package.until,
+                    (until, _) => until.max(now).saturating_add(time),
+                };
+                tx.execute(
+                    "UPDATE packages SET granted = ?2, until = ?3 WHERE id = ?1",
+                    params![package.id, as_i64(granted), as_i64(until)],
+                )?;
+                package.id
+            }
+            None => {
+                let label = format!("bought: {}", order.offer);
+                let until = if order.days == 0 { 0 } else { now.saturating_add(time.max(60)) };
+                Store::grant_in(&tx, bytes.max(1), until, &[order.buyer], &label, now, Some(order.buyer))?.0
+            }
+        };
+        tx.execute(
+            "INSERT INTO credits (key, at, sat, mint, of_order, package, bytes, days) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                format!("{}:{}:{arrived}", order.method, hex(&order.receipt)),
+                as_i64(now),
+                as_i64(arrived - order.paid_sat),
+                order.mint,
+                order.id,
+                package,
+                as_i64(bytes),
+                as_i64(time / 86_400)
+            ],
+        )?;
+        tx.execute(
+            "UPDATE orders SET paid = 1, paid_sat = ?2, package = ?3,
+                               settled = CASE WHEN settled = 0 THEN ?4 ELSE settled END
+             WHERE id = ?1",
+            params![order.id, as_i64(arrived), package, as_i64(now)],
+        )?;
+        let package = Store::package_in(&tx, &package)?.ok_or(Refused::NoPackage)?;
+        tx.commit()?;
+        Ok(Some(Credited {
+            package,
+            offer: order.offer,
+            first: order.paid_sat == 0,
+            sat: arrived - order.paid_sat,
+            bytes,
+            arrived,
+        }))
     }
 
     /// A new key for the package order `id` made, for its buyer who asks

@@ -146,11 +146,38 @@ struct Lightning {
     describes: bool,
 }
 
-/// An invoice of a mint's, and the quote it stands for there.
+/// What a mint says of payments it takes on the chain, in sat.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Chain {
+    /// The least and the most one may be.
+    pub least: u64,
+    pub most: u64,
+    /// How often a payment has to be confirmed before the mint counts it.
+    pub confirmations: u32,
+}
+
+impl Chain {
+    /// What a mint's description of itself says of them (NUT-04, for the
+    /// method `onchain`), if it takes any for sat.
+    fn of(info: &cdk::nuts::MintInfo) -> Option<Chain> {
+        let minting = &info.nuts.nut04;
+        minting.get_settings(&CurrencyUnit::Sat, &onchain()).filter(|_| !minting.disabled).map(|its| Chain {
+            least: its.min_amount.map_or(1, |least| least.to_u64().max(1)),
+            most: its.max_amount.map_or(u64::MAX, |most| most.to_u64()),
+            confirmations: match its.options {
+                Some(MintMethodOptions::Onchain { confirmations }) => confirmations,
+                _ => 0,
+            },
+        })
+    }
+}
+
+/// An invoice of a mint's, or an address it gave for a payment on the
+/// chain, and the quote it stands for there.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Quote {
     pub id: String,
-    /// The invoice: a BOLT11 payment request.
+    /// The invoice, a BOLT11 payment request; or the address.
     pub request: String,
     /// When it ends, in Unix seconds.
     pub expires: u64,
@@ -217,6 +244,10 @@ pub enum Left {
     Pending,
     /// Not paid, and nothing left the wallet: why.
     Not(String),
+}
+
+fn onchain() -> PaymentMethod {
+    PaymentMethod::Known(KnownMethod::Onchain)
 }
 
 fn bolt11() -> PaymentMethod {
@@ -294,6 +325,8 @@ pub struct Mint {
     /// What the mint said of its invoices when it was last reached, if it
     /// gives any for sat.
     lightning: std::sync::Mutex<Option<Lightning>>,
+    /// And of payments on the chain, if it takes any for sat.
+    chain: std::sync::Mutex<Option<Chain>>,
     /// What the wallet held here when that was last asked, in sat; and the
     /// most it may hold (0: any amount), from where on nothing is sold.
     held: AtomicU64,
@@ -331,6 +364,7 @@ impl Mint {
             }
             // Whether it gives invoices, as it says itself (NUT-04).
             *self.lightning.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Lightning::of(&info);
+            *self.chain.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Chain::of(&info);
             if self.count_first.load(Ordering::Relaxed) || self.look_ahead.load(Ordering::Relaxed) {
                 let _turn = self.turn.lock().await;
                 if self.count_first.load(Ordering::Relaxed) || self.behind().await? {
@@ -797,9 +831,25 @@ impl Mint {
     /// of the wallet's file. Where the wallet was interrupted in minting
     /// for the quote, it finishes that here.
     pub async fn quote_state(&self, quote: &str, key: Option<&str>) -> Result<Paid, String> {
+        let now = self.quote_now(quote, key, bolt11()).await?;
+        Ok(match now.state {
+            MintQuoteState::Unpaid => Paid::No,
+            MintQuoteState::Paid => Paid::Yes,
+            MintQuoteState::Issued => Paid::Minted(now.amount_issued.to_u64()),
+        })
+    }
+
+    /// The quote as the mint has it now, learnt again where the wallet's
+    /// file does not know it, with its key put to it where that is missing.
+    async fn quote_now(
+        &self,
+        quote: &str,
+        key: Option<&str>,
+        method: PaymentMethod,
+    ) -> Result<cdk::wallet::types::MintQuote, String> {
         let known = match self.db.get_mint_quote(quote).await.map_err(said)? {
             Some(known) => known,
-            None => within(self.wallet.fetch_mint_quote(quote, Some(bolt11()))).await?,
+            None => within(self.wallet.fetch_mint_quote(quote, Some(method))).await?,
         };
         // Its key, whenever the wallet's file has the quote without it: it
         // is learnt from the mint without one, and may have been left so.
@@ -810,12 +860,44 @@ impl Mint {
             with_key.secret_key = Some(SecretKey::from_hex(key).map_err(said)?);
             self.db.add_mint_quote(with_key).await.map_err(said)?;
         }
-        let now = within(self.wallet.check_mint_quote_status(quote)).await?;
-        Ok(match now.state {
-            MintQuoteState::Unpaid => Paid::No,
-            MintQuoteState::Paid => Paid::Yes,
-            MintQuoteState::Issued => Paid::Minted(now.amount_issued.to_u64()),
+        within(self.wallet.check_mint_quote_status(quote)).await
+    }
+
+    /// Does the mint take a payment on the chain, as far as it has said:
+    /// of `sat`, or (for none) at all? How often one has to be confirmed
+    /// before the mint counts it.
+    pub fn takes_onchain(&self, sat: Option<u64>) -> Option<Chain> {
+        let chain = *self.chain.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        chain.filter(|its| sat.is_none_or(|sat| (its.least..=its.most).contains(&sat)))
+    }
+
+    /// Ask the mint for an address to pay to on the chain: a quote that
+    /// names no amount, at which whatever arrives and is confirmed can be
+    /// minted for. Its end is 0 where the mint names none. The caller holds
+    /// [`Mint::turn`].
+    ///
+    /// The address is read here: a buyer is shown nothing that is not one.
+    pub async fn address(&self) -> Result<Quote, String> {
+        let quote = within(self.wallet.mint_quote(onchain(), None, None, None)).await?;
+        bitcoin::Address::from_str(&quote.request)
+            .map_err(|e| format!("what the mint gave is not a Bitcoin address: {e}"))?;
+        Ok(Quote {
+            id: quote.id,
+            request: quote.request,
+            expires: quote.expiry,
+            key: quote.secret_key.as_ref().map(SecretKey::to_secret_hex),
         })
+    }
+
+    /// What the mint says arrived at the address of `quote`, which `key` is
+    /// locked to, and is confirmed; and how much of that was minted
+    /// already, for this wallet. In sat. The caller holds [`Mint::turn`].
+    /// As [`Mint::quote_state`] for an invoice, a quote the wallet's file
+    /// does not know is learnt again, and the wallet finishes here what it
+    /// was interrupted in.
+    pub async fn arrived(&self, quote: &str, key: Option<&str>) -> Result<(u64, u64), String> {
+        let now = self.quote_now(quote, key, onchain()).await?;
+        Ok((now.amount_paid.to_u64(), now.amount_issued.to_u64()))
     }
 
     /// Have the wallet's file know `quote` without its key: as when it
@@ -938,6 +1020,7 @@ impl Wallets {
             // it sells for does not change with every start.
             let remembered = db.get_mint(url.clone()).await.ok().flatten();
             let lightning = remembered.as_ref().and_then(Lightning::of);
+            let chain = remembered.as_ref().and_then(Chain::of);
             opened.push(Arc::new(Mint {
                 name: name.clone(),
                 url,
@@ -950,6 +1033,7 @@ impl Wallets {
                 look_ahead: AtomicBool::new(true),
                 again: again.clone(),
                 lightning: std::sync::Mutex::new(lightning),
+                chain: std::sync::Mutex::new(chain),
                 held: AtomicU64::new(0),
                 cap: AtomicU64::new(0),
                 out: std::sync::Mutex::new(Vec::new()),
@@ -967,6 +1051,11 @@ impl Wallets {
     /// Whether any mint at which something is sold now gives invoices.
     pub fn invoicing(&self) -> bool {
         self.mints.iter().any(|mint| mint.sells() && mint.gives_invoices(None))
+    }
+
+    /// Whether any of them takes payments on the chain.
+    pub fn chaining(&self) -> bool {
+        self.mints.iter().any(|mint| mint.sells() && mint.takes_onchain(None).is_some())
     }
 
     /// The most the wallet may hold at a mint, in sat (0: any amount): at

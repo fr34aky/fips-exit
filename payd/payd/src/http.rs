@@ -30,7 +30,7 @@ use tokio::sync::{Notify, Semaphore};
 use crate::config::Config;
 use crate::invoices;
 use crate::orders::{self, Desk, Kind};
-use crate::store::{BOLT11, CASHU, Store};
+use crate::store::{BOLT11, CASHU, ONCHAIN, Store};
 use crate::sync::{Seats, unix_now};
 use crate::terms::{self, Exit, YourPackage};
 
@@ -91,13 +91,18 @@ impl Site {
     }
 
     /// The ways of paying that work now: a token of a mint that is
-    /// reached, and an invoice where one of those gives any.
+    /// reached; an invoice where one of those gives any; and bitcoin on
+    /// the chain where one takes that.
     pub fn methods(&self) -> Vec<String> {
-        match &self.desk {
-            Some(desk) if desk.wallets.invoicing() => vec![CASHU.to_string(), BOLT11.to_string()],
-            Some(desk) if desk.wallets.ready() => vec![CASHU.to_string()],
-            _ => Vec::new(),
+        let Some(desk) = self.desk.as_ref().filter(|desk| desk.wallets.ready()) else { return Vec::new() };
+        let mut ways = vec![CASHU.to_string()];
+        if desk.wallets.invoicing() {
+            ways.push(BOLT11.to_string());
         }
+        if desk.wallets.chaining() {
+            ways.push(ONCHAIN.to_string());
+        }
+        ways
     }
 
     /// The package `caller` is in, as the caller may see it.

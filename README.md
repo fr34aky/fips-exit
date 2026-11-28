@@ -145,8 +145,9 @@ sudo systemctl enable --now fips-exit-advert.timer   # and every hour
 `fips-exit-payd` runs beside the exit, as a user of its own with no
 privilege, and answers at `http://<npub>.fips:5170/`, the exit's npub being
 its name on the mesh. It says what the exit costs, sells packages for Cashu
-tokens of the mints you name and for Lightning invoices those mints give,
-and keeps the packages you give away:
+tokens of the mints you name, for Lightning invoices those mints give and
+for bitcoin on the chain where they take it, and keeps the packages you
+give away:
 
 ```sh
 ACCESS=paid
@@ -293,9 +294,70 @@ POST /v1/orders/<order>/key  {}                                                 
   invoice for that price. A program may name another of them
   (`"mint": "https://…"`).
 
+#### A package for bitcoin on the chain
+
+Where a mint in `MINTS` takes payments on the chain (it says so of itself:
+NUT-04, for `onchain` in sat; NUT-30), the page has a button "Pay on the
+chain", and a program asks the same way:
+
+```
+POST /v1/orders              {"package": "1gb", "method": "onchain"}               201: the order, with its address
+POST /v1/orders              {"package": "1gb", "method": "onchain", "key": "…"}   to be added to the package that key opens
+GET  /v1/orders/<order>      what became of it: "waiting", "paid" (with "paid_sat": what has arrived), "checking", "expired"
+POST /v1/orders/<order>/key  {}                                                    a key for the package it made
+```
+
+- The exit runs no Bitcoin node. The address is the mint's (a quote, as
+  for an invoice), and what arrives there is ecash in the exit's wallet
+  once the mint has seen it confirmed as often as it wants. Nothing is
+  granted before that: an unconfirmed payment buys nothing yet.
+- **What arrives buys at the package's rate, whatever it is.** An address
+  names no amount and a payment on the chain cannot be refused, so the
+  price is not a condition: half the price buys half the bytes and half the
+  days, twice the price twice as much, and a few sat less (a wallet that
+  takes its fee out of what it sends) a little less. The first payment
+  that arrives makes the package, with the device that ordered in it (or
+  goes to the package whose key was sent); what arrives at the same
+  address after that is added to the same package. Nothing is given back.
+- **What is confirmed after the order's end is lost to whoever sent it.**
+  The end is the mint's for its address, and two days after the order at
+  the most. The page says when that is, beside the address, and shows the
+  address only until then; so does `"expires"` for a program. A payment
+  sent with a fee too small to be confirmed by then is lost the same way.
+- The page shows the address as text, as a `bitcoin:` link that names the
+  price and as a QR code of that link, and what the mint says of how often
+  it wants a payment confirmed and how little or much it takes at once.
+  It looks again every half minute. Once something has arrived it says
+  what that bought, and goes on showing the address until the order ends.
+- The mint is asked about an address more seldom than about an invoice:
+  every half minute while its buyer is asking, and otherwise more seldom
+  the older the order is, every quarter of an hour at the most (every ten
+  minutes once something has arrived). So a payment nobody is waiting for
+  is credited up to a quarter of an hour after the mint counts it.
+- At most 3 addresses nothing has arrived at wait for one buyer, and 64 in
+  all: counted apart from the invoices, so that neither keeps the other
+  from being given. The same asked again is the same address, for as long
+  as nothing has arrived at it, it is good for another day, and the
+  package costs what it did.
+- As with an invoice, the order is its buyer's alone, its package's key is
+  asked for by its buyer, the order is enough to claim what arrives if the
+  wallet's file is lost, and a mint has to stay in `MINTS` while
+  `fips-exit orders` shows an order of it `open`, or `more`: that is an
+  address something has arrived at, which is good for more until its end,
+  up to two days after it was given.
+- An order at whose address nothing arrived is kept for ninety days after
+  its end, with the quote and the key that claim what is confirmed there
+  after all: the service does not look there any more, and whoever wants
+  to make a late payer whole can, by hand. One whose mint does not say
+  what arrived, or will not mint for it, is asked about for a week after
+  its end, and then ended and kept, with a line in the log.
+- `WALLET_CAP` keeps new addresses from being given, and does not bound
+  what arrives at one that was: what is sent is the sender's to choose.
+  Set `SWEEP_TO` if that matters.
+
 ```sh
-sudo fips-exit wallet    # what the wallet holds at each mint, what was sold there, whether it gives invoices
-sudo fips-exit orders    # what was paid, with a token or by invoice, by whom, for which package
+sudo fips-exit wallet    # what the wallet holds at each mint, what was sold there, whether it gives invoices and takes payments on the chain
+sudo fips-exit orders    # what was paid, with a token, by invoice or on the chain, by whom, for which package
 ```
 
 **The wallet is money on this machine.** What is paid is ecash in a wallet
@@ -360,11 +422,12 @@ sudo fips-exit wallet out                        # what left the wallet, and wha
   payment is under way there, nothing else is. The service then talks to
   that host as well as to its mints, and to nobody else.
 - **`WALLET_CAP`** is the most the wallet may hold at one mint: from there
-  on nothing is sold at that mint, by token or by invoice (`503`, the code
-  `wallet-full`), until something has left it. Half a million sat when the
-  config says nothing; 0 for any amount. Invoices given before it was
-  reached are still honoured, so it can end a little over. With `SWEEP_TO`,
-  `SWEEP_ABOVE` has to be under it.
+  on nothing is sold at that mint, by token, by invoice or on the chain
+  (`503`, the code `wallet-full`), until something has left it. Half a
+  million sat when the config says nothing; 0 for any amount. Invoices and
+  addresses given before it was reached are still honoured, so it can end
+  over: a little for an invoice, and by whatever is sent for an address.
+  With `SWEEP_TO`, `SWEEP_ABOVE` has to be under it.
 - **Everything that leaves is written down** before the mint is asked
   (`wallet out`), with the most it may cost, and then with what it did
   cost, or that it came to nothing. `fips-exit wallet` shows for each mint
@@ -560,11 +623,12 @@ an optimisation, not a requirement.
 
 Optional paid public exits (an advert with price and country, prepaid data
 packages, pay-as-you-go) are designed in
-[`docs/paid-exit.md`](docs/paid-exit.md). Its first seven phases are here:
+[`docs/paid-exit.md`](docs/paid-exit.md). Its first eight phases are here:
 accounts and `ACCESS=paid`, the advert, the payment service, packages and
-their keys, packages sold for Cashu tokens and for Lightning invoices, and
-paying out of the wallet with a limit on what it holds, all above. To come:
-on-chain payments, a command-line client, and pay-as-you-go channels.
+their keys, packages sold for Cashu tokens, for Lightning invoices and for
+bitcoin on the chain, and paying out of the wallet with a limit on what it
+holds, all above. To come: a command-line client, and pay-as-you-go
+channels.
 
 ## Test
 
@@ -596,7 +660,9 @@ neither the uplink's LAN nor port 25, the payment service tells a node that
 is no client what the exit costs and who it is, a node that is nobody's buys
 a package with a token of a mint that runs in the test and is carried,
 another pays an invoice of that mint for one, a token and an invoice leave
-the wallet again on the operator's word, a full wallet sells nothing, and
+the wallet again on the operator's word, a full wallet sells nothing, half
+a package's price and then the rest arrive at an address of that mint and
+buy half of it and then the whole, and
 leaving the mode removes what it made, the opening for the payment service
 with it.
 
@@ -610,10 +676,12 @@ the same. `payd/payd` is the payment service: its config, its terms and
 page, its HTTP server's limits over a real socket, its packages, and what
 is paid. `payd/test-mint` is a Cashu mint for the tests, in memory, with a
 Lightning backend that pays its own invoices (at once, or when a test says
-so), and a way to it on which a request or an answer can be lost: the
-payments are tested against it, a token spent twice, one spent elsewhere,
-an invoice paid late or never, an answer that never arrived and a service
-that died between a payment and its package among them. It is not
+so), addresses on the chain at which what arrives is what a test says, and
+a way to it on which a request or an answer can be lost: the payments are
+tested against it, a token spent twice, one spent elsewhere, an invoice
+paid late or never, a part of a price and more than a price arriving on
+the chain, an answer that never arrived and a service that died between a
+payment and its package among them. It is not
 installed, and nothing it gives out is worth anything.
 
 The fourth is the script's side of the advert: the signature against the

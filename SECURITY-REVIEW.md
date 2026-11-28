@@ -148,6 +148,21 @@ IPv4 address derived from the client's fips address.
     has a bound of its own (one invoice every three seconds). The one
     request there that changes something, a new key for the package an
     order made, is a POST held to the same rules as every other change.
+    **A request for an address on the chain** is the same request with
+    another word, and makes the same kind of order, of a mint that says it
+    takes such payments (NUT-30). What differs: the order lasts until the
+    mint's quote ends and two days at the most, and is asked about at its
+    mint for as long, whether or not anything has arrived; so the bounds
+    are its own and smaller (3 addresses nothing has arrived at for one
+    buyer, 64 in all, counted apart from the invoices; the same asked again
+    is the same address), and it is asked about more seldom (every half
+    minute for its buyer, else every quarter of an hour at the most). The
+    address is the mint's and is read before it is shown: it must parse as
+    a Bitcoin address (the `bitcoin` crate, which the wallet library
+    brings), or nothing is shown. It goes into the page escaped, as text,
+    in a `bitcoin:` link with the price and in a QR code of that link.
+    What is credited is a number the mint gives, held to a rule here (see
+    below); no amount comes from the buyer.
 13. **What the payment service tells the script.** `fips-exit wallet`,
     `orders`, `status` and `advert` ask the service over its socket, and
     root prints or signs what comes back: the service is another program,
@@ -281,6 +296,25 @@ IPv4 address derived from the client's fips address.
   quote (an order is one quote of one mint, and a credit's key can exist
   once); and an order given up while its invoice could still be paid, or
   without the mint's word.
+  For an address the ground is one number: how much the mint has minted
+  for the order's quote, which it does only for what it counts as
+  confirmed there and only for the wallet that holds the quote's key,
+  either just now to this wallet or as it says it did before. An order
+  keeps how much of that it has credited, and only what is over it is new,
+  in one transaction with a credit whose key names the total and can exist
+  once. What is new buys at the rate of what was ordered: the bytes and
+  the seconds of the whole that has arrived, less those of what was
+  credited, so that parts add up to what the whole buys and rounding gives
+  nothing away. Serious: anything granted for what the mint has not
+  minted (a payment seen and not confirmed, an amount the buyer names);
+  the same sat credited twice (a lost answer, a restart between minting
+  and crediting, two looks at once); more bytes for an amount in parts
+  than at once; and an order that is ended, or whose address stops being
+  looked at, while the page still shows it as good, or while something
+  that arrived there is not credited yet. An order is ended without the
+  mint's word in one case: a week after its end, when the mint still does
+  not say what arrived or will not mint for it; it is kept, and the log
+  says so loudly.
 - **An invoice paid, and nothing granted.** An order is written down before
   its invoice is shown to anyone; it is given up only when the mint, asked
   after the invoice's end and a while more, says it is not paid; and
@@ -388,7 +422,8 @@ IPv4 address derived from the client's fips address.
   otherwise) and a way to send it on by itself (`SWEEP_TO`), and whoever
   takes the service over, or reads its state directory, has what is held
   at that moment, with the seed. The limit is not exact: invoices given
-  before it was reached are honoured after.
+  before it was reached are honoured after, and so is whatever arrives at
+  an address on the chain that was given before.
 - **Sending on to a Lightning address trusts that address's host**, as
   paying one always does: it gives the invoice. The wallet library checks
   the invoice against the amount asked, and nothing else of it: not who is
@@ -421,24 +456,60 @@ IPv4 address derived from the client's fips address.
   ended, one every three seconds in all, so with many waiting a payment is
   seen later (half the looks go to orders whose buyers ask, half to
   whichever waited longest). Members are carried all the same.
+  Addresses on the chain last two days where an invoice lasts minutes, so
+  the ones nobody pays are counted apart and are few (64): they keep no
+  invoice from being given, and at their slowest pace take about a fifth
+  of the looks. But 64 of them, asked for from as many addresses on the
+  mesh, keep everyone else from paying on the chain here for two days
+  after whoever did it has stopped; tokens and invoices go on.
 - **A mint taken out of `MINTS` strands its open invoices.** The service
   keeps a wallet only for the mints it names, so an invoice of a mint that
   was removed cannot be asked about: it is not shown to be paid any more,
   the log says so, and the order is kept with what claims it. One paid in
-  between is granted only when the mint is named again. A token need not carry the proof (NUT-12) that
+  between is granted only when the mint is named again. The same holds for
+  an address on the chain, for longer: its order is open for up to two
+  days, paid or not. A token need not carry the proof (NUT-12) that
   would let the service refuse a made-up one without asking: wallets in
   use leave it out.
 - **A mint is trusted for what it holds, and for the truth.** It can keep
   what the wallet has there, and it decides what was paid: a mint that says
   it signed when it did not is believed, and so is one that says an invoice
   is paid. The invoice is the mint's too: its amount is checked here, and
-  who it pays is not, so a mint could have a buyer pay someone else. That
-  is what choosing a mint means.
+  who it pays is not, so a mint could have a buyer pay someone else. An
+  address on the chain is the mint's in the same way: that it is an
+  address is checked here, and whose it is, on which network, and what
+  the mint counts of what arrives there are the mint's word. That is what
+  choosing a mint means.
 - **What is paid after an invoice has ended is lost.** To the payer, at the
   mint; the exit does not know of it, having given the order up on the
   mint's word ten minutes after the end. A Lightning wallet does not pay an
   invoice that has ended, so this takes a payment that was under way for
   longer than that.
+- **On the chain that is easier to do, and nothing stops it.** A Bitcoin
+  wallet sends to an address whenever it is told to, and when a payment is
+  confirmed is for the miners: one sent in time with too small a fee, or
+  sent to an address read off an old page, is confirmed after the order's
+  end and is at the mint, under a quote this exit has stopped asking
+  about (it is asked a last time between ten and twenty-five minutes
+  after the end, and what is there then still counts). The page says the
+  end beside the address and shows the address only until then; more
+  cannot be done from here. The quote and its key stay with the order in
+  the service's store, for ninety days after its end where nothing
+  arrived and for good where something did, so an operator who wants to
+  make such a buyer whole still can, by hand.
+- **On the chain the price is a rate, and the operator's limits are
+  looser.** What arrives is not held to the price, so a buyer who sends a
+  hundred times the price is granted a hundred times the package and the
+  wallet holds that much: `WALLET_CAP` keeps new addresses from being
+  given and bounds nothing that arrives at one. What the mint says it
+  takes at once, at least and at most, is shown on the page and is the
+  mint's to enforce: what it does with a payment outside that is not known
+  here.
+- **Paying on the chain ties a node to a transaction.** The exit knows
+  which address on the mesh asked for which Bitcoin address, the mint knows
+  the Bitcoin address and that the exit asked, and the chain shows the
+  payment to everyone: a buyer who pays this way has told the operator
+  which coins were theirs. A token says nothing of the kind.
 - **The wallet library is most of the program.** Some 270 crates, pinned by
   the lockfile and by `cdk`'s exact version, none of them read here beyond
   what the service calls. Nothing in CI looks for advisories against them.

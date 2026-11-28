@@ -19,8 +19,8 @@ NAT to the uplink, and the firewall.
 
 With ACCESS=paid and the payment service running (fips-exit-payd), packages
 are sold for Cashu tokens of the mints in MINTS, and for Lightning invoices
-where one of those mints gives them. What is paid arrives in a wallet of
-the service's own:
+and bitcoin on the chain where one of those mints takes them. What is paid
+arrives in a wallet of the service's own:
 
   fips-exit wallet                                       what the wallet holds at each mint, and what was sold
   fips-exit orders                                       what was paid, by whom, for what
@@ -1396,8 +1396,10 @@ def cmd_status():
             if listening:
                 mints = [line.split() for line in (payd("wallet", fatal=False) or [])[:-1]]
                 for mint in mints:
-                    if len(mint) == 9:
+                    # (A service from before it said so says nothing of the chain.)
+                    if len(mint) in (9, 10):
                         invoices = ", and gives Lightning invoices" if mint[6] == "invoices" else ""
+                        invoices += ", and takes payments on the chain" if mint[9:] == ["onchain"] else ""
                         full = "; FULL (WALLET_CAP): nothing is sold here" if mint[8] == "full" else ""
                         print(f"  tokens of {shown(mint[1], 256)}: {shown(mint[2], 8)}, "
                               f"holds {shown(mint[3], 20)} sat{invoices}{full}")
@@ -1616,18 +1618,23 @@ def cmd_wallet(*args):
             raise TypeError
         return out[args[0]](*args[1:])
     lines = payd("wallet")
-    print(f"{'holds':>12} {'under way':>12} {'sold':>12} {'paid out':>12}  {'mint':<8} {'invoices':<8} url")
+    print(f"{'holds':>12} {'under way':>12} {'sold':>12} {'paid out':>12}  {'mint':<8} {'invoices':<8} "
+          f"{'chain':<6} url")
     for line in lines[:-1]:
         try:
-            _, url, state, holds, pending, sold, invoices, paid_out, room = line.split()
+            # (A service from before it took payments on the chain says nothing of them.)
+            said = line.split()
+            _, url, state, holds, pending, sold, invoices, paid_out, room, chain = said + ["?"] * (len(said) == 9)
             holds, pending, sold, paid_out = int(holds), int(pending), int(sold), int(paid_out)
         except ValueError:
             die(f"the payment service said something that is not a mint: {shown(line, 200)}")
         # Whether the mint gives Lightning invoices, as it said when it was last reached.
         invoices = {"invoices": "yes", "tokens": "no"}.get(invoices, "?")
+        # And whether it takes payments on the chain.
+        chain = {"onchain": "yes", "offchain": "no"}.get(chain, "?")
         full = "  FULL: nothing is sold here" if room == "full" else ""
         print(f"{f'{holds} sat':>12} {f'{pending} sat':>12} {f'{sold} sat':>12} {f'{paid_out} sat':>12}  "
-              f"{shown(state, 8):<8} {invoices:<8} {shown(url, 256)}{full}")
+              f"{shown(state, 8):<8} {invoices:<8} {chain:<6} {shown(url, 256)}{full}")
     if len(lines) == 1:
         print(f"(no mint is named: MINTS in {CONFIG})")
     # What the config says of the wallet, as the service reads it.
@@ -1655,8 +1662,9 @@ def cmd_orders():
             sat, paid_sat, fee = int(sat), int(paid_sat), int(fee)
         except (ValueError, OverflowError, OSError):
             die(f"the payment service said something that is not an order: {shown(line, 200)}")
-        # How it is paid: with a token, or by a Lightning invoice.
-        by = {"cashu": "token", "bolt11": "invoice"}.get(method, shown(method, 7))
+        # How it is paid: with a token, by a Lightning invoice, or on the chain. One
+        # paid on the chain is "more" while its address is still good for more.
+        by = {"cashu": "token", "bolt11": "invoice", "onchain": "chain"}.get(method, shown(method, 7))
         print(f"{shown(order, 18):<18} {shown(state, 5):<5} {by:<7} {when:<16} {f'{sat} sat':>10} "
               f"{f'{paid_sat} sat':>10} {fee:>6}  {shown(offer, 20):<20} {shown(package, 18):<18} {shown(buyer, 80)}")
     if len(lines) == 1:

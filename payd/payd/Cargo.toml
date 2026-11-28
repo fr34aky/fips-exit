@@ -39,6 +39,9 @@ cdk-sqlite = { version = "=0.18.3", default-features = false, features = ["walle
 # The wallet's seed as words (BIP-39), so that it can be written down, and
 # what the wallet holds found again from it, here or in another wallet.
 bip39 = { version = "2", default-features = false, features = ["std"] }
+# An address a mint gives for a payment on the chain is read before it is
+# shown. The wallet library's own version of it.
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 # The invoice as a QR code: the code alone, drawn here as SVG.
 qrcode = { version = "0.14", default-features = false }
 

@@ -543,27 +543,32 @@ class Command(unittest.TestCase):
 
     def test_the_wallet_and_the_orders_are_shown_as_the_service_says_them(self):
         self.service({
-            "wallet": "mint https://mint.example.org reached 1564 0 1564\nmint https://b.example away 0 64 0\nok 2\n",
+            "wallet": "mint https://mint.example.org reached 1564 0 1564 invoices\n"
+                      "mint https://b.example away 0 64 0 tokens\nok 2\n",
             "orders": "order o0123456789abcdef paid 1800000000 fd77::7 1gb 1500 1500 1 p0123456789abcdef "
-                      "https://mint.example.org\norder o1123456789abcdef open 1800000060 npub1abc small 64 0 0 - "
-                      "https://mint.example.org\nok 2\n"})
+                      "https://mint.example.org cashu\norder o1123456789abcdef open 1800000060 npub1abc small 64 0 0 - "
+                      "https://mint.example.org bolt11\norder o2123456789abcdef ended 1800000120 npub1abc small 64 0 0 - "
+                      "https://mint.example.org bolt11\nok 3\n"})
         status, out = self.run_command(x.cmd_wallet)
         self.assertEqual(status, 0)
         rows = out.splitlines()
-        self.assertEqual(rows[1].split(), ["1564", "sat", "0", "sat", "1564", "sat", "reached", "https://mint.example.org"])
-        self.assertEqual(rows[2].split(), ["0", "sat", "64", "sat", "0", "sat", "away", "https://b.example"])
+        self.assertEqual(rows[1].split(),
+                         ["1564", "sat", "0", "sat", "1564", "sat", "reached", "yes", "https://mint.example.org"])
+        self.assertEqual(rows[2].split(), ["0", "sat", "64", "sat", "0", "sat", "away", "no", "https://b.example"])
         self.assertIn("its seed", out)
         status, out = self.run_command(x.cmd_orders)
         self.assertEqual(status, 0)
         rows = out.splitlines()
-        self.assertEqual(rows[1].split()[:2] + rows[1].split()[4:],
-                         ["o0123456789abcdef", "paid", "1500", "sat", "1500", "sat", "1", "1gb", "p0123456789abcdef",
-                          "fd77::7"])
-        self.assertEqual(rows[2].split()[:2] + rows[2].split()[-3:], ["o1123456789abcdef", "open", "small", "-", "npub1abc"])
+        self.assertEqual(rows[1].split()[:3] + rows[1].split()[5:],
+                         ["o0123456789abcdef", "paid", "token", "1500", "sat", "1500", "sat", "1", "1gb",
+                          "p0123456789abcdef", "fd77::7"])
+        self.assertEqual(rows[2].split()[:3] + rows[2].split()[-3:],
+                         ["o1123456789abcdef", "open", "invoice", "small", "-", "npub1abc"])
+        self.assertEqual(rows[3].split()[:3], ["o2123456789abcdef", "ended", "invoice"])
 
     def test_what_is_not_a_mint_or_an_order_is_said_and_does_nothing_to_the_terminal(self):
-        self.service({"wallet": "mint https://m.example reached lots 0 0\nok 1\n",
-                      "orders": "order o1 paid when\x1b[2J fd77::7 1gb 1 1 0 p1 https://m.example\nok 1\n"})
+        self.service({"wallet": "mint https://m.example reached lots 0 0 invoices\nok 1\n",
+                      "orders": "order o1 paid when\x1b[2J fd77::7 1gb 1 1 0 p1 https://m.example cashu\nok 1\n"})
         for command in (x.cmd_wallet, x.cmd_orders):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):

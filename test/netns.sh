@@ -701,8 +701,8 @@ r=$(http_post c1 /v1/orders '{"package": "1gb", "token": "cashuBabc"}')
 [ "$(status_of "$r")" = 503 ] || fail "an order on an exit that names no mint: $r"
 sells "tiny:30000:8:1 1gb:1GB:1500:30" "MINTS=$MINT\n"
 restart_payd
-wait_for 'http_get c1 /v1/terms | grep -q "\"methods\":\[\"cashu\"\]"' \
-  || fail "the service does not take tokens: $(http_get c1 /v1/terms) $(tail -5 "$FIPS_EXIT_DIR/payd.log")"
+wait_for 'http_get c1 /v1/terms | grep -q "\"methods\":\[\"cashu\",\"bolt11\"\]"' \
+  || fail "the service does not take tokens, or gives no invoices: $(http_get c1 /v1/terms) $(tail -5 "$FIPS_EXIT_DIR/payd.log")"
 http_get c1 / | grep -q '<form method="post" action="/buy">' || fail "the page does not sell"
 [ "$(ask c1 4 8.8.8.2 100)" = timeout ] || fail "c1 was carried before it paid"
 t=$(token 8)
@@ -735,36 +735,104 @@ r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")
 also=$(printf '%s' "$r" | tail -n +2 | python3 -c 'import json, sys; print(json.load(sys.stdin)["package"]["id"])')
 wait_for '[ "$(ask c3 4 8.8.8.2 100)" = 100 ]' || fail "the second node that paid is not carried"
 # What the operator sees of it, and what the advert says now.
-"$here/fips-exit" wallet | grep -Eq "^ +16 sat +0 sat +16 sat +reached +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
+"$here/fips-exit" wallet | grep -Eq "^ +16 sat +0 sat +16 sat +reached +yes +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
 "$here/fips-exit" orders | grep -Eq "^o[0-9a-f]{16} +paid .* 8 sat +8 sat +0 +tiny +$bought +$C1\$" || fail "orders: $("$here/fips-exit" orders)"
 [ "$("$here/fips-exit" orders | grep -c " paid ")" = 2 ] || fail "orders: $("$here/fips-exit" orders)"
 "$here/fips-exit" packages | grep -q "^$bought  *live .*bought: tiny" || fail "packages: $("$here/fips-exit" packages)"
-"$here/fips-exit" status | grep -q "tokens of $MINT: reached, holds 16 sat" || fail "status: $("$here/fips-exit" status)"
+"$here/fips-exit" status | grep -q "tokens of $MINT: reached, holds 16 sat, and gives Lightning invoices" || fail "status: $("$here/fips-exit" status)"
 advert_terms | python3 -c '
 import json, sys
 tags = json.load(sys.stdin)
-for tag in (["access", "paid"], ["price", "2000000"], ["pay", "cashu"], ["port", "5170"], ["mint", sys.argv[1]],
+for tag in (["access", "paid"], ["price", "2000000"], ["pay", "cashu", "bolt11"], ["port", "5170"], ["mint", sys.argv[1]],
             ["package", "tiny", "30000", "8", "1"], ["package", "1gb", "1000000000", "1500", "30"]):
     assert tag in tags, (tag, tags)' $MINT || fail "the advert of an exit that sells: $(advert_terms)"
+ok "a token of the exit's mint buys a package over the mesh: once, for its price, and its buyer is carried"
+
+# --- a package bought with Lightning, over the mesh ----------------------------------
+# The mint gives the invoice, and from here on it is paid when this test says
+# so. c3, which is in the package it bought with a token, asks for another.
+"$mint" hold $MINT || fail "the test mint does not hold its invoices"
+http_get c3 / | grep -q '<button>Pay with Lightning</button>' || fail "the page does not sell for an invoice"
+r=$(http_post c3 /v1/orders '{"package": "tiny", "method": "bolt11"}')
+[ "$(status_of "$r")" = 201 ] || fail "asking for an invoice: $r $(tail -5 "$FIPS_EXIT_DIR/payd.log")"
+order=$(printf '%s' "$r" | tail -n +2 | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["state"] == "waiting" and d["method"] == "bolt11" and d["sat"] == 8 and d["request"].startswith("lnbc80n1"), d
+assert "key" not in d and "package" not in d, d
+print(d["order"], d["request"])') || fail "the order: $r"
+invoice=${order#* }; order=${order% *}
+# The order is its buyer's, and it waits: nothing is granted for an invoice.
+[ "$(status_of "$(http_get c1 /v1/orders/$order)")" = 404 ] || fail "ANOTHER NODE SAW AN ORDER THAT IS NOT ITS OWN"
+http_get c3 /v1/orders/$order | grep -q '"state":"waiting"' || fail "the order while it waits: $(http_get c3 /v1/orders/$order)"
+http_get c3 /order/$order | grep -q '<svg class="qr"' || fail "the order's page shows no code to pay by"
+[ "$(status_of "$(http_post c3 /v1/orders/$order/key '{}')")" = 409 ] || fail "a key was given for an order that is not paid"
+"$here/fips-exit" orders | grep -Eq "^$order +open +invoice " || fail "orders: $("$here/fips-exit" orders)"
+[ "$(ctl "check $C3")" = "ok member $also v4" ] || fail "c3 before it paid the invoice: $(ctl "check $C3")"
+# Somebody pays it: the mint is asked, the wallet mints, the package is there.
+"$mint" pay $MINT "$invoice" || fail "the test mint did not take the payment"
+wait_for 'http_get c3 /v1/orders/$order | grep -q "\"state\":\"paid\""' \
+  || fail "AN INVOICE THAT WAS PAID BOUGHT NOTHING: $(http_get c3 /v1/orders/$order) $(tail -5 "$FIPS_EXIT_DIR/payd.log")"
+via=$(http_get c3 /v1/orders/$order | tail -n +2 | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["paid_sat"] == 8 and d["added"] is False and "request" not in d, d
+print(d["package"]["id"])') || fail "the order once it is paid: $(http_get c3 /v1/orders/$order)"
+wait_for '[ "$(ctl "check $C3")" = "ok member $via v4" ]' || fail "who paid an invoice is not in its package: $(ctl "check $C3")"
+[ "$(ask c3 4 8.8.8.2 100)" = 100 ] || fail "A NODE THAT PAID AN INVOICE IS NOT CARRIED"
+http_get c3 /order/$order | grep -q "Paid: 8 sat arrived, and tiny is package $via" || fail "the order's page once it is paid"
+# Nobody was shown the package's key: its buyer asks for one, and nobody else.
+[ "$(status_of "$(http_post c1 /v1/orders/$order/key '{}')")" = 404 ] || fail "ANOTHER NODE WAS GIVEN A KEY"
+r=$(http_post c3 /v1/orders/$order/key '{}')
+[ "$(status_of "$r")" = 200 ] || fail "a key for what an invoice bought: $r"
+via_key=$(printf '%s' "$r" | tail -n +2 | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["package"]["id"] == sys.argv[1] and d["package"]["you"] is True and len(d["key"]) == 64, d
+print(d["key"])' $via) || fail "the key: $r"
+[ "$(status_of "$(http_post c1 /v1/package "{\"key\": \"$via_key\"}")")" = 200 ] || fail "the key that was given opens nothing"
+# As the page's form asks: on to the order's page. And not from another site.
+ip netns exec c1 python3 -c '
+import http.client, sys
+def post(origin):
+    c = http.client.HTTPConnection(sys.argv[1], 5170, timeout=4)
+    c.request("POST", "/buy", body="package=tiny&method=bolt11",
+              headers={"Host": sys.argv[2], "Content-Type": "application/x-www-form-urlencoded", "Origin": origin})
+    r = c.getresponse()
+    return r.status, r.getheader("Location") or ""
+status, at = post("http://" + sys.argv[2])
+assert status == 303 and at.startswith("/order/o"), (status, at)
+assert post("http://evil.example")[0] == 403' $E "$NPUB.fips:5170" || fail "the page's form for an invoice"
+"$here/fips-exit" orders | grep -Eq "^$order +paid +invoice .* 8 sat +8 sat +0 +tiny +$via +$C3\$" || fail "orders: $("$here/fips-exit" orders)"
+"$here/fips-exit" wallet | grep -Eq "^ +24 sat +0 sat +24 sat +reached +yes +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
+ok "an invoice of the exit's mint buys a package over the mesh: when it is paid, for its buyer alone"
+
 # The wallet and what was sold are kept when the service starts again, with
 # its mint away: nothing is sold then, and who paid is carried all the same.
+# (That the mint gives invoices is remembered, for what the advert says.)
 fresh=$(token 8)
 kill $mint_pid; wait $mint_pid 2>/dev/null || true
 restart_payd
-wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +16 sat +0 sat +16 sat +away +$MINT\$"' \
+wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +24 sat +0 sat +24 sat +away +yes +$MINT\$"' \
   || fail "the wallet after the service started again: $("$here/fips-exit" wallet 2>&1)"
 r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$fresh\"}")
 [ "$(status_of "$r")" = 503 ] && printf '%s' "$r" | grep -q '"code":"mint-away"' || fail "an order while the mint is away: $r"
+r=$(http_post c1 /v1/orders '{"package": "tiny", "method": "bolt11"}')
+[ "$(status_of "$r")" = 503 ] && printf '%s' "$r" | grep -q '"code":"mint-away"' || fail "an invoice while the mint is away: $r"
+# The invoice c1 asked for by the form was not paid: it waits for its mint,
+# and is not given up while that cannot be asked.
+"$here/fips-exit" orders | grep -Eq "^o[0-9a-f]{16} +open +invoice " || fail "an invoice that waits, after a restart: $("$here/fips-exit" orders)"
 # A token that did buy is still answered with what became of it.
 r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")
 [ "$(status_of "$r")" = 200 ] && printf '%s' "$r" | grep -q '"again":true' || fail "a token that bought, sent again while the mint is away: $r"
 wait_for '[ "$(ask c1 4 8.8.8.2 100)" = 100 ]' || fail "who paid is not carried after the service started again"
 [ "$(stat -c %a "$FIPS_EXIT_DIR/state/seed")" = 600 ] && [ "$(wc -w < "$FIPS_EXIT_DIR/state/seed")" = 24 ] || fail "the wallet's seed"
-"$here/fips-exit" revoke $bought >/dev/null && "$here/fips-exit" revoke $also >/dev/null || fail "revoke what was bought"
+"$here/fips-exit" revoke $bought >/dev/null && "$here/fips-exit" revoke $also >/dev/null \
+  && "$here/fips-exit" revoke $via >/dev/null || fail "revoke what was bought"
 wait_for '[ "$(ctl "check $C1") $(ctl "check $C3")" = "ok free v4 ok free v4" ]' || fail "after revoking what was bought: $(ctl "check $C1") $(ctl "check $C3")"
 sells "1gb:1GB:1500:30 5gb:5GB:6000:90" ""
 restart_payd
-ok "a token of the exit's mint buys a package over the mesh: once, for its price, and its buyer is carried"
+ok "the wallet and who paid outlive the service, and nothing is sold while its mint is away"
 
 # --- a removed client is cut off, even when `up` then stops -------------------------
 # `remove` saves the list and applies it. If applying stops at something (here:

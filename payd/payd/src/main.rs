@@ -15,8 +15,10 @@ mod admin;
 mod config;
 mod http;
 mod identity;
+mod invoices;
 mod manage;
 mod orders;
+mod qr;
 mod store;
 mod sync;
 mod terms;
@@ -217,6 +219,7 @@ async fn run() -> Result<(), String> {
     let site = Arc::new(site);
     // What an earlier run left open is decided before anything new.
     tokio::spawn(orders::keep(site.clone()));
+    tokio::spawn(invoices::keep(site.clone()));
     tokio::spawn(admin::serve(admin, site.clone()));
     // With --listen, which tests use, a peer from anywhere is talked to.
     let admit: fn(IpAddr) -> bool = if args.listen.is_some() { |_| true } else { http::on_the_mesh };

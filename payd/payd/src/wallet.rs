@@ -17,6 +17,11 @@
 //! wallet holds, and can find it again at the mints with any wallet that
 //! restores from a seed (NUT-13).
 //!
+//! What is paid by Lightning arrives the same way: the mint gives an invoice
+//! (a quote), and once that is paid the wallet mints ecash for it. A quote
+//! is locked to a key of the wallet's (NUT-20, where the mint has it), so
+//! that nobody else mints what was paid.
+//!
 //! What the wallet asks a mint to sign follows from the seed and a counter
 //! in the wallet's file. A file that is behind its seed's use (a new one, or
 //! an old copy put back) would ask for what the mint has signed already:
@@ -33,11 +38,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use cdk::amount::SplitTarget;
 use cdk::cdk_database::WalletDatabase;
 use cdk::mint_url::MintUrl;
+use cdk::nuts::nut00::KnownMethod;
+use cdk::nuts::nut04::MintMethodOptions;
 use cdk::nuts::{
-    BlindedMessage, CheckStateRequest, CurrencyUnit, PreMintSecrets, ProofsMethods, PublicKey, RestoreRequest, State,
-    Token,
+    BlindedMessage, CheckStateRequest, CurrencyUnit, MintQuoteState, PaymentMethod, PreMintSecrets, ProofsMethods,
+    PublicKey, RestoreRequest, SecretKey, State, Token,
 };
 use cdk::wallet::types::{
     KeysetLoadPolicy, OperationData, ReceiveSagaState, TransactionDirection, TransactionId, TransactionStatus,
@@ -119,6 +127,57 @@ pub enum Recorded {
     Received(u64, u64),
 }
 
+/// What a mint says of the invoices it gives, in sat.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Lightning {
+    /// The least and the most an invoice may be for.
+    least: u64,
+    most: u64,
+    /// Whether an invoice may say what it is for.
+    describes: bool,
+}
+
+/// An invoice of a mint's, and the quote it stands for there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Quote {
+    pub id: String,
+    /// The invoice: a BOLT11 payment request.
+    pub request: String,
+    /// When it ends, in Unix seconds.
+    pub expires: u64,
+    /// The key the quote is locked to, where the wallet made one.
+    pub key: Option<String>,
+}
+
+/// What a mint says of a quote.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Paid {
+    /// Its invoice is not paid.
+    No,
+    /// It is, and nothing was minted for it yet.
+    Yes,
+    /// It is, and this much was minted for it, in sat: for this wallet,
+    /// which alone knows the quote and holds its key.
+    Minted(u64),
+}
+
+impl Lightning {
+    /// What a mint's description of itself says of its invoices (NUT-04),
+    /// if it gives any for sat.
+    fn of(info: &cdk::nuts::MintInfo) -> Option<Lightning> {
+        let minting = &info.nuts.nut04;
+        minting.get_settings(&CurrencyUnit::Sat, &bolt11()).filter(|_| !minting.disabled).map(|its| Lightning {
+            least: its.min_amount.map_or(1, |least| least.to_u64().max(1)),
+            most: its.max_amount.map_or(u64::MAX, |most| most.to_u64()),
+            describes: matches!(its.options, Some(MintMethodOptions::Bolt11 { description: true })),
+        })
+    }
+}
+
+fn bolt11() -> PaymentMethod {
+    PaymentMethod::Known(KnownMethod::Bolt11)
+}
+
 fn said(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -187,8 +246,11 @@ pub struct Mint {
     look_ahead: AtomicBool,
     /// Told when this mint is to be reached again now.
     again: Arc<tokio::sync::Notify>,
-    /// One thing at a time at a mint: a token taken, or what was
-    /// interrupted put right, never both at once.
+    /// What the mint said of its invoices when it was last reached, if it
+    /// gives any for sat.
+    lightning: std::sync::Mutex<Option<Lightning>>,
+    /// One thing at a time at a mint: a token taken, an invoice asked for
+    /// or minted, or what was interrupted put right, never two at once.
     pub turn: tokio::sync::Mutex<()>,
 }
 
@@ -214,6 +276,8 @@ impl Mint {
             if !keysets.iter().any(|keyset| keyset.unit == CurrencyUnit::Sat) {
                 return Err("it has no keys for sat".to_string());
             }
+            // Whether it gives invoices, as it says itself (NUT-04).
+            *self.lightning.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Lightning::of(&info);
             if self.count_first.load(Ordering::Relaxed) || self.look_ahead.load(Ordering::Relaxed) {
                 let _turn = self.turn.lock().await;
                 if self.count_first.load(Ordering::Relaxed) || self.behind().await? {
@@ -461,6 +525,90 @@ impl Mint {
         Ok((holds, pending))
     }
 
+    /// Does the mint give invoices, as far as it has said: for `sat`, or
+    /// (for none) at all?
+    pub fn gives_invoices(&self, sat: Option<u64>) -> bool {
+        let lightning = *self.lightning.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        lightning.is_some_and(|its| sat.is_none_or(|sat| (its.least..=its.most).contains(&sat)))
+    }
+
+    /// Ask the mint for an invoice of `sat`, which says it is for `about`
+    /// where the mint lets an invoice say anything. The caller holds
+    /// [`Mint::turn`].
+    ///
+    /// The invoice is read here, and is one of exactly `sat`: a buyer is
+    /// shown nothing else.
+    pub async fn invoice(&self, sat: u64, about: &str) -> Result<Quote, String> {
+        let lightning = *self.lightning.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let describes = lightning.is_some_and(|its| its.describes);
+        let about = describes.then(|| about.to_string());
+        let quote = within(self.wallet.mint_quote(bolt11(), Some(cdk::Amount::from(sat)), about, None)).await?;
+        let invoice = cdk::Bolt11Invoice::from_str(&quote.request)
+            .map_err(|e| format!("what the mint gave is not an invoice: {e}"))?;
+        if invoice.amount_milli_satoshis() != sat.checked_mul(1000) {
+            return Err(format!("the mint's invoice is not for {sat} sat"));
+        }
+        // It ends when the mint says its quote does, or when the invoice
+        // itself does: whichever is first.
+        let ends = invoice.expires_at().map_or(u64::MAX, |ends| ends.as_secs());
+        let expires = if quote.expiry == 0 { ends } else { quote.expiry.min(ends) };
+        if expires == u64::MAX {
+            return Err("the mint's invoice does not say when it ends".into());
+        }
+        Ok(Quote {
+            id: quote.id,
+            request: quote.request,
+            expires,
+            key: quote.secret_key.as_ref().map(SecretKey::to_secret_hex),
+        })
+    }
+
+    /// What the mint says of `quote`, which `key` is locked to. The caller
+    /// holds [`Mint::turn`].
+    ///
+    /// A quote the wallet's file does not know (the file is a new one, or
+    /// an old one put back) is learnt from the mint again, and its key from
+    /// what the order kept: so what was paid can be minted whatever became
+    /// of the wallet's file. Where the wallet was interrupted in minting
+    /// for the quote, it finishes that here.
+    pub async fn quote_state(&self, quote: &str, key: Option<&str>) -> Result<Paid, String> {
+        let known = match self.db.get_mint_quote(quote).await.map_err(said)? {
+            Some(known) => known,
+            None => within(self.wallet.fetch_mint_quote(quote, Some(bolt11()))).await?,
+        };
+        // Its key, whenever the wallet's file has the quote without it: it
+        // is learnt from the mint without one, and may have been left so.
+        if known.secret_key.is_none()
+            && let Some(key) = key
+        {
+            let mut with_key = known;
+            with_key.secret_key = Some(SecretKey::from_hex(key).map_err(said)?);
+            self.db.add_mint_quote(with_key).await.map_err(said)?;
+        }
+        let now = within(self.wallet.check_mint_quote_status(quote)).await?;
+        Ok(match now.state {
+            MintQuoteState::Unpaid => Paid::No,
+            MintQuoteState::Paid => Paid::Yes,
+            MintQuoteState::Issued => Paid::Minted(now.amount_issued.to_u64()),
+        })
+    }
+
+    /// Have the wallet's file know `quote` without its key: as when it
+    /// learnt the quote from the mint and stopped there.
+    #[cfg(test)]
+    pub async fn forget_key(&self, quote: &str) {
+        let mut known = self.db.get_mint_quote(quote).await.unwrap().unwrap();
+        known.secret_key = None;
+        self.db.add_mint_quote(known).await.unwrap();
+    }
+
+    /// Mint what `quote`'s invoice paid for. What arrived, in sat. The
+    /// caller holds [`Mint::turn`], and sets the time it may take.
+    pub async fn mint_paid(&self, quote: &str) -> Result<u64, cdk::Error> {
+        let proofs = self.wallet.mint(quote, SplitTarget::default(), None).await?;
+        Ok(proofs.total_amount()?.to_u64())
+    }
+
     /// Find again, from the seed, what this wallet has at the mint
     /// (NUT-09). The caller holds [`Mint::turn`].
     pub async fn count_again(&self) -> Result<String, String> {
@@ -540,6 +688,11 @@ impl Wallets {
             }
             let wallet = Wallet::new(name, CurrencyUnit::Sat, db.clone(), seed, None)
                 .map_err(|e| format!("MINTS: {name}: {e}"))?;
+            // What the mint said of its invoices when it was last reached,
+            // as the wallet's file remembers it: so that what the exit says
+            // it sells for does not change with every start.
+            let remembered = db.get_mint(url.clone()).await.ok().flatten();
+            let lightning = remembered.as_ref().and_then(Lightning::of);
             opened.push(Arc::new(Mint {
                 name: name.clone(),
                 url,
@@ -551,6 +704,7 @@ impl Wallets {
                 marker: marker(name),
                 look_ahead: AtomicBool::new(true),
                 again: again.clone(),
+                lightning: std::sync::Mutex::new(lightning),
                 turn: tokio::sync::Mutex::new(()),
             }));
         }
@@ -560,6 +714,11 @@ impl Wallets {
     /// Whether a token is taken at any mint now.
     pub fn ready(&self) -> bool {
         self.mints.iter().any(|mint| mint.ready())
+    }
+
+    /// Whether any mint that is reached now gives invoices.
+    pub fn invoicing(&self) -> bool {
+        self.mints.iter().any(|mint| mint.ready() && mint.gives_invoices(None))
     }
 
     /// The wallet at the mint `token` names, which must be an accepted

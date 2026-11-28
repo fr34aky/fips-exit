@@ -391,13 +391,18 @@ IPv4 address derived from the client's fips address.
   before it was reached are honoured after.
 - **Sending on to a Lightning address trusts that address's host**, as
   paying one always does: it gives the invoice. The wallet library checks
-  the invoice against the amount asked and the address's own description,
-  and not who is paid by it. That step is the one part of paying out that
+  the invoice against the amount asked, and nothing else of it: not who is
+  paid by it, and (in the version used here) not that it carries the
+  address's own description, which it only remarks on. That step is the one part of paying out that
   the tests here do not reach: the library takes only a public host over
   HTTPS, so the tests send the wallet on to invoices of their own making.
 - **A token that was handed out and lost** can be taken back only while
-  nobody has redeemed it, and its text is in the wallet's file until then:
-  whoever reads that file has it, as they have the seed.
+  nobody has redeemed it, and its text is in the service's store until
+  then (and in the wallet's file while the wallet remembers it): whoever
+  reads those has it, as they have the seed. The store, and not the
+  wallet's file, is what says which tokens are out: the wallet library
+  forgets one when it puts itself right or counts again, and would then
+  take its proofs for the wallet's own.
 - **Two wallets on one seed.** A copy of the seed in a second service, or
   in another wallet while this one runs, makes each ask the mint for what
   it signed for the other. That is found out (the mint refuses, selling

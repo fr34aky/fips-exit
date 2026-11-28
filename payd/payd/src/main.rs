@@ -219,6 +219,9 @@ async fn run() -> Result<(), String> {
         tokio::spawn(wallets.keep());
     }
     let site = Arc::new(site);
+    // Which tokens are out, and what each mint's wallet holds, before
+    // anything is sold: a wallet that is full sells nothing from the start.
+    payouts::start(&site).await;
     // What an earlier run left open is decided before anything new.
     tokio::spawn(orders::keep(site.clone()));
     tokio::spawn(invoices::keep(site.clone()));

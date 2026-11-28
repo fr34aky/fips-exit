@@ -57,10 +57,10 @@ pub struct Config {
     pub sweep_above: u64,
 }
 
-/// What the wallet may hold at a mint when the config does not say
-/// (`WALLET_CAP`): a wallet on a server is protected by holding little.
 /// The most a number of sat in the config may be: all there will ever be.
 const MAX_SAT: u64 = 2_100_000_000_000_000;
+/// What the wallet may hold at a mint when the config does not say
+/// (`WALLET_CAP`): a wallet on a server is protected by holding little.
 pub const DEFAULT_WALLET_CAP: u64 = 500_000;
 /// Above how much the wallet is sent on when the config names where to and
 /// not above how much (`SWEEP_ABOVE`), and the least that may be.

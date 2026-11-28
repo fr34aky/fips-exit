@@ -389,10 +389,14 @@ each whether it happened; one whose end is not known counts as gone, and
 the mint is asked until it says. What the wallet holds at a mint is what
 was sold there less what left it, and that sum is what tells, after an
 answer of the mint's was lost, whether the wallet has to count again from
-its seed. For sending on, the address's host is asked for an invoice (the
-only thing asked of anyone but a mint), the library checks it against the
-amount and the address, and a mint that wants more than a twentieth and
-20 sat for paying it is not paid by itself.
+its seed. A token that is out is kept in the service's store, with its
+text and its proofs: the wallet's file forgets one when the wallet puts
+itself right, and what is out must be listed, asked about, taken back and
+kept from the wallet's own whatever that file remembers. For sending on,
+the address's host is asked for an invoice (the only thing asked of anyone
+but a mint), the library checks it against the amount, and a mint that
+wants more than a twentieth and 20 sat for paying it is not paid by
+itself.
 
 ### State, and what a crash may not break
 

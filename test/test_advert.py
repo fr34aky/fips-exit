@@ -660,6 +660,24 @@ class Command(unittest.TestCase):
         self.assertIn("…", rows[1])
         self.assertLess(len(rows[1]), 160)
         self.assertEqual(rows[2].split()[:2], ["w0123456789abcdef", "back"])
+        # No answer to a command that pays is not "not paid": the service was asked, and may pay yet.
+        with unittest.mock.patch.object(x, "payd", wraps=x.payd) as asked:
+            quiet = socket.socket(socket.AF_UNIX)
+            path = x.PAYD_ADMIN + ".quiet"
+            quiet.bind(path)
+            quiet.listen(1)
+            self.addCleanup(quiet.close)
+            with unittest.mock.patch.object(x, "PAYD_ADMIN", path):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as stopped:
+                    x.payd("sweep", wait=0.3, pays=True)
+                self.assertEqual(stopped.exception.code, 3)
+                self.assertIn("may pay yet", err.getvalue())
+                # One that pays nothing just failed.
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as stopped:
+                    x.payd("wallet", wait=0.3)
+                self.assertNotEqual(stopped.exception.code, 3)
+            self.assertTrue(asked.called)
         # A word that is no command of the wallet's is the usage, not a line to the service.
         with self.assertRaises(TypeError):
             x.cmd_wallet("empty")

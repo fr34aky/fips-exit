@@ -1405,21 +1405,25 @@ def cmd_status():
                     print("  nothing is sold: no mint is named (MINTS), or the service says nothing of its wallet")
 
 
-def payd(line, fatal=True, wait=10):
+def payd(line, fatal=True, wait=10, pays=False):
     """One command to the payment service's socket for the operator; the
     lines of its answer, the last beginning `ok`, or the script stops with
     what was said. With `fatal` false, None in place of stopping. `wait`:
     how long it may take, in seconds (a mint is asked for what leaves the
-    wallet, and a payment takes its time)."""
+    wallet, and a payment takes its time). `pays`: the command pays
+    something, so that no answer to it is not "nothing happened": the
+    service goes on with it, and the script ends with 3, not known."""
     def stop(why):
         if fatal:
             die(why)
 
     peer = socket.socket(socket.AF_UNIX)
     peer.settimeout(wait)
+    sent = False
     try:
         peer.connect(PAYD_ADMIN)
         peer.sendall(line.encode() + b"\n")
+        sent = True
         peer.shutdown(socket.SHUT_WR)
         answer = b""
         while True:
@@ -1430,6 +1434,11 @@ def payd(line, fatal=True, wait=10):
             if len(answer) > 4 << 20:
                 raise OSError("an answer without end")
     except OSError as error:
+        if pays and sent:
+            print(f"fips-exit: the payment service did not answer in time ({error.strerror or error}). It was asked, "
+                  "and may pay yet: what became of it is in `fips-exit wallet out`. Do not pay the same again "
+                  "before looking there.", file=sys.stderr)
+            sys.exit(3)
         return stop(f"the payment service does not answer on {PAYD_ADMIN} ({error.strerror or error}): "
                     "is it running? (systemctl start fips-exit-payd)")
     finally:
@@ -1569,11 +1578,11 @@ def wallet_pay(invoice, *more):
         if input("Pay it? [y/N] ").strip().lower() not in ("y", "yes"):
             print("not paid")
             return
-    left_said(payd(f"pay {word_of(quote, 'a quote')} {word_of(mint, 'a mint')}", wait=150))
+    left_said(payd(f"pay {word_of(quote, 'a quote')} {word_of(mint, 'a mint')}", wait=150, pays=True))
 
 
 def wallet_sweep(mint=None):
-    left_said(payd("sweep" + (f" {word_of(mint, 'a mint')}" if mint else ""), wait=300))
+    left_said(payd("sweep" + (f" {word_of(mint, 'a mint')}" if mint else ""), wait=300, pays=True))
 
 
 def wallet_out():

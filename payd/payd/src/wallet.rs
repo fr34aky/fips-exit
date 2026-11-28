@@ -298,6 +298,10 @@ pub struct Mint {
     /// most it may hold (0: any amount), from where on nothing is sold.
     held: AtomicU64,
     cap: AtomicU64,
+    /// The proofs of the tokens that were handed out here and that nobody
+    /// has redeemed (each token's `Y`s, as JSON): somebody else's, however
+    /// unspent the mint calls them.
+    out: std::sync::Mutex<Vec<String>>,
     /// One thing at a time at a mint: a token taken, an invoice asked for
     /// or minted, or what was interrupted put right, never two at once.
     pub turn: tokio::sync::Mutex<()>,
@@ -627,36 +631,23 @@ impl Mint {
         })
     }
 
-    /// The tokens handed out that nobody has redeemed: each by its name,
-    /// with its text, and whether the mint could be asked about it just
-    /// now. Those the mint says were redeemed are struck off the wallet's
-    /// list by asking; one it could not be asked about is listed all the
-    /// same, since its text is here. The caller holds [`Mint::turn`].
-    pub async fn tokens_out(&self) -> Result<Vec<(String, String, bool)>, String> {
-        let mut out = Vec::new();
-        for name in self.wallet.get_pending_sends().await.map_err(said)? {
-            let asked = match within(self.wallet.check_send_status(name)).await {
-                Ok(true) => continue,
-                Ok(false) => true,
-                Err(_) => false,
-            };
-            let saga = self.db.get_saga(&name).await.map_err(said)?;
-            if let Some(OperationData::Send(data)) = saga.map(|saga| saga.data)
-                && let Some(token) = data.token
-            {
-                out.push((name.to_string(), token, asked));
-            }
-        }
-        Ok(out)
+    /// The text of the token the wallet keeps as `name`, while it keeps it.
+    pub async fn token_text(&self, name: &str) -> Result<Option<String>, String> {
+        let Ok(name) = name.parse() else { return Ok(None) };
+        let saga = self.db.get_saga(&name).await.map_err(said)?.filter(|saga| saga.mint_url == self.url);
+        Ok(match saga.map(|saga| saga.data) {
+            Some(OperationData::Send(data)) => data.token,
+            _ => None,
+        })
     }
 
-    /// Take back the token handed out as `name`, which nobody has redeemed:
-    /// what it was worth is the wallet's again, less what the mint takes for
-    /// the exchange. What came back, in sat. The caller holds
-    /// [`Mint::turn`].
-    pub async fn token_back(&self, name: &str) -> Result<u64, String> {
-        let name = name.parse().map_err(|_| "not a token's name".to_string())?;
-        Ok(within(self.wallet.revoke_send(name)).await?.to_u64())
+    /// Tell the wallet that the token it keeps as `name` is out no more
+    /// (redeemed, or taken back): it strikes it off by asking the mint.
+    /// What the wallet keeps of a token is not gone by, so this may fail.
+    pub async fn token_struck(&self, name: &str) {
+        if let Ok(name) = name.parse() {
+            let _ = within(self.wallet.check_send_status(name)).await;
+        }
     }
 
     /// What it takes to pay `invoice` from the wallet, as the mint quotes
@@ -843,6 +834,25 @@ impl Mint {
         Ok(proofs.total_amount()?.to_u64())
     }
 
+    /// The tokens that are out here, by their proofs (each token's `Y`s as
+    /// JSON): what [`Mint::count_again`] must not take for the wallet's.
+    pub fn set_out(&self, ys: Vec<String>) {
+        *self.out.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = ys;
+    }
+
+    /// A token that was handed out and not redeemed is unspent at the mint,
+    /// and counting takes whatever is unspent for the wallet's own. It is
+    /// its holder's: its proofs are put back as out, so that nothing is
+    /// spent from under them.
+    async fn keep_out(&self) -> Result<(), String> {
+        let out = self.out.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        for ys in out {
+            let ys: Vec<PublicKey> = serde_json::from_str(&ys).map_err(said)?;
+            self.db.update_proofs_state(ys, State::PendingSpent).await.map_err(said)?;
+        }
+        Ok(())
+    }
+
     /// Find again, from the seed, what this wallet has at the mint
     /// (NUT-09). The caller holds [`Mint::turn`].
     pub async fn count_again(&self) -> Result<String, String> {
@@ -850,20 +860,7 @@ impl Mint {
             .await
             .map_err(|_| "the mint did not answer in time".to_string())?
             .map_err(said)?;
-        // A token that was handed out and not redeemed is unspent at the
-        // mint, and counting takes whatever is unspent for the wallet's
-        // own. It is its holder's: put back as out, so that it is not
-        // spent from under them.
-        for saga in self.db.get_incomplete_sagas().await.map_err(said)? {
-            if saga.mint_url == self.url
-                && let (WalletSagaState::Send(SendSagaState::TokenCreated), OperationData::Send(data)) =
-                    (&saga.state, &saga.data)
-                && let Some(proofs) = &data.proofs
-            {
-                let ys = proofs.ys().map_err(said)?;
-                self.db.update_proofs_state(ys, State::PendingSpent).await.map_err(said)?;
-            }
-        }
+        self.keep_out().await?;
         Ok(format!("{} sat found again at the mint, {} spent, {} under way", found.unspent, found.spent, found.pending))
     }
 }
@@ -955,6 +952,7 @@ impl Wallets {
                 lightning: std::sync::Mutex::new(lightning),
                 held: AtomicU64::new(0),
                 cap: AtomicU64::new(0),
+                out: std::sync::Mutex::new(Vec::new()),
                 turn: tokio::sync::Mutex::new(()),
             }));
         }

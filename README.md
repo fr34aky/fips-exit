@@ -332,16 +332,18 @@ sudo fips-exit wallet out                        # what left the wallet, and wha
   redeems it, as near as the mint's fee for that lets it be, and that fee
   is taken out of the exit's wallet with it. The command prints the text
   alone, so that it can be piped; what else it says goes to standard error.
-  Until somebody redeems it the wallet keeps its text (`wallet tokens`,
-  also while its mint cannot be asked), and it can be taken back, which
-  makes that text worthless. A token that is out stays its holder's when
-  the wallet counts again from its seed.
+  Until somebody redeems it the service keeps its text (`wallet tokens`,
+  also while its mint cannot be asked), and it can be taken back by the
+  name it is listed under, which makes that text worthless. A token that
+  is out stays its holder's when the wallet counts again from its seed.
 - **An invoice** is paid by the mint with what the wallet holds (a melt,
   NUT-05). The mint is asked what it takes first: the amount, and the most
   the mint may keep on top for the payment's fee (what it does not use
   comes back). It is paid when you say so: `--yes` for a script, which can
   go by how the command ends: 0 when it is paid, 1 when it is not, 3 when
-  the mint has not said yet. An invoice is paid once: one that a
+  that is not known yet (the mint has not said, or the service did not
+  answer in time and goes on with it: `wallet out` says what became of
+  it). An invoice is paid once: one that a
   withdrawal paid, or is paying, is not quoted again. If the mint has not
   said after a minute what became of a payment, it is written down as
   begun, counts as gone, and the mint is asked about it every minute until
@@ -351,7 +353,8 @@ sudo fips-exit wallet out                        # what left the wallet, and wha
   starts a payment of all that is held there, less a fiftieth and 4 sat
   left for the mint's fee: the address's host is asked for an invoice of
   that much, the wallet library checks that the invoice is for that much
-  and for that address, and the mint pays it. A mint that asks for more
+  (and for nothing else: who an invoice pays is its host's word), and the
+  mint pays it. A mint that asks for more
   than a twentieth and 20 sat for it is not paid by itself. After a failure
   nothing is sent on from that mint for a quarter of an hour, and while a
   payment is under way there, nothing else is. The service then talks to

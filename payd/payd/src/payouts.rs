@@ -30,7 +30,7 @@ use crate::http::Site;
 use crate::orders::Desk;
 use crate::store::{NewWithdrawal, Withdrawal};
 use crate::sync::unix_now;
-use crate::wallet::{Left, Mint, PAY_TIME, Payable, TokenState};
+use crate::wallet::{Inputs, Left, MINT_TIME, Mint, PAY_TIME, Payable, Recorded, TokenState};
 
 /// The kinds of withdrawal, as they are kept.
 pub const TOKEN: &str = "token";
@@ -105,6 +105,45 @@ async fn gone(mint: &Mint, before: u64) -> u64 {
     before.saturating_sub(mint.balance().await.map_or(before, |held| held.0))
 }
 
+/// The mint's wallet is told which tokens are out there, as the store has
+/// them: what it must not take for its own when it counts again.
+pub fn remember_out(site: &Site, mint: &Mint) {
+    if let Ok(out) = site.store.tokens_out(Some(&mint.name)) {
+        mint.set_out(out.into_iter().filter_map(|token| token.ys).collect());
+    }
+}
+
+/// Before anything is sold or sent on: which tokens are out at each mint,
+/// and what each mint's wallet holds (for whether it is full).
+pub async fn start(site: &Site) {
+    let Some(desk) = &site.desk else { return };
+    for mint in &desk.wallets.mints {
+        remember_out(site, mint);
+        let _ = mint.balance().await;
+    }
+}
+
+/// What the wallet's record of taking a token back is kept under.
+fn back_tag(id: &str) -> String {
+    format!("back:{id}")
+}
+
+/// The token of withdrawal `id` is made, and its text is `text`: written
+/// down as out, with its proofs, for `cost` (or, where that was not
+/// measured, for what the token is worth). What it was written down for.
+async fn out(site: &Site, mint: &Mint, id: &str, text: &str, cost: Option<u64>) -> Result<u64, String> {
+    let looked = match crate::wallet::parse(text) {
+        Ok((token, _)) => mint.look(&token).await.ok(),
+        Err(_) => None,
+    };
+    // Its text is kept whatever can be said of it besides.
+    let (worth, ys) = looked.map_or((0, "[]".to_string()), |look| (look.value, look.inputs));
+    let cost = cost.unwrap_or(worth);
+    stored(site.store.withdrawal_token(id, text, &ys, cost, unix_now()))?;
+    remember_out(site, mint);
+    Ok(cost)
+}
+
 /// Hand out a token worth `sat` from the wallet at a mint. The withdrawal's
 /// name, what it cost, and the token's text.
 pub async fn token(site: &Site, named: Option<&str>, sat: u64) -> Result<(String, u64, String), String> {
@@ -132,8 +171,7 @@ pub async fn token(site: &Site, named: Option<&str>, sat: u64) -> Result<(String
     let Some((id, name)) = begun else { return Err(made.err().unwrap_or_else(|| "no token was made".into())) };
     let why = match made {
         Ok(text) => {
-            let cost = gone(mint, before).await;
-            stored(site.store.withdrawal_end(&id, true, cost, unix_now()))?;
+            let cost = out(site, mint, &id, &text, Some(gone(mint, before).await)).await?;
             eprintln!("fips-exit-payd: withdrawal {id}: a token of {sat} sat of {} was handed out", mint.name);
             return Ok((id, cost, text));
         }
@@ -142,12 +180,12 @@ pub async fn token(site: &Site, named: Option<&str>, sat: u64) -> Result<(String
     // Not made, as far as was heard: the wallet may be in the middle of
     // it. It is let to finish, and what it has then says what happened.
     let finished = crate::orders::finish(site, mint).await;
-    match mint.token_state(&name).await {
-        Ok(TokenState::Out) => {
-            stored(site.store.withdrawal_end(&id, true, gone(mint, before).await, unix_now()))?;
+    match (mint.token_state(&name).await, mint.token_text(&name).await) {
+        (Ok(TokenState::Out), Ok(Some(text))) => {
+            out(site, mint, &id, &text, Some(gone(mint, before).await)).await?;
             Err(format!("{why}. The token was made all the same: its text is among `wallet tokens` (withdrawal {id})"))
         }
-        Ok(TokenState::Nothing) if finished => {
+        (Ok(TokenState::Nothing), _) if finished => {
             // What the mint took for the try, if it took anything.
             stored(site.store.withdrawal_end(&id, false, gone(mint, before).await, unix_now()))?;
             Err(why)
@@ -158,48 +196,136 @@ pub async fn token(site: &Site, named: Option<&str>, sat: u64) -> Result<(String
     }
 }
 
-/// The tokens handed out at each mint that nobody has redeemed: the mint's
-/// name, the token's name, its text, and whether the mint could be asked
-/// about it just now. A mint that cannot be asked keeps nothing from being
-/// listed: the text of a token is in the wallet's file.
-pub async fn tokens(site: &Site) -> Result<Vec<(String, String, String, bool)>, String> {
-    let mut out = Vec::new();
-    for mint in &desk(site)?.wallets.mints {
-        let _turn = mint.turn.lock().await;
-        for (name, text, asked) in mint.tokens_out().await? {
-            out.push((mint.name.clone(), name, text, asked));
-        }
-        let _ = mint.balance().await;
+/// The proofs of token `out` are spent at the mint: by this wallet, if it
+/// was taking the token back and did not hear of it, or else by whoever
+/// had the token. Written down as what it was; what came back, if it was
+/// taken back. The caller holds the mint's turn.
+async fn spent(site: &Site, mint: &Mint, token: &Withdrawal) -> Result<Option<u64>, String> {
+    let tag = back_tag(&token.id);
+    let mut recorded = mint.recorded(&tag).await?;
+    if recorded == Recorded::Pending && crate::orders::finish(site, mint).await {
+        recorded = mint.recorded(&tag).await?;
     }
-    Ok(out)
+    let back = match recorded {
+        Recorded::Received(sat, _) => {
+            stored(site.store.withdrawal_back(&token.id, sat, unix_now()))?;
+            eprintln!("fips-exit-payd: the token of withdrawal {} was taken back: {sat} sat", token.id);
+            Some(sat)
+        }
+        Recorded::Pending => return Err("whether it came back is not known yet".into()),
+        Recorded::No => {
+            stored(site.store.withdrawal_redeemed(&token.id))?;
+            None
+        }
+    };
+    if let Some(name) = &token.quote {
+        mint.token_struck(name).await;
+    }
+    remember_out(site, mint);
+    let _ = mint.balance().await;
+    Ok(back)
 }
 
-/// Take back the token that was handed out as `name`, which nobody has
-/// redeemed. What came back, in sat.
-pub async fn take_back(site: &Site, name: &str) -> Result<u64, String> {
-    for mint in &desk(site)?.wallets.mints {
-        let _turn = mint.turn.lock().await;
-        if mint.token_state(name).await? == TokenState::Nothing {
-            continue;
-        }
-        let (before, _) = mint.balance().await?;
-        let taken = mint.token_back(name).await;
-        // Not heard that it came back: the mint may have exchanged it all
-        // the same. The wallet is let to finish, and what it holds says.
-        if taken.is_err() {
-            crate::orders::finish(site, mint).await;
-        }
-        let after = mint.balance().await.map_or(before, |held| held.0);
-        let back = match taken {
-            Ok(back) => back,
-            Err(_) if after > before => after - before,
-            Err(why) => return Err(why),
-        };
-        stored(site.store.withdrawal_back(name, back, unix_now()))?;
-        eprintln!("fips-exit-payd: the token {name} of {} was taken back: {back} sat", mint.name);
-        return Ok(back);
+/// A token whose withdrawal is written as begun, and which the wallet has
+/// made (the service stopped in between): written down as out, with its
+/// text. Nothing is asked of the mint. Whether it was one.
+async fn adopt(site: &Site, mint: &Mint, begun: &Withdrawal) -> bool {
+    let Some(name) = &begun.quote else { return false };
+    if begun.kind != TOKEN || mint.token_state(name).await != Ok(TokenState::Out) {
+        return false;
     }
-    Err("no token of that name is out: it was redeemed, or never made".into())
+    match mint.token_text(name).await {
+        // What it cost was not measured: what it is worth.
+        Ok(Some(text)) => out(site, mint, &begun.id, &text, None).await.is_ok(),
+        _ => false,
+    }
+}
+
+/// The tokens that are out, at each mint: the mint's name, the name of the
+/// token's withdrawal, its text, and whether the mint could be asked about
+/// it just now. One the mint says is spent is out no more, and not listed.
+/// A mint that cannot be asked keeps nothing from being listed: the text
+/// of a token is kept here.
+pub async fn tokens(site: &Site) -> Result<Vec<(String, String, String, bool)>, String> {
+    let desk = desk(site)?;
+    let mut listed = Vec::new();
+    for mint in &desk.wallets.mints {
+        let _turn = mint.turn.lock().await;
+        for begun in stored(site.store.withdrawals_begun(&mint.name))? {
+            adopt(site, mint, &begun).await;
+        }
+        // A mint that does not answer is asked once, not once for a token.
+        let mut ask = mint.ready();
+        for token in stored(site.store.tokens_out(Some(&mint.name)))? {
+            let (Some(text), Some(ys)) = (&token.token, &token.ys) else { continue };
+            let mut asked = false;
+            if ask {
+                match mint.inputs(ys).await {
+                    Ok(Inputs::Spent) => match spent(site, mint, &token).await {
+                        Ok(_) => continue,
+                        Err(_) => asked = true,
+                    },
+                    Ok(_) => asked = true,
+                    Err(_) => ask = false,
+                }
+            }
+            listed.push((mint.name.clone(), token.id.clone(), text.clone(), asked));
+        }
+    }
+    // Those of a mint that is not named any more: their text all the same.
+    for token in stored(site.store.tokens_out(None))? {
+        if desk.wallets.named(&token.mint).is_none()
+            && let Some(text) = token.token
+        {
+            listed.push((token.mint, token.id, text, false));
+        }
+    }
+    Ok(listed)
+}
+
+/// Take back the token of withdrawal `id`, which nobody has redeemed: it
+/// is exchanged at its mint for what the wallet holds again, and its text
+/// is worth nothing after. What came back, in sat.
+pub async fn take_back(site: &Site, id: &str) -> Result<u64, String> {
+    let none = "no token of that name is out: it was redeemed, taken back, or never made";
+    let token = stored(site.store.tokens_out(None))?.into_iter().find(|token| token.id == id).ok_or(none)?;
+    let mint = desk(site)?
+        .wallets
+        .named(&token.mint)
+        .ok_or_else(|| format!("its mint, {}, is not in MINTS any more", token.mint))?;
+    let (Some(text), Some(ys)) = (&token.token, &token.ys) else { return Err(none.into()) };
+    let _turn = mint.turn.lock().await;
+    let tag = back_tag(&token.id);
+    // Asked before, and not heard of: what became of that, first.
+    if mint.recorded(&tag).await? != Recorded::No {
+        return spent(site, mint, &token).await?.ok_or_else(|| none.to_string());
+    }
+    let why = match tokio::time::timeout(MINT_TIME, mint.receive(text, &tag)).await {
+        Ok(Ok(back)) => {
+            stored(site.store.withdrawal_back(&token.id, back, unix_now()))?;
+            if let Some(name) = &token.quote {
+                mint.token_struck(name).await;
+            }
+            remember_out(site, mint);
+            let _ = mint.balance().await;
+            eprintln!("fips-exit-payd: the token of withdrawal {} was taken back: {back} sat", token.id);
+            return Ok(back);
+        }
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => "the mint did not answer in time".to_string(),
+    };
+    // Not heard that it came back: the mint may have exchanged it all the
+    // same. The wallet is let to finish, and the mint says whether the
+    // token is spent: by this wallet, then, or by whoever had it.
+    crate::orders::finish(site, mint).await;
+    match mint.inputs(ys).await {
+        Ok(Inputs::Spent) => match spent(site, mint, &token).await? {
+            Some(back) => Ok(back),
+            None => Err("it was redeemed already, by whoever had it".into()),
+        },
+        Ok(_) => Err(format!("{why}. It is out still, and can be taken back again")),
+        Err(_) => Err(format!("{why}. Whether it came back is not known yet: `wallet out` says so once it is")),
+    }
 }
 
 /// An invoice as it is kept and compared: in small letters, which is the
@@ -289,26 +415,28 @@ pub async fn pay_quoted(site: &Site, named: Option<&str>, quote: &str) -> Result
 /// Ask `mint` what became of what was begun there and has no known end. How
 /// much is still under way.
 pub async fn settle(site: &Site, mint: &Mint) -> usize {
-    let begun = match site.store.withdrawals_begun(&mint.name) {
-        Ok(begun) if !begun.is_empty() => begun,
-        Ok(_) => return 0,
-        Err(e) => {
+    let (begun, out) = match (site.store.withdrawals_begun(&mint.name), site.store.tokens_out(Some(&mint.name))) {
+        (Ok(begun), Ok(out)) if !(begun.is_empty() && out.is_empty()) => (begun, out),
+        (Ok(_), Ok(_)) => return 0,
+        (Err(e), _) | (_, Err(e)) => {
             eprintln!("fips-exit-payd: the withdrawals could not be read: {e}");
             return 0;
         }
     };
     let _turn = mint.turn.lock().await;
     let mut under_way = 0;
+    // A token that was being taken back when that was last heard of: what
+    // the wallet's record of it says now.
+    for token in &out {
+        if matches!(mint.recorded(&back_tag(&token.id)).await, Ok(Recorded::Pending | Recorded::Received(..)))
+            && spent(site, mint, token).await.is_err()
+        {
+            under_way += 1;
+        }
+    }
     for withdrawal in &begun {
         let Some(reference) = &withdrawal.quote else { continue };
-        let Ok((before, _)) = mint.balance().await else {
-            under_way += 1;
-            continue;
-        };
-        // Whether it is done, or came to nothing; None while that is not
-        // known. What came back to the wallet by asking is taken off what
-        // it was written down to cost.
-        let ended = if withdrawal.kind == TOKEN {
+        if withdrawal.kind == TOKEN {
             // A token: made if the wallet keeps it. One the wallet was in
             // the middle of making is let to be finished first.
             let mut state = mint.token_state(reference).await;
@@ -316,21 +444,40 @@ pub async fn settle(site: &Site, mint: &Mint) -> usize {
                 state = mint.token_state(reference).await;
             }
             match state {
-                Ok(TokenState::Out) => Some(true),
-                Ok(TokenState::Nothing) => Some(false),
-                Ok(TokenState::Unfinished) | Err(_) => None,
+                Ok(TokenState::Out) if adopt(site, mint, withdrawal).await => eprintln!(
+                    "fips-exit-payd: withdrawal {}: a token of {} sat of {} was made: it is among those that are out",
+                    withdrawal.id, withdrawal.sat, mint.name
+                ),
+                // Never made, as far as the wallet knows. Nobody was given
+                // its text (a token is written down as out before that),
+                // so whatever the wallet holds for it is the wallet's:
+                // found again from the seed if it is missing.
+                Ok(TokenState::Nothing) => {
+                    if site.store.withdrawal_end(&withdrawal.id, false, 0, unix_now()).is_err() {
+                        under_way += 1;
+                        continue;
+                    }
+                    eprintln!("fips-exit-payd: withdrawal {}: no token was made", withdrawal.id);
+                    crate::orders::found_again(site, mint).await;
+                }
+                _ => under_way += 1,
             }
-        } else {
-            match mint.payment(reference).await {
-                Ok(Left::Paid { .. }) => Some(true),
-                Ok(Left::Not(_)) => Some(false),
-                Ok(Left::Pending) | Err(_) => None,
-            }
-        };
-        let Some(done) = ended else {
+            continue;
+        }
+        let Ok((before, _)) = mint.balance().await else {
             under_way += 1;
             continue;
         };
+        let done = match mint.payment(reference).await {
+            Ok(Left::Paid { .. }) => true,
+            Ok(Left::Not(_)) => false,
+            Ok(Left::Pending) | Err(_) => {
+                under_way += 1;
+                continue;
+            }
+        };
+        // What came back to the wallet by asking is taken off what was
+        // held back for it.
         let back = mint.balance().await.map_or(0, |held| held.0.saturating_sub(before));
         let cost = if done { withdrawal.cost_sat.saturating_sub(back) } else { 0 };
         if let Err(e) = site.store.withdrawal_end(&withdrawal.id, done, cost, unix_now()) {
@@ -436,14 +583,11 @@ pub async fn keep(site: Arc<Site>) {
             }
             // What is under way, whether or not anything is sent on.
             settle(&site, mint).await;
-            // Now and then: which of the tokens handed out were redeemed,
-            // so that they do not count as under way for ever.
-            if round.is_multiple_of(TOKENS_EVERY) {
-                let _turn = mint.turn.lock().await;
-                let _ = mint.tokens_out().await;
-                let _ = mint.balance().await;
-            }
             let _ = sweep(&site, &desk, mint, false).await;
+        }
+        // Now and then: which of the tokens that are out were redeemed.
+        if round.is_multiple_of(TOKENS_EVERY) {
+            let _ = tokens(&site).await;
         }
         round += 1;
         tokio::time::sleep(desk.sweeping.every).await;
@@ -522,6 +666,124 @@ mod tests {
         w.proxy.go_away();
         let out = tokens(&both).await.unwrap();
         assert_eq!((out.len(), out[0].0.as_str()), (1, another.as_str()));
+    }
+
+    /// What the wallet's file remembers of a token is not what is gone by:
+    /// the wallet forgets one when it puts itself right, or counts again.
+    /// A token that is out is listed, kept from the wallet's own, and taken
+    /// back all the same.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_is_out_whatever_the_wallets_file_remembers_of_it() {
+        let w = world(0, GIVE_UP).await;
+        sold(&w).await;
+        // 300 of 1564 is made by exchanging what the wallet holds.
+        let (id, _, text) = token(&w.site, None, 300).await.unwrap();
+        let mint = w.the_mint();
+        for _ in 0..2 {
+            {
+                let _turn = mint.turn.lock().await;
+                assert!(crate::orders::finish(&w.site, mint).await, "the wallet puts itself right");
+                mint.count_again().await.unwrap();
+                assert!(crate::orders::finish(&w.site, mint).await);
+            }
+            assert_eq!(w.holds().await, 1264, "what is out is not the wallet's again");
+            let out = tokens(&w.site).await.unwrap();
+            assert_eq!(out.len(), 1, "and it is out still");
+            assert_eq!((out[0].1.as_str(), out[0].2.as_str(), out[0].3), (id.as_str(), text.as_str(), true));
+        }
+        the_books_agree(&w).await;
+        assert_eq!(take_back(&w.site, &id).await, Ok(300));
+        assert_eq!(w.holds().await, 1564);
+        assert!(!w.still_good(&text).await);
+        the_books_agree(&w).await;
+    }
+
+    /// The service stopped between a token being made and that being
+    /// written down: the token is found in the wallet, written down as out
+    /// for what it is worth, and stays written as made once it is redeemed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_made_and_not_written_down_is_found() {
+        let w = world(0, GIVE_UP).await;
+        sold(&w).await;
+        let mint = w.the_mint();
+        let mut id = String::new();
+        let text = {
+            let _turn = mint.turn.lock().await;
+            let made = mint.token_out(300, |name| {
+                let new = NewWithdrawal {
+                    mint: &w.mint,
+                    kind: TOKEN,
+                    sat: 300,
+                    cost_most: 322,
+                    to_whom: "",
+                    reference: name,
+                };
+                id = w.site.store.withdrawal_begin(&new, unix_now()).map_err(|e| e.to_string())?;
+                Ok(())
+            });
+            made.await.unwrap()
+        };
+        assert_eq!(withdrawals(&w)[0].state, "begun");
+        // Its text is to be had: it is listed, and written down by that.
+        let out = tokens(&w.site).await.unwrap();
+        assert_eq!((out.len(), out[0].1.as_str(), out[0].2.as_str()), (1, id.as_str(), text.as_str()));
+        let written = withdrawals(&w).pop().unwrap();
+        assert_eq!((written.state.as_str(), written.cost_sat), ("done", 300), "for what it is worth, not the most");
+        the_books_agree(&w).await;
+        // Redeemed: out no more, and still a token that was made.
+        assert!(w.still_good(&text).await);
+        assert!(tokens(&w.site).await.unwrap().is_empty());
+        assert_eq!(settle(&w.site, mint).await, 0);
+        let written = withdrawals(&w).pop().unwrap();
+        assert_eq!((written.state.as_str(), written.cost_sat), ("done", 300));
+        assert!(take_back(&w.site, &id).await.is_err());
+        the_books_agree(&w).await;
+    }
+
+    /// A token taken back, the mint's answer lost and the mint then away:
+    /// it is not known what became of it, and it is found out later by
+    /// whoever asks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_taken_back_unheard_is_written_down_when_it_is_known() {
+        let w = world(0, GIVE_UP).await;
+        sold(&w).await;
+        let (id, _, text) = token(&w.site, None, 500).await.unwrap();
+        w.proxy.lose_a_swap_answer_and_go_away();
+        let unheard = take_back(&w.site, &id).await.unwrap_err();
+        assert!(unheard.contains("not known yet"), "{unheard}");
+        let written = withdrawals(&w).pop().unwrap();
+        assert_eq!((written.state.as_str(), written.token.is_some()), ("done", true), "out, as far as is known");
+        // The mint is back: asked about what is under way, it came back.
+        w.proxy.pass();
+        assert_eq!(settle(&w.site, w.the_mint()).await, 0);
+        let written = withdrawals(&w).pop().unwrap();
+        assert_eq!((written.state.as_str(), written.cost_sat), ("back", 0));
+        assert_eq!(w.holds().await, 1564);
+        assert!(!w.still_good(&text).await && tokens(&w.site).await.unwrap().is_empty());
+        the_books_agree(&w).await;
+        // With the mint away, the tokens that are out are listed at once,
+        // and each as not asked about.
+        token(&w.site, None, 100).await.unwrap();
+        token(&w.site, None, 50).await.unwrap();
+        w.proxy.go_away();
+        let asked = tokio::time::Instant::now();
+        let out = tokens(&w.site).await.unwrap();
+        assert_eq!((out.len(), out[0].3, out[1].3), (2, false, false));
+        assert!(asked.elapsed() < Duration::from_secs(20), "the mint is asked once, not once for each");
+    }
+
+    /// What a wallet holds is known before anything is sold: one that is
+    /// full when the service starts sells nothing from the start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wallet_that_is_full_at_the_start_sells_nothing() {
+        let w = world(0, GIVE_UP).await;
+        sold(&w).await;
+        let wallets = crate::wallet::Wallets::open(&w.dir, std::slice::from_ref(&w.mint)).await.unwrap();
+        wallets.set_cap(1000);
+        wallets.mints[0].reach().await.unwrap();
+        let again = w.with_wallets(wallets);
+        start(&again).await;
+        assert!(again.desk.as_ref().unwrap().wallets.mints[0].full() && again.methods().is_empty());
     }
 
     /// Counting the wallet again from its seed finds everything the mint

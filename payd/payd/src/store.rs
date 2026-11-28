@@ -140,6 +140,17 @@ const SCHEMA: &[&str] = &[
         ended INTEGER NOT NULL DEFAULT 0
     );
 ",
+    "
+    -- A token that was handed out and that nobody has redeemed, as far as
+    -- is known: its text, and its proofs as the mint knows them. Kept here,
+    -- and not left to the wallet's file alone, which forgets a token when
+    -- it puts itself right: with these a token that is out can be listed,
+    -- asked about and taken back whatever the wallet remembers, and is
+    -- kept from being counted as the wallet's own again. Both are NULL
+    -- once it is redeemed or taken back.
+    ALTER TABLE withdrawals ADD COLUMN token TEXT;
+    ALTER TABLE withdrawals ADD COLUMN ys TEXT;
+",
 ];
 
 /// The most a package may be granted: what the daemon takes.
@@ -208,6 +219,10 @@ pub struct Withdrawal {
     pub to_whom: String,
     pub quote: Option<String>,
     pub ended: u64,
+    /// For a token that is out: its text, and its proofs as the mint knows
+    /// them.
+    pub token: Option<String>,
+    pub ys: Option<String>,
 }
 
 /// What is about to leave the wallet at `mint`, as `kind`: `sat`, costing
@@ -921,7 +936,8 @@ impl Store {
         values: &[&dyn rusqlite::ToSql],
     ) -> rusqlite::Result<Vec<Withdrawal>> {
         let sql = format!(
-            "SELECT id, created, mint, kind, sat, cost_sat, state, to_whom, quote, ended FROM withdrawals {condition}"
+            "SELECT id, created, mint, kind, sat, cost_sat, state, to_whom, quote, ended, token, ys FROM withdrawals \
+             {condition}"
         );
         let mut query = db.prepare_cached(&sql)?;
         query
@@ -937,6 +953,8 @@ impl Store {
                     to_whom: row.get(7)?,
                     quote: row.get(8)?,
                     ended: as_u64(row.get(9)?),
+                    token: row.get(10)?,
+                    ys: row.get(11)?,
                 })
             })?
             .collect()
@@ -987,15 +1005,42 @@ impl Store {
         Ok(())
     }
 
-    /// The token handed out as `name` was taken back, and `back` sat of it
-    /// are the wallet's again: what it cost is what the mint took.
-    pub fn withdrawal_back(&self, name: &str, back: u64, now: u64) -> Result<(), Refused> {
+    /// The token of withdrawal `id` was made, and is out: its text and its
+    /// proofs (`ys`) are kept, and what it cost.
+    pub fn withdrawal_token(&self, id: &str, token: &str, ys: &str, cost_sat: u64, now: u64) -> Result<(), Refused> {
         self.db().execute(
-            "UPDATE withdrawals SET state = 'back', cost_sat = MAX(cost_sat - ?2, 0), ended = ?3
-             WHERE quote = ?1 AND kind = 'token' AND state IN ('begun', 'done')",
-            params![name, as_i64(back), as_i64(now)],
+            "UPDATE withdrawals SET state = 'done', cost_sat = ?2, ended = ?3, token = ?4, ys = ?5
+             WHERE id = ?1 AND kind = 'token' AND state = 'begun'",
+            params![id, as_i64(cost_sat), as_i64(now), token, ys],
         )?;
         Ok(())
+    }
+
+    /// The token of withdrawal `id` was redeemed: it is out no more.
+    pub fn withdrawal_redeemed(&self, id: &str) -> Result<(), Refused> {
+        self.db().execute("UPDATE withdrawals SET token = NULL, ys = NULL WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// The token of withdrawal `id` was taken back, and `back` sat of it
+    /// are the wallet's again: what it cost is what the mint took.
+    pub fn withdrawal_back(&self, id: &str, back: u64, now: u64) -> Result<(), Refused> {
+        self.db().execute(
+            "UPDATE withdrawals SET state = 'back', cost_sat = MAX(cost_sat - ?2, 0), ended = ?3, token = NULL, ys = NULL
+             WHERE id = ?1 AND kind = 'token' AND state = 'done' AND token IS NOT NULL",
+            params![id, as_i64(back), as_i64(now)],
+        )?;
+        Ok(())
+    }
+
+    /// The tokens that are out, at `mint` or (None) at any: oldest first.
+    pub fn tokens_out(&self, mint: Option<&str>) -> Result<Vec<Withdrawal>, Refused> {
+        Ok(Store::withdrawals_where(
+            &self.db(),
+            "WHERE kind = 'token' AND state = 'done' AND token IS NOT NULL AND (?1 IS NULL OR mint = ?1)
+             ORDER BY created, id",
+            &[&mint],
+        )?)
     }
 
     /// The withdrawal that paid `to_whom`, or is paying it: one that was

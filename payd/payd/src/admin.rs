@@ -31,8 +31,10 @@ use tokio::sync::Notify;
 use crate::config::size;
 use crate::http::Site;
 use crate::identity::client;
+use crate::payouts;
 use crate::store::Store;
 use crate::sync::unix_now;
+use crate::wallet::Left;
 
 /// The longest line read, and how long one may take.
 const MAX_LINE: usize = 4096;
@@ -164,9 +166,11 @@ pub fn answer(store: &Store, line: &str, now: u64) -> String {
                 Ok(out)
             }
             [] => Err("err syntax".into()),
-            ["grant" | "top-up" | "members" | "revoke" | "packages" | "orders" | "wallet" | "terms", ..] => {
-                Err("err arguments".into())
-            }
+            [
+                "grant" | "top-up" | "members" | "revoke" | "packages" | "orders" | "wallet" | "terms" | "token"
+                | "tokens" | "take-back" | "quote" | "pay" | "sweep" | "withdrawals",
+                ..,
+            ] => Err("err arguments".into()),
             _ => Err("err command".into()),
         }
     })();
@@ -192,6 +196,23 @@ pub fn listen(path: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
+/// Text on one line: what another program's error may say goes into an
+/// answer of lines.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect()
+}
+
+/// What became of a payment from the wallet, as a line.
+fn left_line(id: &str, left: &Left) -> String {
+    match left {
+        Left::Paid { sat, fee, proof } => {
+            format!("paid {id} {sat} {fee} {}\n", proof.as_deref().filter(|proof| !proof.is_empty()).unwrap_or("-"))
+        }
+        Left::Pending => format!("pending {id}\n"),
+        Left::Not(why) => format!("failed {id} {}\n", one_line(why)),
+    }
+}
+
 /// What is asked of the service as it runs, and not of its store alone:
 /// the wallet, and the terms. None for any other line.
 async fn of_the_site(site: &Site, line: &str) -> Option<String> {
@@ -208,14 +229,102 @@ async fn of_the_site(site: &Site, line: &str) -> Option<String> {
                     Ok(sold) => sold,
                     Err(e) => return Some(format!("err {e}\n")),
                 };
+                let out_of_it = match site.store.paid_out(&mint.name) {
+                    Ok(out) => out,
+                    Err(e) => return Some(format!("err {e}\n")),
+                };
                 let state = if mint.ready() { "reached" } else { "away" };
                 // Whether it gives invoices, as it said when last reached.
                 let invoices = if mint.gives_invoices(None) { "invoices" } else { "tokens" };
-                out.push_str(&format!("mint {} {state} {holds} {pending} {sold} {invoices}\n", mint.name));
+                // Whether the wallet holds as much as it may there.
+                let room = if mint.full() { "full" } else { "room" };
+                out.push_str(&format!(
+                    "mint {} {state} {holds} {pending} {sold} {invoices} {out_of_it} {room}\n",
+                    mint.name
+                ));
             }
-            out.push_str(&format!("ok {}\n", mints.len()));
+            // And what the config says of it: the most it may hold at a
+            // mint, where it is sent on to, and above how much.
+            out.push_str(&format!(
+                "ok {} {} {} {}\n",
+                mints.len(),
+                site.config.wallet_cap,
+                site.config.sweep_to.as_deref().unwrap_or("-"),
+                site.config.sweep_above
+            ));
             Some(out)
         }
+        // What leaves the wallet, on the operator's word: see `payouts`.
+        ["token", sat] | ["token", sat, _] => {
+            let Some(sat) = sat.parse::<u64>().ok().filter(|sat| *sat > 0) else {
+                return Some("err a token of how many sat\n".into());
+            };
+            let mint = line.split_whitespace().nth(2);
+            Some(match payouts::token(site, mint, sat).await {
+                Ok((id, cost, text)) => format!("token {id} {cost} {text}\nok\n"),
+                Err(e) => format!("err {}\n", one_line(&e)),
+            })
+        }
+        ["tokens"] => Some(match payouts::tokens(site).await {
+            Ok(out) => {
+                // Whether the mint could be asked if it was redeemed.
+                let line = |(mint, name, text, asked): &(String, String, String, bool)| {
+                    format!("token {name} {mint} {text} {}\n", if *asked { "asked" } else { "unasked" })
+                };
+                format!("{}ok {}\n", out.iter().map(line).collect::<String>(), out.len())
+            }
+            Err(e) => format!("err {}\n", one_line(&e)),
+        }),
+        ["take-back", name] => Some(match payouts::take_back(site, name).await {
+            Ok(back) => format!("back {back}\nok\n"),
+            Err(e) => format!("err {}\n", one_line(&e)),
+        }),
+        ["quote", invoice] | ["quote", invoice, _] => {
+            let mint = line.split_whitespace().nth(2);
+            Some(match payouts::quote(site, mint, invoice).await {
+                Ok((mint, payable)) => {
+                    format!(
+                        "quote {} {} {} {} {mint}\nok\n",
+                        payable.quote, payable.sat, payable.fee_most, payable.expires
+                    )
+                }
+                Err(e) => format!("err {}\n", one_line(&e)),
+            })
+        }
+        ["pay", quote] | ["pay", quote, _] => {
+            let mint = line.split_whitespace().nth(2);
+            Some(match payouts::pay_quoted(site, mint, quote).await {
+                Ok((id, left)) => format!("{}ok\n", left_line(&id, &left)),
+                Err(e) => format!("err {}\n", one_line(&e)),
+            })
+        }
+        ["sweep"] | ["sweep", _] => {
+            let Some(desk) = &site.desk else { return Some("err there is no wallet\n".into()) };
+            if site.config.sweep_to.is_none() {
+                return Some("err nowhere to send it: SWEEP_TO is not set\n".into());
+            }
+            let named = line.split_whitespace().nth(1);
+            if let Some(name) = named
+                && desk.wallets.named(name).is_none()
+            {
+                return Some(format!("err {} is not a mint in MINTS\n", one_line(name)));
+            }
+            // Each mint for itself: what left one is said whatever became
+            // of the next.
+            let mut out = String::new();
+            for mint in desk.wallets.mints.iter().filter(|mint| named.is_none_or(|name| name == mint.name)) {
+                match payouts::sweep(site, desk, mint, true).await {
+                    Ok(Some((id, left))) => out.push_str(&left_line(&id, &left)),
+                    Ok(None) => out.push_str(&format!("nothing {}\n", mint.name)),
+                    Err(e) => out.push_str(&format!("error {} {}\n", mint.name, one_line(&e))),
+                }
+            }
+            Some(format!("{out}ok\n"))
+        }
+        ["withdrawals"] => Some(match site.store.withdrawals(MAX_ORDERS) {
+            Ok(all) => format!("{}ok {}\n", all.iter().map(payouts::line).collect::<String>(), all.len()),
+            Err(e) => format!("err {e}\n"),
+        }),
         // What the advert says of this exit's terms: what is configured,
         // whether or not its mints answer at this moment.
         ["terms"] => {
@@ -326,13 +435,13 @@ mod tests {
         let w = crate::orders::testing::world(0, Duration::from_secs(600)).await;
         assert_eq!(
             of_the_site(&w.site, "wallet").await.unwrap(),
-            format!("mint {} reached 0 0 0 invoices\nok 1\n", w.mint)
+            format!("mint {} reached 0 0 0 invoices 0 room\nok 1 500000 - 20000\n", w.mint)
         );
         assert_eq!(answer(&w.site.store, "orders", NOW), "ok 0\n");
         let bought = w.buy("fd77::7", "small", &w.token(64).await, None).await.unwrap();
         assert_eq!(
             of_the_site(&w.site, "wallet").await.unwrap(),
-            format!("mint {} reached 64 0 64 invoices\nok 1\n", w.mint)
+            format!("mint {} reached 64 0 64 invoices 0 room\nok 1 500000 - 20000\n", w.mint)
         );
         let orders = answer(&w.site.store, "orders", NOW);
         let [order, id, state, _created, buyer, offer, sat, paid, fee, package, mint, method, ok, n] =
@@ -348,6 +457,54 @@ mod tests {
         assert_eq!((method, ok, n), ("cashu", "ok", "1"));
         // The package it made is among the packages, said to be bought.
         assert!(answer(&w.site.store, "packages", NOW).contains(" fd77::7 bought: small\n"));
+        // What leaves the wallet, on the operator's word: a token, which
+        // is out until somebody redeems it, and can be taken back.
+        let said = of_the_site(&w.site, "token 40").await.unwrap();
+        let ["token", id, "40", text, "ok"] = said.split_whitespace().collect::<Vec<_>>()[..] else { panic!("{said}") };
+        assert!(id.starts_with('w') && text.starts_with("cashu"), "{said}");
+        let out = of_the_site(&w.site, "tokens").await.unwrap();
+        let ["token", name, mint, its_text, "asked", "ok", "1"] = out.split_whitespace().collect::<Vec<_>>()[..] else {
+            panic!("{out}")
+        };
+        assert_eq!((mint, its_text), (w.mint.as_str(), text));
+        assert_eq!(of_the_site(&w.site, &format!("take-back {name}")).await.unwrap(), "back 40\nok\n");
+        assert_eq!(of_the_site(&w.site, "tokens").await.unwrap(), "ok 0\n");
+        // An invoice: what it takes is asked, and then it is paid.
+        let invoice = fips_exit_test_mint::invoice(20, fips_exit_test_mint::Fate::Paid);
+        let said = of_the_site(&w.site, &format!("quote {invoice}")).await.unwrap();
+        let ["quote", quote, "20", fee_most, _expires, mint, "ok"] = said.split_whitespace().collect::<Vec<_>>()[..]
+        else {
+            panic!("{said}")
+        };
+        assert_eq!((mint, fee_most), (w.mint.as_str(), "2"));
+        let said = of_the_site(&w.site, &format!("pay {quote}")).await.unwrap();
+        let ["paid", paid_id, "20", _fee, _proof, "ok"] = said.split_whitespace().collect::<Vec<_>>()[..] else {
+            panic!("{said}")
+        };
+        let all = of_the_site(&w.site, "withdrawals").await.unwrap();
+        assert!(all.ends_with("ok 2\n"), "{all}");
+        assert!(
+            all.contains(&format!("withdrawal {id} back ")) && all.contains(&format!("withdrawal {paid_id} done "))
+        );
+        assert!(all.lines().any(|line| line.ends_with(&format!(" invoice 20 21 {} {invoice}", w.mint))), "{all}");
+        assert_eq!(
+            of_the_site(&w.site, "wallet").await.unwrap(),
+            format!("mint {} reached 43 0 64 invoices 21 room\nok 1 500000 - 20000\n", w.mint)
+        );
+        // What is not a withdrawal is said on one line, and takes nothing.
+        for (asked, why) in [
+            ("token 0", "err a token of how many sat"),
+            ("token 5000", "err the wallet holds 43 sat"),
+            ("token 5 https://mint.example", "err https://mint.example is not a mint in MINTS"),
+            ("pay nothing", "err no such quote"),
+            ("quote lnbc1", "err "),
+            ("take-back nothing", "err no token of that name is out"),
+            ("sweep", "err "),
+        ] {
+            let said = of_the_site(&w.site, asked).await.unwrap();
+            assert!(said.starts_with(why) && said.lines().count() == 1, "{asked}: {said}");
+        }
+        assert!(of_the_site(&w.site, "withdrawals").await.unwrap().ends_with("ok 2\n"));
         let terms = of_the_site(&w.site, "terms").await.unwrap();
         let (line, ok) = terms.trim_end().split_once('\n').unwrap();
         let said: serde_json::Value = serde_json::from_str(line.strip_prefix("terms ").unwrap()).unwrap();

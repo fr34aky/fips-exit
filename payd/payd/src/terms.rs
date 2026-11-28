@@ -374,6 +374,9 @@ mod tests {
             name: String::new(),
             about: String::new(),
             country: None,
+            wallet_cap: 0,
+            sweep_to: None,
+            sweep_above: 0,
         }
     }
 

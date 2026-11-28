@@ -154,6 +154,9 @@ PRICE_MSAT_PER_GB=2000000                   # millisatoshi a GB of 10^9 bytes: 2
 PACKAGES="1gb:1GB:1500:30 5gb:5GB:6000:90"  # optional: id:size:sat:days, sizes in bytes, MB, GB or TB
 MINTS="https://mint.example.org"            # optional: the Cashu mints whose tokens are taken; none, nothing is sold
 PAY_PORT=5170                               # optional, the default
+WALLET_CAP=500000                           # optional, the default: the most the wallet may hold at a mint, in sat (0: any amount)
+SWEEP_TO="you@example.org"                  # optional: a Lightning address of yours that the wallet is sent on to
+SWEEP_ABOVE=20000                           # optional, the default: above how many sat at a mint it is sent on
 ```
 
 ```sh
@@ -310,12 +313,67 @@ Ecash is the mint's promise and nothing more: a mint that goes away takes
 what the wallet holds there with it, so name mints you would trust with
 that, or your own.
 
-**Nothing pays out yet.** There is no command so far that takes ecash out
-of the wallet, and no limit on what it holds: both are the next phases of
-[`docs/paid-exit.md`](docs/paid-exit.md). Until then what is paid stays at
-the mint, and the way to it is the seed, restored in another wallet with the
-service stopped for good (two wallets on one seed get in each other's way).
-Price a package accordingly, and try this with small amounts.
+#### Taking what was paid out of the wallet
+
+A wallet on a server is protected by holding little. Nothing a buyer does
+takes anything out of it; you do, or your config does:
+
+```sh
+sudo fips-exit wallet token 5000                 # a Cashu token of 5000 sat: its text is the money
+sudo fips-exit wallet tokens                     # the tokens handed out that nobody has redeemed, with their text
+sudo fips-exit wallet take-back <name>           # one of those, back into the wallet
+sudo fips-exit wallet pay lnbc…                  # pay a Lightning invoice out of it: says what it takes, then asks
+sudo fips-exit wallet sweep                      # send on to SWEEP_TO now, whatever is held
+sudo fips-exit wallet out                        # what left the wallet, and what each cost
+```
+
+- **A token** is ecash for whoever has its text: redeem it in a wallet of
+  your own, at the same mint. It is worth what you asked for to whoever
+  redeems it, as near as the mint's fee for that lets it be, and that fee
+  is taken out of the exit's wallet with it. The command prints the text
+  alone, so that it can be piped; what else it says goes to standard error.
+  Until somebody redeems it the service keeps its text (`wallet tokens`,
+  also while its mint cannot be asked), and it can be taken back by the
+  name it is listed under, which makes that text worthless. A token that
+  is out stays its holder's when the wallet counts again from its seed.
+- **An invoice** is paid by the mint with what the wallet holds (a melt,
+  NUT-05). The mint is asked what it takes first: the amount, and the most
+  the mint may keep on top for the payment's fee (what it does not use
+  comes back). It is paid when you say so: `--yes` for a script, which can
+  go by how the command ends: 0 when it is paid, 1 when it is not, 3 when
+  that is not known yet (the mint has not said, or the service did not
+  answer in time and goes on with it: `wallet out` says what became of
+  it). An invoice is paid once: one that a
+  withdrawal paid, or is paying, is not quoted again. If the mint has not
+  said after a minute what became of a payment, it is written down as
+  begun, counts as gone, and the mint is asked about it every minute until
+  it says.
+- **`SWEEP_TO`** is a Lightning address of yours (`name@host`). Once a
+  minute each mint's holdings are looked at, and what is over `SWEEP_ABOVE`
+  starts a payment of all that is held there, less a fiftieth and 4 sat
+  left for the mint's fee: the address's host is asked for an invoice of
+  that much, the wallet library checks that the invoice is for that much
+  (and for nothing else: who an invoice pays is its host's word), and the
+  mint pays it. A mint that asks for more
+  than a twentieth and 20 sat for it is not paid by itself. After a failure
+  nothing is sent on from that mint for a quarter of an hour, and while a
+  payment is under way there, nothing else is. The service then talks to
+  that host as well as to its mints, and to nobody else.
+- **`WALLET_CAP`** is the most the wallet may hold at one mint: from there
+  on nothing is sold at that mint, by token or by invoice (`503`, the code
+  `wallet-full`), until something has left it. Half a million sat when the
+  config says nothing; 0 for any amount. Invoices given before it was
+  reached are still honoured, so it can end a little over. With `SWEEP_TO`,
+  `SWEEP_ABOVE` has to be under it.
+- **Everything that leaves is written down** before the mint is asked
+  (`wallet out`), with the most it may cost, and then with what it did
+  cost, or that it came to nothing. `fips-exit wallet` shows for each mint
+  what it holds, what was sold there and what was paid out: the first is
+  the second less the third.
+
+The seed is still the way to everything the wallet holds, and the way of
+last resort: restored in another wallet, with the service stopped for good
+(two wallets on one seed get in each other's way).
 
 Packages the operator gives away, for nothing:
 
@@ -502,10 +560,10 @@ an optimisation, not a requirement.
 
 Optional paid public exits (an advert with price and country, prepaid data
 packages, pay-as-you-go) are designed in
-[`docs/paid-exit.md`](docs/paid-exit.md). Its first six phases are here:
+[`docs/paid-exit.md`](docs/paid-exit.md). Its first seven phases are here:
 accounts and `ACCESS=paid`, the advert, the payment service, packages and
-their keys, and packages sold for Cashu tokens and for Lightning invoices,
-all above. To come: paying out of the wallet and a limit on what it holds,
+their keys, packages sold for Cashu tokens and for Lightning invoices, and
+paying out of the wallet with a limit on what it holds, all above. To come:
 on-chain payments, a command-line client, and pay-as-you-go channels.
 
 ## Test
@@ -537,8 +595,10 @@ the byte and are cut off at the grant, a member reaches the internet and
 neither the uplink's LAN nor port 25, the payment service tells a node that
 is no client what the exit costs and who it is, a node that is nobody's buys
 a package with a token of a mint that runs in the test and is carried,
-another pays an invoice of that mint for one, and leaving the mode removes
-what it made, the opening for the payment service with it.
+another pays an invoice of that mint for one, a token and an invoice leave
+the wallet again on the operator's word, a full wallet sells nothing, and
+leaving the mode removes what it made, the opening for the payment service
+with it.
 
 The third is `payd/`, a workspace with a lockfile of its own, so that the
 daemon keeps its one dependency. `payd/proto` is a crate with no

@@ -25,6 +25,19 @@ the service's own:
   fips-exit wallet                                       what the wallet holds at each mint, and what was sold
   fips-exit orders                                       what was paid, by whom, for what
 
+What the wallet holds is taken out of it by these, and by nothing a buyer
+does. SWEEP_TO in the config (a Lightning address) sends it on by itself,
+above SWEEP_ABOVE sat at a mint; at WALLET_CAP sat a mint sells nothing more:
+
+  fips-exit wallet token <sat> [mint]                    a Cashu token of that much: its text is the money
+  fips-exit wallet tokens                                the tokens handed out that nobody has redeemed
+  fips-exit wallet take-back <name>                      one of those, back into the wallet
+  fips-exit wallet pay <invoice> [mint] [--yes]          pay a Lightning invoice out of the wallet (asks first);
+                                                         ends with 0 when it is paid, 1 when not, 3 when the
+                                                         mint has not said yet
+  fips-exit wallet sweep [mint]                          send on to SWEEP_TO now, whatever is held; ends alike
+  fips-exit wallet out                                   what left the wallet, and what it cost
+
 And packages the operator gives away, without payment:
 
   fips-exit grant <size> <days> <who>[,<who>…] [label]   a package: size like 1GB, days 0 for no end,
@@ -1383,27 +1396,34 @@ def cmd_status():
             if listening:
                 mints = [line.split() for line in (payd("wallet", fatal=False) or [])[:-1]]
                 for mint in mints:
-                    if len(mint) == 7:
+                    if len(mint) == 9:
                         invoices = ", and gives Lightning invoices" if mint[6] == "invoices" else ""
+                        full = "; FULL (WALLET_CAP): nothing is sold here" if mint[8] == "full" else ""
                         print(f"  tokens of {shown(mint[1], 256)}: {shown(mint[2], 8)}, "
-                              f"holds {shown(mint[3], 20)} sat{invoices}")
+                              f"holds {shown(mint[3], 20)} sat{invoices}{full}")
                 if not mints:
                     print("  nothing is sold: no mint is named (MINTS), or the service says nothing of its wallet")
 
 
-def payd(line, fatal=True):
+def payd(line, fatal=True, wait=10, pays=False):
     """One command to the payment service's socket for the operator; the
     lines of its answer, the last beginning `ok`, or the script stops with
-    what was said. With `fatal` false, None in place of stopping."""
+    what was said. With `fatal` false, None in place of stopping. `wait`:
+    how long it may take, in seconds (a mint is asked for what leaves the
+    wallet, and a payment takes its time). `pays`: the command pays
+    something, so that no answer to it is not "nothing happened": the
+    service goes on with it, and the script ends with 3, not known."""
     def stop(why):
         if fatal:
             die(why)
 
     peer = socket.socket(socket.AF_UNIX)
-    peer.settimeout(10)
+    peer.settimeout(wait)
+    sent = False
     try:
         peer.connect(PAYD_ADMIN)
         peer.sendall(line.encode() + b"\n")
+        sent = True
         peer.shutdown(socket.SHUT_WR)
         answer = b""
         while True:
@@ -1414,6 +1434,11 @@ def payd(line, fatal=True):
             if len(answer) > 4 << 20:
                 raise OSError("an answer without end")
     except OSError as error:
+        if pays and sent:
+            print(f"fips-exit: the payment service did not answer in time ({error.strerror or error}). It was asked, "
+                  "and may pay yet: what became of it is in `fips-exit wallet out`. Do not pay the same again "
+                  "before looking there.", file=sys.stderr)
+            sys.exit(3)
         return stop(f"the payment service does not answer on {PAYD_ADMIN} ({error.strerror or error}): "
                     "is it running? (systemctl start fips-exit-payd)")
     finally:
@@ -1451,26 +1476,171 @@ def offered():
             "packages": [{key: package[key] for key in ("id", "bytes", "sat", "days")} for package in said["packages"]]}
 
 
-def cmd_wallet():
-    """What the payment service's wallet holds at each mint."""
-    lines = payd("wallet")
-    print(f"{'holds':>12} {'under way':>12} {'sold':>12}  {'mint':<8} {'invoices':<8} url")
+def sat_of(text):
+    """A number of sat as the operator writes it: digits, and not nothing."""
+    if not (text.isascii() and text.isdigit() and 0 < int(text) < 21 * 10**14):
+        die(f"{shown(text, 40)}: a number of sat")
+    return int(text)
+
+
+def word_of(text, what):
+    """One word for a line to the payment service: nothing in it that would
+    end the line or begin another word."""
+    if not text or not text.isascii() or not text.isprintable() or " " in text or len(text) > 2048:
+        die(f"{shown(text, 60)}: not {what}")
+    return text
+
+
+def left_said(lines):
+    """What became of payments from the wallet, as the service says it.
+    The script ends with what a caller can go by: 0 when everything asked
+    was paid (or there was nothing to pay), 1 when something was not, 3
+    when the end of something is not known yet."""
+    worst = 0
+    for line in lines[:-1]:
+        words = line.split()
+        if words[:1] == ["paid"] and len(words) == 5:
+            print(f"paid: {shown(words[2], 20)} sat, for a fee of {shown(words[3], 20)} sat "
+                  f"(withdrawal {shown(words[1], 20)})")
+        elif words[:1] == ["pending"] and len(words) == 2:
+            print(f"under way: the mint has not said what became of it (withdrawal {shown(words[1], 20)}). "
+                  "It counts as gone until it does: fips-exit wallet out")
+            worst = worst or 3
+        elif words[:1] == ["failed"] and len(words) >= 2:
+            print(f"not paid, and nothing left the wallet: {shown(' '.join(words[2:]), 300)}")
+            worst = 1
+        elif words[:1] == ["error"] and len(words) >= 2:
+            print(f"not sent on from {shown(words[1], 256)}: {shown(' '.join(words[2:]), 300)}")
+            worst = 1
+        elif words[:1] == ["nothing"] and len(words) == 2:
+            print(f"nothing to send on at {shown(words[1], 256)}")
+        else:
+            die(f"the payment service said: {shown(line, 200)}")
+    if worst:
+        sys.exit(worst)
+
+
+def wallet_token(sat, mint=None):
+    """A token of `sat` out of the wallet: its text, alone, on standard
+    output; what is said about it, on standard error."""
+    line = f"token {sat_of(sat)}" + (f" {word_of(mint, 'a mint')}" if mint else "")
+    try:
+        _, withdrawal, cost, text = payd(line, wait=90)[0].split()
+        cost = int(cost)
+    except (ValueError, IndexError):
+        die("the payment service gave no token")
+    print(f"A token of {sat} sat, which took {cost} sat out of the wallet (withdrawal {shown(withdrawal, 20)}).\n"
+          "Its text is the money: whoever has it can redeem it, once. Until somebody does, it is among\n"
+          "`fips-exit wallet tokens`, and can be taken back.", file=sys.stderr)
+    print(shown(text, 1 << 16))
+
+
+def wallet_tokens():
+    lines = payd("tokens", wait=90)
     for line in lines[:-1]:
         try:
-            _, url, state, holds, pending, sold, invoices = line.split()
-            holds, pending, sold = int(holds), int(pending), int(sold)
+            _, name, mint, text, asked = line.split()
+        except ValueError:
+            die(f"the payment service said something that is not a token: {shown(line, 200)}")
+        # A mint that could not be asked may have redeemed it meanwhile: its text is here all the same.
+        unasked = "" if asked == "asked" else "  (its mint could not be asked just now whether it was redeemed)"
+        print(f"{shown(name, 40)}  of {shown(mint, 256)}{unasked}\n  {shown(text, 1 << 16)}")
+    if len(lines) == 1:
+        print("(none: every token handed out was redeemed, or taken back)")
+
+
+def wallet_take_back(name):
+    words = payd(f"take-back {word_of(name, 'a name')}", wait=90)[0].split()
+    if len(words) != 2 or not words[1].isdigit():
+        die("the payment service did not say what came back")
+    print(f"{words[1]} sat are the wallet's again: that token is worth nothing now")
+
+
+def wallet_pay(invoice, *more):
+    """Pay a Lightning invoice out of the wallet: what it takes is asked of
+    the mint and shown, and it is paid when the operator says so."""
+    yes = "--yes" in more
+    mints = [word for word in more if word != "--yes"]
+    if len(mints) > 1:
+        raise TypeError
+    invoice = word_of(invoice.strip().removeprefix("lightning:"), "an invoice")
+    asked = payd(f"quote {invoice}" + (f" {word_of(mints[0], 'a mint')}" if mints else ""), wait=60)
+    try:
+        _, quote, sat, fee_most, _expires, mint = asked[0].split()
+        sat, fee_most = int(sat), int(fee_most)
+    except (ValueError, IndexError):
+        die("the payment service did not say what the invoice takes")
+    print(f"This pays {sat} sat out of the wallet at {shown(mint, 256)}. The mint may take up to {fee_most} sat\n"
+          "more for it, and gives back what it does not use.")
+    if not yes:
+        if not sys.stdin.isatty():
+            die("not paid: say --yes to pay it without being asked")
+        if input("Pay it? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("not paid")
+            return
+    left_said(payd(f"pay {word_of(quote, 'a quote')} {word_of(mint, 'a mint')}", wait=150, pays=True))
+
+
+def wallet_sweep(mint=None):
+    left_said(payd("sweep" + (f" {word_of(mint, 'a mint')}" if mint else ""), wait=300, pays=True))
+
+
+def wallet_out():
+    lines = payd("withdrawals")
+    print(f"{'withdrawal':<18} {'state':<6} {'when':<16} {'what':<8} {'amount':>12} {'it cost':>12}  to")
+    for line in lines[:-1]:
+        try:
+            _, name, state, created, kind, sat, cost, mint, to_whom = line.split()
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(created)))
+            sat, cost = int(sat), int(cost)
+        except (ValueError, OverflowError, OSError):
+            die(f"the payment service said something that is not a withdrawal: {shown(line, 200)}")
+        # An invoice is long: its beginning and its end say which it was.
+        to_whom = shown(to_whom, 2048)
+        to_whom = to_whom if len(to_whom) <= 44 else f"{to_whom[:24]}…{to_whom[-16:]}"
+        to_whom = f"{to_whom}  (from {shown(mint, 256)})" if to_whom != "-" else f"(from {shown(mint, 256)})"
+        print(f"{shown(name, 18):<18} {shown(state, 6):<6} {when:<16} {shown(kind, 8):<8} {f'{sat} sat':>12} "
+              f"{f'{cost} sat':>12}  {to_whom}")
+    if len(lines) == 1:
+        print("(nothing has left the wallet)")
+    print("begun: its end is not known yet, and it counts as gone. failed: nothing left. back: a token taken back.")
+
+
+def cmd_wallet(*args):
+    """What the payment service's wallet holds at each mint; and, with more
+    words, what is taken out of it."""
+    out = {"token": wallet_token, "tokens": wallet_tokens, "take-back": wallet_take_back, "pay": wallet_pay,
+           "sweep": wallet_sweep, "out": wallet_out}
+    if args:
+        if args[0] not in out:
+            raise TypeError
+        return out[args[0]](*args[1:])
+    lines = payd("wallet")
+    print(f"{'holds':>12} {'under way':>12} {'sold':>12} {'paid out':>12}  {'mint':<8} {'invoices':<8} url")
+    for line in lines[:-1]:
+        try:
+            _, url, state, holds, pending, sold, invoices, paid_out, room = line.split()
+            holds, pending, sold, paid_out = int(holds), int(pending), int(sold), int(paid_out)
         except ValueError:
             die(f"the payment service said something that is not a mint: {shown(line, 200)}")
         # Whether the mint gives Lightning invoices, as it said when it was last reached.
         invoices = {"invoices": "yes", "tokens": "no"}.get(invoices, "?")
-        print(f"{f'{holds} sat':>12} {f'{pending} sat':>12} {f'{sold} sat':>12}  {shown(state, 8):<8} "
-              f"{invoices:<8} {shown(url, 256)}")
+        full = "  FULL: nothing is sold here" if room == "full" else ""
+        print(f"{f'{holds} sat':>12} {f'{pending} sat':>12} {f'{sold} sat':>12} {f'{paid_out} sat':>12}  "
+              f"{shown(state, 8):<8} {invoices:<8} {shown(url, 256)}{full}")
     if len(lines) == 1:
         print(f"(no mint is named: MINTS in {CONFIG})")
+    # What the config says of the wallet, as the service reads it.
+    said = lines[-1].split()
+    if len(said) == 5 and said[2].isdigit() and said[4].isdigit():
+        cap, sweep_to, above = int(said[2]), said[3], int(said[4])
+        print(f"It may hold {cap} sat at a mint (WALLET_CAP): from there on nothing is sold at that mint."
+              if cap else "It may hold any amount (WALLET_CAP=0).")
+        print(f"Above {above} sat at a mint it is sent on to {shown(sweep_to, 320)} (SWEEP_TO, SWEEP_ABOVE)."
+              if sweep_to != "-" else "It is sent on nowhere by itself (SWEEP_TO is not set).")
     print("What the wallet holds is whoever's has its seed: the file `seed` in the service's state directory\n"
           "(/var/lib/fips-exit-payd, or /var/lib/private/fips-exit-payd). Keep a copy of it, and keep it safe.\n"
-          "Nothing here pays out yet: what is held stays at the mint until it does, or until its seed is\n"
-          "restored in another Cashu wallet.")
+          "To take out what it holds: fips-exit wallet token <sat>, or fips-exit wallet pay <invoice>.")
 
 
 def cmd_orders():

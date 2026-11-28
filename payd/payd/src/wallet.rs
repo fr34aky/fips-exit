@@ -22,6 +22,11 @@
 //! is locked to a key of the wallet's (NUT-20, where the mint has it), so
 //! that nobody else mints what was paid.
 //!
+//! What the wallet holds leaves it in two ways, both the library's: as a
+//! token, which is ecash for whoever has its text; or by the mint paying a
+//! Lightning invoice for it (a melt, NUT-05). Nothing here decides that
+//! either happens: `payouts` does, for the operator.
+//!
 //! What the wallet asks a mint to sign follows from the seed and a counter
 //! in the wallet's file. A file that is behind its seed's use (a new one, or
 //! an old copy put back) would ask for what the mint has signed already:
@@ -35,7 +40,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use cdk::amount::SplitTarget;
@@ -44,14 +49,14 @@ use cdk::mint_url::MintUrl;
 use cdk::nuts::nut00::KnownMethod;
 use cdk::nuts::nut04::MintMethodOptions;
 use cdk::nuts::{
-    BlindedMessage, CheckStateRequest, CurrencyUnit, MintQuoteState, PaymentMethod, PreMintSecrets, ProofsMethods,
-    PublicKey, RestoreRequest, SecretKey, State, Token,
+    BlindedMessage, CheckStateRequest, CurrencyUnit, MeltQuoteState, MintQuoteState, PaymentMethod, PreMintSecrets,
+    ProofsMethods, PublicKey, RestoreRequest, SecretKey, State, Token,
 };
 use cdk::wallet::types::{
-    KeysetLoadPolicy, OperationData, ReceiveSagaState, TransactionDirection, TransactionId, TransactionStatus,
-    WalletSagaState,
+    KeysetLoadPolicy, OperationData, ReceiveSagaState, SendSagaState, TransactionDirection, TransactionId,
+    TransactionStatus, WalletSagaState,
 };
-use cdk::wallet::{ReceiveOptions, Wallet};
+use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk_sqlite::wallet::WalletSqliteDatabase;
 use sha2::{Digest, Sha256};
 
@@ -60,6 +65,10 @@ use crate::store::random;
 /// How long anything asked of a mint may take. The library sets no limit
 /// of its own on a request.
 pub const MINT_TIME: Duration = Duration::from_secs(25);
+/// How long a mint may take to pay an invoice before the payment is left
+/// as under way: a Lightning payment finds its way, or does not, in about
+/// that.
+pub const PAY_TIME: Duration = Duration::from_secs(60);
 /// The longest token read, in characters, and the most proofs in one: a
 /// bound on what a stranger can make this service, and the mint, work on.
 pub const MAX_TOKEN: usize = 24 * 1024;
@@ -174,6 +183,42 @@ impl Lightning {
     }
 }
 
+/// What the wallet has of a token it was to hand out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TokenState {
+    /// Made, and not redeemed as far as the wallet knows: it is out.
+    Out,
+    /// Begun and not made: the wallet may hold something for it still.
+    Unfinished,
+    /// Nothing: it was never made, or was redeemed, or taken back.
+    Nothing,
+}
+
+/// What paying an invoice from the wallet takes, as the mint quotes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Payable {
+    /// The mint's quote: what the payment is made by, and asked about by.
+    pub quote: String,
+    /// What is paid, and the most the mint may take on top (what it does
+    /// not use of that comes back), in sat.
+    pub sat: u64,
+    pub fee_most: u64,
+    /// When the quote ends, in Unix seconds.
+    pub expires: u64,
+}
+
+/// What became of a payment from the wallet.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Left {
+    /// Paid: this much, for this fee, with the proof of it where the mint
+    /// gave one.
+    Paid { sat: u64, fee: u64, proof: Option<String> },
+    /// Under way: the mint has what pays for it, and has not said.
+    Pending,
+    /// Not paid, and nothing left the wallet: why.
+    Not(String),
+}
+
 fn bolt11() -> PaymentMethod {
     PaymentMethod::Known(KnownMethod::Bolt11)
 }
@@ -249,6 +294,14 @@ pub struct Mint {
     /// What the mint said of its invoices when it was last reached, if it
     /// gives any for sat.
     lightning: std::sync::Mutex<Option<Lightning>>,
+    /// What the wallet held here when that was last asked, in sat; and the
+    /// most it may hold (0: any amount), from where on nothing is sold.
+    held: AtomicU64,
+    cap: AtomicU64,
+    /// The proofs of the tokens that were handed out here and that nobody
+    /// has redeemed (each token's `Y`s, as JSON): somebody else's, however
+    /// unspent the mint calls them.
+    out: std::sync::Mutex<Vec<String>>,
     /// One thing at a time at a mint: a token taken, an invoice asked for
     /// or minted, or what was interrupted put right, never two at once.
     pub turn: tokio::sync::Mutex<()>,
@@ -522,7 +575,179 @@ impl Mint {
     pub async fn balance(&self) -> Result<(u64, u64), String> {
         let holds = self.wallet.total_balance().await.map_err(said)?.to_u64();
         let pending = self.wallet.total_pending_balance().await.map_err(said)?.to_u64();
+        self.held.store(holds, Ordering::Relaxed);
         Ok((holds, pending))
+    }
+
+    /// `sat` more arrived: counted to what is held until that is asked
+    /// again, so that a wallet which has just become full sells no more.
+    pub fn holds_more(&self, sat: u64) {
+        self.held.fetch_add(sat, Ordering::Relaxed);
+    }
+
+    /// Is the wallet full here: did it hold as much as it may, or more,
+    /// when that was last asked ([`Mint::balance`])? Nothing is sold at a
+    /// mint where it is.
+    pub fn full(&self) -> bool {
+        let cap = self.cap.load(Ordering::Relaxed);
+        cap != 0 && self.held.load(Ordering::Relaxed) >= cap
+    }
+
+    /// Whether anything is sold at this mint now: it is reached, and the
+    /// wallet may hold more.
+    pub fn sells(&self) -> bool {
+        self.ready() && !self.full()
+    }
+
+    /// A token worth `sat` to whoever redeems it: what its mint takes for
+    /// redeeming it is added to it. Its text. `named` is told the name the
+    /// wallet keeps it by, before it is made: what is written down of it
+    /// then says, after a stop, whether it was. The caller holds
+    /// [`Mint::turn`].
+    ///
+    /// The text is the money: whoever has it has what it is worth.
+    pub async fn token_out(&self, sat: u64, named: impl FnOnce(&str) -> Result<(), String>) -> Result<String, String> {
+        let options = SendOptions { include_fee: true, ..SendOptions::default() };
+        let prepared = within(self.wallet.prepare_send(cdk::Amount::from(sat), options)).await?;
+        if let Err(e) = named(&prepared.operation_id().to_string()) {
+            let _ = prepared.cancel().await;
+            return Err(e);
+        }
+        Ok(within(prepared.confirm(None)).await?.to_string())
+    }
+
+    /// What the wallet has, at this mint, of the token it keeps as `name`.
+    pub async fn token_state(&self, name: &str) -> Result<TokenState, String> {
+        let Ok(name) = name.parse() else { return Ok(TokenState::Nothing) };
+        let saga = self.db.get_saga(&name).await.map_err(said)?.filter(|saga| saga.mint_url == self.url);
+        Ok(match saga.map(|saga| (saga.state, saga.data)) {
+            Some((WalletSagaState::Send(SendSagaState::TokenCreated), OperationData::Send(data)))
+                if data.token.is_some() =>
+            {
+                TokenState::Out
+            }
+            Some((WalletSagaState::Send(_), _)) => TokenState::Unfinished,
+            _ => TokenState::Nothing,
+        })
+    }
+
+    /// The text of the token the wallet keeps as `name`, while it keeps it.
+    pub async fn token_text(&self, name: &str) -> Result<Option<String>, String> {
+        let Ok(name) = name.parse() else { return Ok(None) };
+        let saga = self.db.get_saga(&name).await.map_err(said)?.filter(|saga| saga.mint_url == self.url);
+        Ok(match saga.map(|saga| saga.data) {
+            Some(OperationData::Send(data)) => data.token,
+            _ => None,
+        })
+    }
+
+    /// Tell the wallet that the token it keeps as `name` is out no more
+    /// (redeemed, or taken back): it strikes it off by asking the mint.
+    /// What the wallet keeps of a token is not gone by, so this may fail.
+    pub async fn token_struck(&self, name: &str) {
+        if let Ok(name) = name.parse() {
+            let _ = within(self.wallet.check_send_status(name)).await;
+        }
+    }
+
+    /// What it takes to pay `invoice` from the wallet, as the mint quotes
+    /// it. Nothing is paid by asking. The caller holds [`Mint::turn`].
+    pub async fn payable(&self, invoice: &str) -> Result<Payable, String> {
+        let quote = within(self.wallet.melt_quote(bolt11(), invoice, None, None)).await?;
+        Ok(Payable {
+            quote: quote.id,
+            sat: quote.amount.to_u64(),
+            fee_most: quote.fee_reserve.to_u64(),
+            expires: quote.expiry,
+        })
+    }
+
+    /// The same for `sat` sent to a Lightning address: its host is asked
+    /// for an invoice of that much (and nothing else is asked of it), which
+    /// the library checks to be for that much and for that address.
+    pub async fn payable_to(&self, address: &str, sat: u64) -> Result<Payable, String> {
+        let msat = sat.checked_mul(1000).ok_or("too much")?;
+        let quote = within(self.wallet.melt_lightning_address_quote(address, cdk::Amount::from(msat))).await?;
+        Ok(Payable {
+            quote: quote.id,
+            sat: quote.amount.to_u64(),
+            fee_most: quote.fee_reserve.to_u64(),
+            expires: quote.expiry,
+        })
+    }
+
+    /// What the wallet's file knows of `quote`, a payment it asked a price
+    /// for: what it takes, and the invoice it is for.
+    pub async fn quoted(&self, quote: &str) -> Result<Option<(Payable, String)>, String> {
+        let known = self.db.get_melt_quote(quote).await.map_err(said)?;
+        Ok(known.filter(|known| known.mint_url.as_ref().is_none_or(|url| *url == self.url)).map(|known| {
+            let payable = Payable {
+                quote: known.id,
+                sat: known.amount.to_u64(),
+                fee_most: known.fee_reserve.to_u64(),
+                expires: known.expiry,
+            };
+            (payable, known.request)
+        }))
+    }
+
+    /// Is the wallet in the middle of paying for `quote`?
+    async fn paying(&self, quote: &str) -> Result<bool, String> {
+        let sagas = self.db.get_incomplete_sagas().await.map_err(said)?;
+        Ok(sagas.iter().any(|saga| {
+            saga.mint_url == self.url && matches!(&saga.data, OperationData::Melt(data) if data.quote_id == quote)
+        }))
+    }
+
+    /// Have the mint pay what `quote` is for, with what the wallet holds.
+    /// The caller holds [`Mint::turn`].
+    ///
+    /// What is said is what is known: a payment whose end is not known
+    /// after `wait` (the mint took its time, or could not be asked what
+    /// became of it) is under way, and [`Mint::payment`] says later what
+    /// became of it.
+    pub async fn pay(&self, quote: &str, wait: Duration) -> Left {
+        let prepared = match within(self.wallet.prepare_melt(quote, HashMap::new())).await {
+            Ok(prepared) => prepared,
+            Err(e) => return Left::Not(e),
+        };
+        let unknown = |why: String| async move {
+            match self.paying(quote).await {
+                Ok(false) => Left::Not(why),
+                _ => Left::Pending,
+            }
+        };
+        match tokio::time::timeout(wait, prepared.confirm()).await {
+            Ok(Ok(melt)) => match melt.state() {
+                MeltQuoteState::Paid => Left::Paid {
+                    sat: melt.amount().to_u64(),
+                    fee: melt.fee_paid().to_u64(),
+                    proof: melt.payment_proof().map(str::to_string),
+                },
+                MeltQuoteState::Pending | MeltQuoteState::Unknown => Left::Pending,
+                MeltQuoteState::Unpaid | MeltQuoteState::Failed => unknown("the mint did not pay it".into()).await,
+            },
+            Ok(Err(e)) => unknown(e.to_string()).await,
+            Err(_) => unknown("the mint did not answer in time".into()).await,
+        }
+    }
+
+    /// What became of a payment for `quote` that was under way, as the mint
+    /// says now: the wallet finishes what it began for it by asking. Its
+    /// fee is not said here: the most it may have been is what the quote
+    /// said. The caller holds [`Mint::turn`].
+    pub async fn payment(&self, quote: &str) -> Result<Left, String> {
+        let now = within(self.wallet.check_melt_quote_status(quote)).await?;
+        Ok(match now.state {
+            MeltQuoteState::Paid => {
+                Left::Paid { sat: now.amount.to_u64(), fee: now.fee_reserve.to_u64(), proof: now.payment_proof }
+            }
+            MeltQuoteState::Pending | MeltQuoteState::Unknown => Left::Pending,
+            // Not paid, as far as the mint says: an end only once the
+            // wallet has nothing of it left that it may still be asking.
+            MeltQuoteState::Unpaid | MeltQuoteState::Failed if self.paying(quote).await? => Left::Pending,
+            MeltQuoteState::Unpaid | MeltQuoteState::Failed => Left::Not("the mint did not pay it".into()),
+        })
     }
 
     /// Does the mint give invoices, as far as it has said: for `sat`, or
@@ -609,6 +834,25 @@ impl Mint {
         Ok(proofs.total_amount()?.to_u64())
     }
 
+    /// The tokens that are out here, by their proofs (each token's `Y`s as
+    /// JSON): what [`Mint::count_again`] must not take for the wallet's.
+    pub fn set_out(&self, ys: Vec<String>) {
+        *self.out.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = ys;
+    }
+
+    /// A token that was handed out and not redeemed is unspent at the mint,
+    /// and counting takes whatever is unspent for the wallet's own. It is
+    /// its holder's: its proofs are put back as out, so that nothing is
+    /// spent from under them.
+    async fn keep_out(&self) -> Result<(), String> {
+        let out = self.out.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        for ys in out {
+            let ys: Vec<PublicKey> = serde_json::from_str(&ys).map_err(said)?;
+            self.db.update_proofs_state(ys, State::PendingSpent).await.map_err(said)?;
+        }
+        Ok(())
+    }
+
     /// Find again, from the seed, what this wallet has at the mint
     /// (NUT-09). The caller holds [`Mint::turn`].
     pub async fn count_again(&self) -> Result<String, String> {
@@ -616,6 +860,7 @@ impl Mint {
             .await
             .map_err(|_| "the mint did not answer in time".to_string())?
             .map_err(said)?;
+        self.keep_out().await?;
         Ok(format!("{} sat found again at the mint, {} spent, {} under way", found.unspent, found.spent, found.pending))
     }
 }
@@ -705,6 +950,9 @@ impl Wallets {
                 look_ahead: AtomicBool::new(true),
                 again: again.clone(),
                 lightning: std::sync::Mutex::new(lightning),
+                held: AtomicU64::new(0),
+                cap: AtomicU64::new(0),
+                out: std::sync::Mutex::new(Vec::new()),
                 turn: tokio::sync::Mutex::new(()),
             }));
         }
@@ -713,12 +961,20 @@ impl Wallets {
 
     /// Whether a token is taken at any mint now.
     pub fn ready(&self) -> bool {
-        self.mints.iter().any(|mint| mint.ready())
+        self.mints.iter().any(|mint| mint.sells())
     }
 
-    /// Whether any mint that is reached now gives invoices.
+    /// Whether any mint at which something is sold now gives invoices.
     pub fn invoicing(&self) -> bool {
-        self.mints.iter().any(|mint| mint.ready() && mint.gives_invoices(None))
+        self.mints.iter().any(|mint| mint.sells() && mint.gives_invoices(None))
+    }
+
+    /// The most the wallet may hold at a mint, in sat (0: any amount): at
+    /// that, nothing is sold there.
+    pub fn set_cap(&self, sat: u64) {
+        for mint in &self.mints {
+            mint.cap.store(sat, Ordering::Relaxed);
+        }
     }
 
     /// The wallet at the mint `token` names, which must be an accepted

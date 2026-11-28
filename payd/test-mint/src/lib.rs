@@ -180,7 +180,8 @@ pub async fn start_with(listen: SocketAddr, input_fee_ppk: u64, invoice_seconds:
     let paying = Arc::new(Paying::default());
     let backend = Held {
         backend: FakeWallet::new(
-            FeeReserve { min_fee_reserve: 1.into(), percent_fee_reserve: 1.0 },
+            // What it may take for paying an invoice: 2 sat, or a fiftieth.
+            FeeReserve { min_fee_reserve: 2.into(), percent_fee_reserve: 0.02 },
             HashMap::default(),
             HashSet::default(),
             // Seconds before an invoice counts as paid.
@@ -286,6 +287,36 @@ pub async fn last(mint: &str) -> Result<String, String> {
     post(mint, "/test/last", "").await
 }
 
+/// What becomes of an invoice when the mint is asked to pay it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fate {
+    Paid,
+    /// The payment fails: the mint says so at once.
+    Fails,
+    /// The payment neither arrives nor fails: under way, whenever the
+    /// mint is asked.
+    Hangs,
+}
+
+/// A Lightning invoice of `sat` for a mint of these tests to pay, which
+/// meets `fate` when one does. Nobody is paid by it.
+pub fn invoice(sat: u64, fate: Fate) -> String {
+    use cdk::nuts::MeltQuoteState::{Failed, Paid, Pending};
+    let (pay_invoice_state, check_payment_state) = match fate {
+        Fate::Paid => (Paid, Paid),
+        Fate::Fails => (Failed, Failed),
+        Fate::Hangs => (Pending, Pending),
+    };
+    let says = cdk_fake_wallet::FakeInvoiceDescription {
+        pay_invoice_state,
+        check_payment_state,
+        pay_err: false,
+        check_err: false,
+    };
+    let says = serde_json::to_string(&says).expect("a description");
+    cdk_fake_wallet::create_fake_invoice(sat * 1000, says).to_string()
+}
+
 /// A wallet at `mint`, in memory, with a seed of its own.
 pub async fn wallet(mint: &str) -> Result<Wallet, String> {
     let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.map_err(said)?);
@@ -351,6 +382,7 @@ pub struct Proxy {
 
 const SWAP: &str = "/v1/swap";
 const MINT: &str = "/v1/mint/bolt11";
+const MELT: &str = "/v1/melt/bolt11";
 
 impl Proxy {
     /// Pass everything on: as when it began.
@@ -364,6 +396,20 @@ impl Proxy {
     pub fn lose_mint_answers(&self) {
         *self.about.lock().unwrap() = MINT;
         self.swaps.store(LOSE_ANSWER, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Pass a request to pay an invoice on to the mint, and lose the mint's
+    /// answer.
+    pub fn lose_melt_answers(&self) {
+        *self.about.lock().unwrap() = MELT;
+        self.swaps.store(LOSE_ANSWER, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Pass the next request to pay an invoice on, lose the mint's answer,
+    /// and be away from then on: the mint paid, and cannot be asked.
+    pub fn lose_a_melt_answer_and_go_away(&self) {
+        *self.about.lock().unwrap() = MELT;
+        self.swaps.store(LOSE_ANSWER_AND_GO, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Pass a swap on to the mint, and lose the mint's answer.

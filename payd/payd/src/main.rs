@@ -18,6 +18,7 @@ mod identity;
 mod invoices;
 mod manage;
 mod orders;
+mod payouts;
 mod qr;
 mod store;
 mod sync;
@@ -209,6 +210,7 @@ async fn run() -> Result<(), String> {
     // The wallet, on an exit that names a mint: what is paid arrives there.
     if !site.config.mints.is_empty() {
         let wallets = Arc::new(wallet::Wallets::open(&args.state, &site.config.mints).await?);
+        wallets.set_cap(site.config.wallet_cap);
         eprintln!(
             "fips-exit-payd: the wallet is kept in {}: its seed (the file `seed`) is what it holds, to be kept safe",
             args.state.display()
@@ -217,9 +219,13 @@ async fn run() -> Result<(), String> {
         tokio::spawn(wallets.keep());
     }
     let site = Arc::new(site);
+    // Which tokens are out, and what each mint's wallet holds, before
+    // anything is sold: a wallet that is full sells nothing from the start.
+    payouts::start(&site).await;
     // What an earlier run left open is decided before anything new.
     tokio::spawn(orders::keep(site.clone()));
     tokio::spawn(invoices::keep(site.clone()));
+    tokio::spawn(payouts::keep(site.clone()));
     tokio::spawn(admin::serve(admin, site.clone()));
     // With --listen, which tests use, a peer from anywhere is talked to.
     let admit: fn(IpAddr) -> bool = if args.listen.is_some() { |_| true } else { http::on_the_mesh };

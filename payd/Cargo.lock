@@ -1041,6 +1041,7 @@ dependencies = [
  "cdk-fake-wallet",
  "cdk-sqlite",
  "futures",
+ "serde_json",
  "tokio",
  "tokio-stream",
 ]

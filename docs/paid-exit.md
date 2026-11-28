@@ -378,6 +378,26 @@ address of the operator's above a threshold, and stops selling above a cap.
 A wallet on a server is protected by holding little. Encrypting it with a
 key on the same disk would protect nothing.
 
+Nothing reached from the mesh takes anything out. What leaves does so on
+the operator's word, over the service's own socket, or by the operator's
+config (`SWEEP_TO`, `SWEEP_ABOVE`); `WALLET_CAP` is the most a mint's wallet
+may hold before nothing more is sold there, half a million sat unless the
+config says otherwise. Each withdrawal is written down before the mint is
+asked, with the most it may cost: a token under the name the wallet keeps
+it by, a payment under the mint's quote. So after a stop it can be said of
+each whether it happened; one whose end is not known counts as gone, and
+the mint is asked until it says. What the wallet holds at a mint is what
+was sold there less what left it, and that sum is what tells, after an
+answer of the mint's was lost, whether the wallet has to count again from
+its seed. A token that is out is kept in the service's store, with its
+text and its proofs: the wallet's file forgets one when the wallet puts
+itself right, and what is out must be listed, asked about, taken back and
+kept from the wallet's own whatever that file remembers. For sending on,
+the address's host is asked for an invoice (the only thing asked of anyone
+but a mint), the library checks it against the amount, and a mint that
+wants more than a twentieth and 20 sat for paying it is not paid by
+itself.
+
 ### State, and what a crash may not break
 
 Two SQLite files, the wallet's and the service's. Nothing assumes that a
@@ -549,7 +569,7 @@ and `SECURITY-REVIEW.md`.
 | 4 | **Done.** Accounts without money: the service on the socket, a grant by hand, members, usage, pushing again after a restart, and a package's members managed with its key over the mesh. |
 | 5 | **Done.** The wallet, and payment by token: a package of its own or added to one by its key, once for a token, and granted only when its price has arrived. Nothing pays out yet: until phase 7 the way to what was paid is the seed. |
 | 6 | **Done.** Lightning: an invoice of the mint's for a package's price, in an order that is its buyer's alone; granted when the wallet has minted for it, and given up only on the mint's word after the invoice's end. |
-| 7 | Paying out and sweeping. Before on-chain: a wallet with no way out is the larger risk. |
+| 7 | **Done.** Paying out and sweeping: a token or a paid invoice on the operator's word, the wallet sent on to the operator's Lightning address above a threshold, a cap from which nothing is sold, and everything that leaves written down first. |
 | 8 | On-chain. |
 | 9 | A command-line client for Linux nodes. |
 | 10 | Channels. |

@@ -115,6 +115,42 @@ const SCHEMA: &[&str] = &[
     ALTER TABLE orders ADD COLUMN expires INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE orders ADD COLUMN ended INTEGER NOT NULL DEFAULT 0;
 ",
+    "
+    -- What left the wallet, or was to: a token handed out, an invoice paid
+    -- for the operator, or the wallet sent on to the operator's address.
+    CREATE TABLE withdrawals (
+        -- 'w' and 16 hex digits.
+        id TEXT PRIMARY KEY,
+        created INTEGER NOT NULL,
+        mint TEXT NOT NULL,
+        -- 'token', 'invoice' or 'sweep'.
+        kind TEXT NOT NULL,
+        -- What was to leave, in sat: the token's worth, or what was paid.
+        sat INTEGER NOT NULL,
+        -- What left the wallet for it in all, with what the mint and the
+        -- payment took. While it is begun: the most that may.
+        cost_sat INTEGER NOT NULL,
+        -- 'begun', written down before the mint is asked; 'done'; 'failed',
+        -- and nothing left; or 'back', a token that was taken back.
+        state TEXT NOT NULL,
+        -- Where to, for a payment: the invoice, or the address.
+        to_whom TEXT NOT NULL DEFAULT '',
+        -- The mint's quote for a payment: what it is asked about by.
+        quote TEXT,
+        ended INTEGER NOT NULL DEFAULT 0
+    );
+",
+    "
+    -- A token that was handed out and that nobody has redeemed, as far as
+    -- is known: its text, and its proofs as the mint knows them. Kept here,
+    -- and not left to the wallet's file alone, which forgets a token when
+    -- it puts itself right: with these a token that is out can be listed,
+    -- asked about and taken back whatever the wallet remembers, and is
+    -- kept from being counted as the wallet's own again. Both are NULL
+    -- once it is redeemed or taken back.
+    ALTER TABLE withdrawals ADD COLUMN token TEXT;
+    ALTER TABLE withdrawals ADD COLUMN ys TEXT;
+",
 ];
 
 /// The most a package may be granted: what the daemon takes.
@@ -166,6 +202,41 @@ pub struct Order {
     pub request: Option<String>,
     pub expires: u64,
     pub ended: u64,
+}
+
+/// Something that left the wallet, or was to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Withdrawal {
+    pub id: String,
+    pub created: u64,
+    pub mint: String,
+    /// `token`, `invoice` or `sweep`.
+    pub kind: String,
+    pub sat: u64,
+    pub cost_sat: u64,
+    /// `begun`, `done`, `failed`, or `back` for a token taken back.
+    pub state: String,
+    pub to_whom: String,
+    pub quote: Option<String>,
+    pub ended: u64,
+    /// For a token that is out: its text, and its proofs as the mint knows
+    /// them.
+    pub token: Option<String>,
+    pub ys: Option<String>,
+}
+
+/// What is about to leave the wallet at `mint`, as `kind`: `sat`, costing
+/// `cost_most` at the most, to `to_whom`. `reference` is what it is asked
+/// about by afterwards: the mint's quote for a payment, the wallet's name
+/// for a token.
+#[derive(Debug, Clone, Copy)]
+pub struct NewWithdrawal<'a> {
+    pub mint: &'a str,
+    pub kind: &'a str,
+    pub sat: u64,
+    pub cost_most: u64,
+    pub to_whom: &'a str,
+    pub reference: &'a str,
 }
 
 /// The ways an order is paid, as they are kept.
@@ -854,6 +925,156 @@ impl Store {
         let sat: i64 =
             self.db()
                 .query_row("SELECT COALESCE(SUM(sat), 0) FROM credits WHERE mint = ?1", [mint], |row| row.get(0))?;
+        Ok(as_u64(sat))
+    }
+
+    // ---- what was paid out ------------------------------------------------------
+
+    fn withdrawals_where(
+        db: &Connection,
+        condition: &str,
+        values: &[&dyn rusqlite::ToSql],
+    ) -> rusqlite::Result<Vec<Withdrawal>> {
+        let sql = format!(
+            "SELECT id, created, mint, kind, sat, cost_sat, state, to_whom, quote, ended, token, ys FROM withdrawals \
+             {condition}"
+        );
+        let mut query = db.prepare_cached(&sql)?;
+        query
+            .query_map(values, |row| {
+                Ok(Withdrawal {
+                    id: row.get(0)?,
+                    created: as_u64(row.get(1)?),
+                    mint: row.get(2)?,
+                    kind: row.get(3)?,
+                    sat: as_u64(row.get(4)?),
+                    cost_sat: as_u64(row.get(5)?),
+                    state: row.get(6)?,
+                    to_whom: row.get(7)?,
+                    quote: row.get(8)?,
+                    ended: as_u64(row.get(9)?),
+                    token: row.get(10)?,
+                    ys: row.get(11)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// Something is about to leave the wallet: written down before the
+    /// mint is asked, so that whatever happens then it is known what was
+    /// under way. Its name.
+    pub fn withdrawal_begin(&self, new: &NewWithdrawal<'_>, now: u64) -> Result<String, Refused> {
+        let id = format!("w{}", hex(&random(8).map_err(|e| Refused::Store(e.to_string()))?));
+        self.db().execute(
+            "INSERT INTO withdrawals (id, created, mint, kind, sat, cost_sat, state, to_whom, quote)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'begun', ?7, ?8)",
+            params![
+                id,
+                as_i64(now),
+                new.mint,
+                new.kind,
+                as_i64(new.sat),
+                as_i64(new.cost_most),
+                new.to_whom,
+                new.reference
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Withdrawal `id` came to an end: it is `done`; or it failed, and
+    /// what was to leave did not. `cost_sat` is what left the wallet for it
+    /// either way: for one that failed, what the mint took for the try, if
+    /// anything.
+    pub fn withdrawal_end(&self, id: &str, done: bool, cost_sat: u64, now: u64) -> Result<(), Refused> {
+        let state = if done { "done" } else { "failed" };
+        self.db().execute(
+            "UPDATE withdrawals SET state = ?2, cost_sat = ?3, ended = ?4 WHERE id = ?1 AND state = 'begun'",
+            params![id, state, as_i64(cost_sat), as_i64(now)],
+        )?;
+        Ok(())
+    }
+
+    /// What left the wallet so far for withdrawal `id`, which is under way:
+    /// as it was measured, in place of the most it might be.
+    pub fn withdrawal_cost(&self, id: &str, cost_sat: u64) -> Result<(), Refused> {
+        self.db().execute(
+            "UPDATE withdrawals SET cost_sat = ?2 WHERE id = ?1 AND state = 'begun'",
+            params![id, as_i64(cost_sat)],
+        )?;
+        Ok(())
+    }
+
+    /// The token of withdrawal `id` was made, and is out: its text and its
+    /// proofs (`ys`) are kept, and what it cost.
+    pub fn withdrawal_token(&self, id: &str, token: &str, ys: &str, cost_sat: u64, now: u64) -> Result<(), Refused> {
+        self.db().execute(
+            "UPDATE withdrawals SET state = 'done', cost_sat = ?2, ended = ?3, token = ?4, ys = ?5
+             WHERE id = ?1 AND kind = 'token' AND state = 'begun'",
+            params![id, as_i64(cost_sat), as_i64(now), token, ys],
+        )?;
+        Ok(())
+    }
+
+    /// The token of withdrawal `id` was redeemed: it is out no more.
+    pub fn withdrawal_redeemed(&self, id: &str) -> Result<(), Refused> {
+        self.db().execute("UPDATE withdrawals SET token = NULL, ys = NULL WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// The token of withdrawal `id` was taken back, and `back` sat of it
+    /// are the wallet's again: what it cost is what the mint took.
+    pub fn withdrawal_back(&self, id: &str, back: u64, now: u64) -> Result<(), Refused> {
+        self.db().execute(
+            "UPDATE withdrawals SET state = 'back', cost_sat = MAX(cost_sat - ?2, 0), ended = ?3, token = NULL, ys = NULL
+             WHERE id = ?1 AND kind = 'token' AND state = 'done' AND token IS NOT NULL",
+            params![id, as_i64(back), as_i64(now)],
+        )?;
+        Ok(())
+    }
+
+    /// The tokens that are out, at `mint` or (None) at any: oldest first.
+    pub fn tokens_out(&self, mint: Option<&str>) -> Result<Vec<Withdrawal>, Refused> {
+        Ok(Store::withdrawals_where(
+            &self.db(),
+            "WHERE kind = 'token' AND state = 'done' AND token IS NOT NULL AND (?1 IS NULL OR mint = ?1)
+             ORDER BY created, id",
+            &[&mint],
+        )?)
+    }
+
+    /// The withdrawal that paid `to_whom`, or is paying it: one that was
+    /// begun or is done, not one that failed.
+    pub fn withdrawal_to(&self, to_whom: &str) -> Result<Option<Withdrawal>, Refused> {
+        Ok(Store::withdrawals_where(
+            &self.db(),
+            "WHERE to_whom = ?1 AND state IN ('begun', 'done') ORDER BY created LIMIT 1",
+            &[&to_whom],
+        )?
+        .pop())
+    }
+
+    /// The newest withdrawals, `most` at most.
+    pub fn withdrawals(&self, most: usize) -> Result<Vec<Withdrawal>, Refused> {
+        let most = i64::try_from(most).unwrap_or(i64::MAX);
+        Ok(Store::withdrawals_where(&self.db(), "ORDER BY created DESC, id LIMIT ?1", &[&most])?)
+    }
+
+    /// The withdrawals at `mint` that were begun and whose end is not
+    /// known, oldest first.
+    pub fn withdrawals_begun(&self, mint: &str) -> Result<Vec<Withdrawal>, Refused> {
+        Ok(Store::withdrawals_where(&self.db(), "WHERE state = 'begun' AND mint = ?1 ORDER BY created, id", &[&mint])?)
+    }
+
+    /// What has left the wallet at `mint` in all, in sat, counting what is
+    /// under way as gone, and what a try that failed or a token taken back
+    /// cost.
+    pub fn paid_out(&self, mint: &str) -> Result<u64, Refused> {
+        let sat: i64 = self.db().query_row(
+            "SELECT COALESCE(SUM(cost_sat), 0) FROM withdrawals WHERE mint = ?1",
+            [mint],
+            |row| row.get(0),
+        )?;
         Ok(as_u64(sat))
     }
 

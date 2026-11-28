@@ -7,7 +7,9 @@ Wants=network-online.target
 # Reads /etc/fips-exit/config (ACCESS=paid, PRICE_MSAT_PER_GB, PACKAGES,
 # MINTS, PAY_PORT) and answers on this node's fips address. Does nothing,
 # and succeeds, when ACCESS is not paid. With MINTS it keeps a Cashu wallet
-# and asks those mints, and nobody else, over the internet.
+# and asks those mints over the internet; with SWEEP_TO, the host of that
+# Lightning address too, for an invoice to send the wallet on to. Nobody
+# else.
 ExecStart=/usr/local/sbin/fips-exit-payd
 # The exit opens the service's port to the mesh while it listens there, and
 # closes it when it stops: `up` looks, as root ("+"), and its failure (the

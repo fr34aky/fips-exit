@@ -48,6 +48,39 @@ pub struct Config {
     pub name: String,
     pub about: String,
     pub country: Option<String>,
+    /// The most the wallet may hold at a mint, in sat: from there on
+    /// nothing is sold at that mint. 0: as much as there is.
+    pub wallet_cap: u64,
+    /// Where what the wallet holds is sent on, if anywhere: a Lightning
+    /// address of the operator's. And above how much at a mint, in sat.
+    pub sweep_to: Option<String>,
+    pub sweep_above: u64,
+}
+
+/// The most a number of sat in the config may be: all there will ever be.
+const MAX_SAT: u64 = 2_100_000_000_000_000;
+/// What the wallet may hold at a mint when the config does not say
+/// (`WALLET_CAP`): a wallet on a server is protected by holding little.
+pub const DEFAULT_WALLET_CAP: u64 = 500_000;
+/// Above how much the wallet is sent on when the config names where to and
+/// not above how much (`SWEEP_ABOVE`), and the least that may be.
+pub const DEFAULT_SWEEP_ABOVE: u64 = 20_000;
+pub const LEAST_SWEEP_ABOVE: u64 = 100;
+
+/// Is `text` written as a Lightning address is: a name, an `@`, and a host
+/// with a dot in it? Whether it is one is found out when it is paid.
+fn is_lightning_address(text: &str) -> bool {
+    let Some((name, host)) = text.split_once('@') else { return false };
+    let plain = |part: &str, more: &str| {
+        !part.is_empty()
+            && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || more.as_bytes().contains(&b))
+    };
+    text.len() <= 320
+        && plain(name, "._+-")
+        && plain(host, ".-")
+        && host.contains('.')
+        && !host.starts_with(['.', '-'])
+        && !host.ends_with(['.', '-'])
 }
 
 /// Why the config cannot be used, said so that the operator knows which
@@ -164,6 +197,36 @@ impl Config {
         let line = |text: &str, limit: usize| {
             text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(limit).collect()
         };
+        let sat = |key: &str, default: u64| match get(key) {
+            "" => Ok(default),
+            text => digits(text)
+                .filter(|sat| *sat <= MAX_SAT)
+                .ok_or_else(|| Wrong(format!("{key}={text}: a number of sat, {MAX_SAT} at most"))),
+        };
+        let wallet_cap = sat("WALLET_CAP", DEFAULT_WALLET_CAP)?;
+        let sweep_to = match get("SWEEP_TO") {
+            "" => None,
+            address if is_lightning_address(address) => Some(address.to_string()),
+            address => {
+                return Err(Wrong(format!(
+                    "SWEEP_TO={address}: a Lightning address, name@host in small letters (you@example.org)"
+                )));
+            }
+        };
+        let sweep_above = sat("SWEEP_ABOVE", DEFAULT_SWEEP_ABOVE)?;
+        if sweep_above < LEAST_SWEEP_ABOVE {
+            return Err(Wrong(format!(
+                "SWEEP_ABOVE={sweep_above}: {LEAST_SWEEP_ABOVE} sat at the least (what is sent on costs a fee each time)"
+            )));
+        }
+        // A wallet that stops selling before it is sent on would stop for
+        // good.
+        if sweep_to.is_some() && wallet_cap != 0 && sweep_above >= wallet_cap {
+            return Err(Wrong(format!(
+                "SWEEP_ABOVE={sweep_above} is not under WALLET_CAP={wallet_cap}: the wallet would be full, and \
+                 sell nothing, before it is sent on"
+            )));
+        }
         Ok(Some(Config {
             port,
             mesh_if: match get("MESH_IF") {
@@ -176,6 +239,9 @@ impl Config {
             name: line(get("ADVERT_NAME"), MAX_NAME),
             about: line(get("ADVERT_ABOUT"), MAX_ABOUT),
             country,
+            wallet_cap,
+            sweep_to,
+            sweep_above,
         }))
     }
 }
@@ -186,6 +252,41 @@ mod tests {
 
     fn config(text: &str) -> Result<Option<Config>, Wrong> {
         Config::from_settings(&settings(text))
+    }
+
+    #[test]
+    fn what_the_wallet_may_hold_and_where_it_is_sent_on() {
+        let base = "ACCESS=paid\nPRICE_MSAT_PER_GB=1000\n";
+        let said = config(base).unwrap().unwrap();
+        assert_eq!((said.wallet_cap, said.sweep_to, said.sweep_above), (500_000, None, 20_000), "when nothing is said");
+        let said = config(&format!("{base}WALLET_CAP=0\nSWEEP_TO=me+exit@pay.example.org\nSWEEP_ABOVE=5000\n"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (said.wallet_cap, said.sweep_to.as_deref(), said.sweep_above),
+            (0, Some("me+exit@pay.example.org"), 5000)
+        );
+        for wrong in [
+            "WALLET_CAP=lots",
+            "WALLET_CAP=-1",
+            "WALLET_CAP=2100000000000001",
+            "SWEEP_TO=example.org",
+            "SWEEP_TO=me@localhost",
+            "SWEEP_TO=Me@Example.org",
+            "SWEEP_TO=me@.org",
+            "SWEEP_TO=me@example.org.",
+            "SWEEP_TO=https://example.org/x@y",
+            "SWEEP_TO=me@example.org/path",
+            "SWEEP_ABOVE=99",
+            // Full before it is sent on: it would sell nothing, for good.
+            "SWEEP_TO=me@example.org\nSWEEP_ABOVE=500000",
+            "SWEEP_TO=me@example.org\nWALLET_CAP=20000",
+        ] {
+            assert!(config(&format!("{base}{wrong}\n")).is_err(), "{wrong}");
+        }
+        // Above how much says nothing while nothing is sent on.
+        assert!(config(&format!("{base}SWEEP_ABOVE=600000\n")).is_ok());
+        assert!(config(&format!("{base}SWEEP_TO=me@example.org\nWALLET_CAP=0\nSWEEP_ABOVE=600000\n")).is_ok());
     }
 
     #[test]

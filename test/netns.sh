@@ -735,7 +735,7 @@ r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")
 also=$(printf '%s' "$r" | tail -n +2 | python3 -c 'import json, sys; print(json.load(sys.stdin)["package"]["id"])')
 wait_for '[ "$(ask c3 4 8.8.8.2 100)" = 100 ]' || fail "the second node that paid is not carried"
 # What the operator sees of it, and what the advert says now.
-"$here/fips-exit" wallet | grep -Eq "^ +16 sat +0 sat +16 sat +reached +yes +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
+"$here/fips-exit" wallet | grep -Eq "^ +16 sat +0 sat +16 sat +0 sat +reached +yes +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
 "$here/fips-exit" orders | grep -Eq "^o[0-9a-f]{16} +paid .* 8 sat +8 sat +0 +tiny +$bought +$C1\$" || fail "orders: $("$here/fips-exit" orders)"
 [ "$("$here/fips-exit" orders | grep -c " paid ")" = 2 ] || fail "orders: $("$here/fips-exit" orders)"
 "$here/fips-exit" packages | grep -q "^$bought  *live .*bought: tiny" || fail "packages: $("$here/fips-exit" packages)"
@@ -804,8 +804,56 @@ status, at = post("http://" + sys.argv[2])
 assert status == 303 and at.startswith("/order/o"), (status, at)
 assert post("http://evil.example")[0] == 403' $E "$NPUB.fips:5170" || fail "the page's form for an invoice"
 "$here/fips-exit" orders | grep -Eq "^$order +paid +invoice .* 8 sat +8 sat +0 +tiny +$via +$C3\$" || fail "orders: $("$here/fips-exit" orders)"
-"$here/fips-exit" wallet | grep -Eq "^ +24 sat +0 sat +24 sat +reached +yes +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
+"$here/fips-exit" wallet | grep -Eq "^ +24 sat +0 sat +24 sat +0 sat +reached +yes +$MINT\$" || fail "wallet: $("$here/fips-exit" wallet)"
 ok "an invoice of the exit's mint buys a package over the mesh: when it is paid, for its buyer alone"
+
+# --- what leaves the wallet, on the operator's word ---------------------------------
+# A token out of the wallet is ecash like any other. Its text alone is printed.
+out=$("$here/fips-exit" wallet token 8 2>/dev/null) || fail "a token out of the wallet: $("$here/fips-exit" wallet token 8 2>&1)"
+case "$out" in cashu*) ;; *) fail "what was handed out is not a token: $out";; esac
+"$here/fips-exit" wallet tokens | grep -qF "$out" || fail "the token handed out is not among those that are out: $("$here/fips-exit" wallet tokens)"
+"$here/fips-exit" wallet | grep -Eq "^ +16 sat +0 sat +24 sat +8 sat +reached +yes +$MINT\$" || fail "the wallet after a token left it: $("$here/fips-exit" wallet)"
+# Whoever has it redeems it: here it buys c1 another package of this exit.
+r=$(http_post c1 /v1/orders "{\"package\": \"tiny\", \"token\": \"$out\"}")
+[ "$(status_of "$r")" = 200 ] || fail "a token out of the wallet did not buy: $r"
+more=$(printf '%s' "$r" | tail -n +2 | python3 -c 'import json, sys; print(json.load(sys.stdin)["package"]["id"])')
+"$here/fips-exit" wallet tokens | grep -q "^(none" || fail "a token that was redeemed is still out: $("$here/fips-exit" wallet tokens)"
+# One that nobody has yet is taken back, and is worth nothing after.
+lost=$("$here/fips-exit" wallet token 4 2>/dev/null) || fail "a second token"
+name=$("$here/fips-exit" wallet tokens | awk 'NR == 1 { print $1 }')
+"$here/fips-exit" wallet take-back "$name" | grep -q "^4 sat are the wallet's again" || fail "taking a token back"
+[ "$(status_of "$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$lost\"}")")" != 200 ] || fail "A TOKEN THAT WAS TAKEN BACK BOUGHT SOMETHING"
+# An invoice is paid out of the wallet, once, and what it cost is written down.
+invoice=$("$mint" invoice 5) || fail "no invoice to pay"
+"$here/fips-exit" wallet pay "$invoice" --yes > "$FIPS_EXIT_DIR/pay.out" 2>&1 || fail "paying an invoice out of the wallet: $(cat "$FIPS_EXIT_DIR/pay.out")"
+grep -q "^This pays 5 sat out of the wallet at $MINT" "$FIPS_EXIT_DIR/pay.out" && grep -q "^paid: 5 sat, for a fee of 1 sat" "$FIPS_EXIT_DIR/pay.out" \
+  || fail "what paying said: $(cat "$FIPS_EXIT_DIR/pay.out")"
+"$here/fips-exit" wallet pay "$invoice" --yes >/dev/null 2>&1 && fail "AN INVOICE WAS PAID TWICE"
+"$here/fips-exit" wallet pay "$("$mint" invoice 5)" < /dev/null >/dev/null 2>&1 && fail "AN INVOICE WAS PAID WITHOUT THE OPERATOR SAYING SO"
+"$here/fips-exit" wallet pay "$("$mint" invoice 5000)" --yes >/dev/null 2>&1 && fail "MORE THAN THE WALLET HOLDS WAS PAID"
+"$here/fips-exit" wallet out > "$FIPS_EXIT_DIR/out.out"
+grep -Eq "^w[0-9a-f]{16} +done +.* invoice +5 sat +6 sat +lnbc" "$FIPS_EXIT_DIR/out.out" \
+  && grep -Eq "^w[0-9a-f]{16} +done +.* token +8 sat +8 sat " "$FIPS_EXIT_DIR/out.out" \
+  && grep -Eq "^w[0-9a-f]{16} +back +.* token +4 sat +0 sat " "$FIPS_EXIT_DIR/out.out" \
+  && [ "$(grep -Ec '^w[0-9a-f]{16} ' "$FIPS_EXIT_DIR/out.out")" = 3 ] || fail "what left the wallet: $(cat "$FIPS_EXIT_DIR/out.out")"
+# What it holds is what was sold, less what left it.
+"$here/fips-exit" wallet | grep -Eq "^ +18 sat +0 sat +32 sat +14 sat +reached +yes +$MINT\$" || fail "the wallet after all that: $("$here/fips-exit" wallet)"
+"$here/fips-exit" wallet sweep 2>&1 | grep -q "SWEEP_TO is not set" || fail "sending on with nowhere to send to: $("$here/fips-exit" wallet sweep 2>&1)"
+# A wallet that holds as much as it may sells nothing more.
+sells "tiny:30000:8:1 1gb:1GB:1500:30" "MINTS=$MINT\nWALLET_CAP=10\n"
+restart_payd
+wait_for 'http_get c1 /v1/terms | grep -q "\"methods\":\[\]"' || fail "a full wallet goes on selling: $(http_get c1 /v1/terms)"
+r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$(token 8)\"}")
+[ "$(status_of "$r")" = 503 ] && printf '%s' "$r" | grep -q '"code":"wallet-full"' || fail "a token for a full wallet: $r"
+r=$(http_post c3 /v1/orders '{"package": "tiny", "method": "bolt11"}')
+[ "$(status_of "$r")" = 503 ] && printf '%s' "$r" | grep -q '"code":"wallet-full"' || fail "an invoice for a full wallet: $r"
+"$here/fips-exit" wallet | grep -q "FULL: nothing is sold here" && "$here/fips-exit" wallet | grep -q "It may hold 10 sat at a mint" \
+  || fail "the wallet does not say that it is full: $("$here/fips-exit" wallet)"
+"$here/fips-exit" status | grep -q "FULL (WALLET_CAP)" || fail "status does not say that the wallet is full: $("$here/fips-exit" status)"
+sells "tiny:30000:8:1 1gb:1GB:1500:30" "MINTS=$MINT\n"
+restart_payd
+wait_for 'http_get c1 /v1/terms | grep -q "\"methods\":\[\"cashu\",\"bolt11\"\]"' || fail "the wallet with room again does not sell"
+ok "a token and an invoice leave the wallet on the operator's word, are written down, and a full wallet sells nothing"
 
 # The wallet and what was sold are kept when the service starts again, with
 # its mint away: nothing is sold then, and who paid is carried all the same.
@@ -813,7 +861,7 @@ ok "an invoice of the exit's mint buys a package over the mesh: when it is paid,
 fresh=$(token 8)
 kill $mint_pid; wait $mint_pid 2>/dev/null || true
 restart_payd
-wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +24 sat +0 sat +24 sat +away +yes +$MINT\$"' \
+wait_for '"$here/fips-exit" wallet 2>/dev/null | grep -Eq "^ +18 sat +0 sat +32 sat +14 sat +away +yes +$MINT\$"' \
   || fail "the wallet after the service started again: $("$here/fips-exit" wallet 2>&1)"
 r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$fresh\"}")
 [ "$(status_of "$r")" = 503 ] && printf '%s' "$r" | grep -q '"code":"mint-away"' || fail "an order while the mint is away: $r"
@@ -828,7 +876,7 @@ r=$(http_post c3 /v1/orders "{\"package\": \"tiny\", \"token\": \"$t\"}")
 wait_for '[ "$(ask c1 4 8.8.8.2 100)" = 100 ]' || fail "who paid is not carried after the service started again"
 [ "$(stat -c %a "$FIPS_EXIT_DIR/state/seed")" = 600 ] && [ "$(wc -w < "$FIPS_EXIT_DIR/state/seed")" = 24 ] || fail "the wallet's seed"
 "$here/fips-exit" revoke $bought >/dev/null && "$here/fips-exit" revoke $also >/dev/null \
-  && "$here/fips-exit" revoke $via >/dev/null || fail "revoke what was bought"
+  && "$here/fips-exit" revoke $via >/dev/null && "$here/fips-exit" revoke $more >/dev/null || fail "revoke what was bought"
 wait_for '[ "$(ctl "check $C1") $(ctl "check $C3")" = "ok free v4 ok free v4" ]' || fail "after revoking what was bought: $(ctl "check $C1") $(ctl "check $C3")"
 sells "1gb:1GB:1500:30 5gb:5GB:6000:90" ""
 restart_payd

@@ -165,14 +165,19 @@ pub enum Fault {
     NoNewKey,
     /// Another request of the caller's is under way, and did not end.
     UnderWay,
+    /// The wallet holds as much as it may at the mint: nothing is sold there.
+    WalletFull,
 }
 
 impl Fault {
     pub fn status(&self) -> StatusCode {
         match self {
-            Fault::NotSold | Fault::MintAway(_) | Fault::ExitDown | Fault::Again | Fault::NoInvoice(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Fault::NotSold
+            | Fault::MintAway(_)
+            | Fault::ExitDown
+            | Fault::Again
+            | Fault::NoInvoice(_)
+            | Fault::WalletFull => StatusCode::SERVICE_UNAVAILABLE,
             Fault::NoOffer(_) | Fault::Token(_) | Fault::WrongMint(_) | Fault::TooMuch { .. } | Fault::Bad(_) => {
                 StatusCode::BAD_REQUEST
             }
@@ -222,6 +227,7 @@ impl Fault {
             Fault::NotPaid => "not-paid",
             Fault::NoNewKey => "no-key-to-give",
             Fault::UnderWay => "under-way",
+            Fault::WalletFull => "wallet-full",
         }
     }
 
@@ -289,6 +295,10 @@ impl Fault {
             ),
             Fault::NoOrder => "There is no such order of this device's.".into(),
             Fault::NotPaid => "That order is not paid: there is no package of it yet.".into(),
+            Fault::WalletFull => format!(
+                "This exit takes no payment at the moment: its wallet holds as much as its operator lets it. \
+                 {untouched}"
+            ),
             Fault::UnderWay => {
                 "Another purchase of this device's is being made here just now: try again in a moment.".into()
             }
@@ -338,6 +348,8 @@ pub struct Desk {
     pub give_up: Duration,
     /// What is kept of the invoices that wait to be paid.
     pub invoices: crate::invoices::Waiting,
+    /// And of sending the wallet on.
+    pub sweeping: crate::payouts::Sweeping,
 }
 
 /// An order being worked on by a request, until this is dropped.
@@ -367,6 +379,7 @@ impl Desk {
             wake: Notify::new(),
             give_up: GIVE_UP,
             invoices: crate::invoices::Waiting::default(),
+            sweeping: crate::payouts::Sweeping::default(),
         }
     }
 
@@ -446,6 +459,7 @@ fn known(site: &Site, caller: Ipv6Addr, order: &Order) -> Result<Bought, Fault> 
 pub fn settle(site: &Site, mint: &Mint, id: &str, paid: u64) -> Result<Bought, Fault> {
     match site.store.order_settle(id, paid, unix_now()) {
         Ok(settled) => {
+            mint.holds_more(paid);
             eprintln!(
                 "fips-exit-payd: order {id}: {paid} sat arrived at {}; {} package {}",
                 mint.name,
@@ -587,6 +601,9 @@ pub async fn buy(site: &Arc<Site>, caller: Ipv6Addr, asked: &Asked, until: Insta
     if !mint.ready() {
         return Err(Fault::MintAway(mint.name.clone()));
     }
+    if mint.full() {
+        return Err(Fault::WalletFull);
+    }
     if Instant::now() >= until {
         return Err(Fault::Again);
     }
@@ -660,6 +677,29 @@ pub async fn round(site: &Site) -> usize {
     }
     // An order at a mint that is not accepted any more waits for it.
     left + open.iter().filter(|order| desk.wallets.named(&order.mint).is_none()).count()
+}
+
+/// Let the wallet finish what it was interrupted in at `mint`, for
+/// something that is not an order: a token it was making, or taking back.
+/// What it asked the mint to sign for every open order is kept first, as
+/// [`decide`] keeps it: the wallet does not know that any more once it has
+/// put itself right, and an order is decided by it. Whether the wallet
+/// finished. The caller holds the mint's turn.
+pub async fn finish(site: &Site, mint: &Mint) -> bool {
+    let Ok(open) = site.store.orders_open() else { return false };
+    for order in open.iter().filter(|order| order.mint == mint.name && order.outputs.is_none()) {
+        let Ok(receipt) = <[u8; 32]>::try_from(order.receipt.as_slice()) else { continue };
+        match mint.unfinished(&receipt).await {
+            Ok(Some(wallet::Unfinished { outputs: Some(outputs) })) => {
+                if site.store.order_keep_outputs(&order.id, &outputs).is_err() {
+                    return false;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    mint.put_right().await.is_ok()
 }
 
 /// What [`decide`] came to.
@@ -823,12 +863,18 @@ async fn decide(site: &Site, desk: &Desk, mint: &Mint, mine: Option<Mine<'_>>) -
 /// what was paid without a hitch: if the wallet does not hold it, it is
 /// found again from the seed. The caller holds the mint's turn.
 pub async fn found_again(site: &Site, mint: &Mint) {
-    let (holds, sold) = (mint.balance().await.map(|b| b.0), site.store.sold(&mint.name));
-    if let (Ok(holds), Ok(sold)) = (holds, sold)
-        && holds < sold
+    // What it should hold: what was sold, less what left it since.
+    let (holds, sold, out) =
+        (mint.balance().await.map(|b| b.0), site.store.sold(&mint.name), site.store.paid_out(&mint.name));
+    if let (Ok(holds), Ok(sold), Ok(out)) = (holds, sold, out)
+        && holds.saturating_add(out) < sold
     {
         let found = mint.count_again().await.unwrap_or_else(|e| format!("not counted again: {e}"));
-        eprintln!("fips-exit-payd: {}: the wallet held {holds} sat of {sold} sat sold: {found}", mint.name);
+        eprintln!(
+            "fips-exit-payd: {}: the wallet held {holds} sat of {sold} sat sold, {out} sat having left it: {found}",
+            mint.name
+        );
+        let _ = mint.balance().await;
     }
 }
 
@@ -1034,6 +1080,8 @@ pub mod testing {
         pub dir: PathBuf,
         /// What the daemon says an address is, when it is not `free v4`.
         pub seats: Arc<Mutex<HashMap<Ipv6Addr, String>>>,
+        /// What becomes of the invoice the wallet is sent on to.
+        pub fate: Arc<Mutex<fips_exit_test_mint::Fate>>,
     }
 
     impl Drop for World {
@@ -1072,13 +1120,19 @@ pub mod testing {
     /// 1500 sat, 30 days) for tokens of a mint of its own, which takes
     /// `fee_ppk` for a proof; an open order is given up after `give_up`.
     pub async fn world(fee_ppk: u64, give_up: Duration) -> World {
-        world_with(fee_ppk, give_up, 3600, "").await
+        world_with(fee_ppk, give_up, 3600, "", "").await
     }
 
     /// The same, with invoices that end after `invoice_seconds`, and
     /// `more` packages on offer. An invoice that waits is looked at
     /// whenever a test says so, and given up as soon as it has ended.
-    pub async fn world_with(fee_ppk: u64, give_up: Duration, invoice_seconds: u64, more: &str) -> World {
+    pub async fn world_with(
+        fee_ppk: u64,
+        give_up: Duration,
+        invoice_seconds: u64,
+        more: &str,
+        settings_too: &str,
+    ) -> World {
         let dir = std::env::temp_dir().join(format!(
             "fips-exit-payd-orders-{}-{}",
             std::process::id(),
@@ -1089,7 +1143,8 @@ pub mod testing {
             fips_exit_test_mint::start_with("127.0.0.1:0".parse().unwrap(), fee_ppk, invoice_seconds).await.unwrap();
         let proxy = fips_exit_test_mint::proxy(&mint).await.unwrap();
         let config = Config::from_settings(&settings(&format!(
-            "ACCESS=paid\nPRICE_MSAT_PER_GB=2000000\nPACKAGES=\"small:10MB:64:1 big:1GB:1500:30{more}\"\nMINTS={}\n",
+            "ACCESS=paid\nPRICE_MSAT_PER_GB=2000000\nPACKAGES=\"small:10MB:64:1 big:1GB:1500:30{more}\"\nMINTS={}\n\
+             {settings_too}",
             proxy.url
         )))
         .unwrap()
@@ -1105,16 +1160,25 @@ pub mod testing {
         let seats: Arc<Mutex<HashMap<Ipv6Addr, String>>> = Arc::default();
         tokio::spawn(daemon(tokio::net::UnixListener::bind(&control).unwrap(), seats.clone()));
         let wallets = Arc::new(Wallets::open(&dir, &config.mints).await.unwrap());
+        wallets.set_cap(config.wallet_cap);
         for mint in &wallets.mints {
             mint.reach().await.unwrap();
         }
         let mut desk = Desk::new(wallets, control);
         desk.give_up = give_up;
+        // What is sent on goes to an invoice of the tests' own making,
+        // which meets the fate the test says.
+        let fate = Arc::new(Mutex::new(fips_exit_test_mint::Fate::Paid));
+        let its_fate = fate.clone();
+        desk.sweeping.source = crate::payouts::Source::Invoices(Box::new(move |sat| {
+            fips_exit_test_mint::invoice(sat, *its_fate.lock().unwrap())
+        }));
+        desk.sweeping.pay_time = Duration::from_secs(3);
         (desk.invoices.every, desk.invoices.grace, desk.invoices.pace, desk.invoices.life) =
             (Duration::ZERO, 0, (0, 0), 0);
         let mut site = Site::new(config, exit, Arc::new(Store::in_memory()), Seats::default(), Arc::default());
         site.desk = Some(Arc::new(desk));
-        World { site: Arc::new(site), mint: proxy.url.clone(), direct: mint, proxy, dir, seats }
+        World { site: Arc::new(site), mint: proxy.url.clone(), direct: mint, proxy, dir, seats, fate }
     }
 
     impl World {

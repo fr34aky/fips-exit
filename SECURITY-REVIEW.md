@@ -403,6 +403,12 @@ IPv4 address derived from the client's fips address.
 - **The wallet library is most of the program.** Some 270 crates, pinned by
   the lockfile and by `cdk`'s exact version, none of them read here beyond
   what the service calls. Nothing in CI looks for advisories against them.
+  One is known: `jsonwebtoken` 9.3.1 (CVE-2026-25537, a token's claims
+  passing a check they should fail), which the wallet library uses to check
+  a login token for a mint that asks its users to log in (NUT-21). This
+  service gives its wallet no such token, so that check is never made here;
+  the crate cannot be raised past what `cdk` 0.18.3 asks for, and goes with
+  the next `cdk` that takes a fixed one.
 - **A mint named by an IPv6 address in brackets is not reached**: the
   library's HTTP client does not take one. A name, or an IPv4 address.
 - **An account's end is by this machine's clock.** A machine that starts
